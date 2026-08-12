@@ -151,3 +151,38 @@ async fn handler_panic_stops_current_and_queued_commands_then_allows_fresh_activ
     state.activation_release.notify_one();
     assert_eq!(fresh.await.unwrap().unwrap(), 2);
 }
+
+#[tokio::test]
+async fn activation_failure_releases_runtime_capacity() {
+    let (runtime, state) = {
+        let state = AppState {
+            activation_attempts: Arc::new(AtomicUsize::new(0)),
+            activation_entered: Arc::new(Notify::new()),
+            activation_release: Arc::new(Notify::new()),
+            panic_entered: Arc::new(Notify::new()),
+            panic_release: Arc::new(Notify::new()),
+        };
+        let runtime = RuntimeBuilder::new(state.clone())
+            .max_active_actors(1)
+            .register::<LifecycleActor>()
+            .build()
+            .expect("runtime should build");
+        (runtime, state)
+    };
+    let first = runtime
+        .actor_ref::<LifecycleActor>(ActorId::from("first-fails"))
+        .expect("registered Actor Type");
+    let second = runtime
+        .actor_ref::<LifecycleActor>(ActorId::from("second-starts"))
+        .expect("registered Actor Type");
+
+    let failed = tokio::spawn(async move { first.add(1).await });
+    state.activation_entered.notified().await;
+    state.activation_release.notify_one();
+    assert_eq!(failed.await.unwrap(), Err(SendError::ActivationFailed));
+
+    let replacement = tokio::spawn(async move { second.add(2).await });
+    state.activation_entered.notified().await;
+    state.activation_release.notify_one();
+    assert_eq!(replacement.await.unwrap().unwrap(), 2);
+}

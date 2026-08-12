@@ -36,6 +36,10 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         ImplItem::Fn(method) if method.sig.ident == "on_activate" => Some(method.clone()),
         _ => None,
     });
+    let deactivation = actor_impl.items.iter().find_map(|item| match item {
+        ImplItem::Fn(method) if method.sig.ident == "on_deactivate" => Some(method.clone()),
+        _ => None,
+    });
 
     if commands.is_empty() {
         return compile_error("an actor must declare at least one #[command]");
@@ -177,6 +181,32 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
     };
+    let deactivate = if deactivation.is_some() {
+        quote! {
+            fn deactivate<'a>(
+                actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
+                context: ::coactor::ActorContext<'a, #state_type>,
+                reason: ::coactor::DeactivationReason,
+            ) -> ::coactor::__private::BoxFuture<'a, ()> {
+                ::std::boxed::Box::pin(async move {
+                    let actor = actor
+                        .downcast_mut::<#actor_type>()
+                        .expect("CoActor registered an incompatible Actor Type");
+                    actor.on_deactivate(&context, reason).await
+                })
+            }
+        }
+    } else {
+        quote! {
+            fn deactivate<'a>(
+                _actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
+                _context: ::coactor::ActorContext<'a, #state_type>,
+                _reason: ::coactor::DeactivationReason,
+            ) -> ::coactor::__private::BoxFuture<'a, ()> {
+                ::std::boxed::Box::pin(async {})
+            }
+        }
+    };
 
     quote! {
         #actor_impl
@@ -201,6 +231,7 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             #activate
+            #deactivate
 
             fn make_ref(inner: ::coactor::__private::ActorRef<#state_type>) -> Self::Ref {
                 #ref_ident { inner }

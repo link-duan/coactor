@@ -6,11 +6,12 @@ use std::{
     convert::Infallible,
     fmt,
     sync::{Arc, Weak},
+    time::Duration,
 };
 
 use parking_lot::Mutex;
 use thiserror::Error;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 pub use coactor_macros::{actor, command};
 
@@ -107,6 +108,7 @@ pub enum ActorRefError {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ActorTypeConfig {
     mailbox_capacity: Option<usize>,
+    idle_timeout: Option<Duration>,
 }
 
 impl ActorTypeConfig {
@@ -118,6 +120,17 @@ impl ActorTypeConfig {
         self.mailbox_capacity = Some(capacity);
         self
     }
+
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = Some(timeout);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeactivationReason {
+    Idle,
+    Shutdown,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -128,6 +141,10 @@ pub enum SendError<E = Infallible> {
     MailboxFull,
     #[error("the Active Actor failed to activate")]
     ActivationFailed,
+    #[error("the Active Actor is deactivating")]
+    ActorDeactivating,
+    #[error("the runtime has reached its Active Actor limit")]
+    RuntimeAtCapacity,
     #[error("the Active Actor stopped")]
     ActorStopped,
     #[error("the CoActor runtime stopped")]
@@ -138,6 +155,9 @@ pub struct RuntimeBuilder<S> {
     state: S,
     registrations: Vec<__private::Registration<S>>,
     mailbox_capacity: usize,
+    max_active_actors: usize,
+    idle_timeout: Duration,
+    deactivation_timeout: Duration,
 }
 
 impl<S> RuntimeBuilder<S>
@@ -149,11 +169,29 @@ where
             state,
             registrations: Vec::new(),
             mailbox_capacity: 32,
+            max_active_actors: 10_000,
+            idle_timeout: Duration::from_secs(60),
+            deactivation_timeout: Duration::from_secs(5),
         }
     }
 
     pub fn mailbox_capacity(mut self, capacity: usize) -> Self {
         self.mailbox_capacity = capacity;
+        self
+    }
+
+    pub fn max_active_actors(mut self, maximum: usize) -> Self {
+        self.max_active_actors = maximum;
+        self
+    }
+
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    pub fn deactivation_timeout(mut self, timeout: Duration) -> Self {
+        self.deactivation_timeout = timeout;
         self
     }
 
@@ -171,12 +209,13 @@ where
     {
         let mut registration = __private::Registration::of::<A>();
         registration.mailbox_capacity = config.mailbox_capacity;
+        registration.idle_timeout = config.idle_timeout;
         self.registrations.push(registration);
         self
     }
 
     pub fn build(self) -> Result<Runtime<S>, BuildError> {
-        if self.mailbox_capacity == 0 {
+        if self.mailbox_capacity == 0 || self.max_active_actors == 0 {
             return Err(BuildError::InvalidMailboxCapacity);
         }
         let mut registrations = HashMap::new();
@@ -186,6 +225,9 @@ where
             }
             if registration.mailbox_capacity.is_none() {
                 registration.mailbox_capacity = Some(self.mailbox_capacity);
+            }
+            if registration.idle_timeout.is_none() {
+                registration.idle_timeout = Some(self.idle_timeout);
             }
             let name = registration.name;
             if registrations.insert(name, registration).is_some() {
@@ -197,6 +239,9 @@ where
                 state: Arc::new(self.state),
                 registrations,
                 actors: Mutex::new(HashMap::new()),
+                capacity: Arc::new(Semaphore::new(self.max_active_actors)),
+                deactivation_timeout: self.deactivation_timeout,
+                next_generation: std::sync::atomic::AtomicU64::new(1),
             }),
         })
     }
@@ -227,7 +272,13 @@ where
 #[doc(hidden)]
 pub mod __private {
     use super::*;
-    use std::{future::Future, marker::PhantomData, pin::Pin};
+    use std::{
+        future::Future,
+        marker::PhantomData,
+        pin::Pin,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    use tokio::sync::OwnedSemaphorePermit;
 
     pub use futures_util::FutureExt;
     pub use tokio;
@@ -250,6 +301,11 @@ pub mod __private {
         &'a mut (dyn Any + Send),
         ActorContext<'a, S>,
     ) -> BoxFuture<'a, Result<(), String>>;
+    type Deactivate<S> = for<'a> fn(
+        &'a mut (dyn Any + Send),
+        ActorContext<'a, S>,
+        DeactivationReason,
+    ) -> BoxFuture<'a, ()>;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum CommandOutcome {
@@ -263,6 +319,8 @@ pub mod __private {
         RuntimeStopped,
         MailboxFull,
         ActivationFailed,
+        ActorDeactivating,
+        RuntimeAtCapacity,
     }
 
     impl<E> From<RuntimeError> for SendError<E> {
@@ -272,6 +330,8 @@ pub mod __private {
                 RuntimeError::RuntimeStopped => Self::RuntimeStopped,
                 RuntimeError::MailboxFull => Self::MailboxFull,
                 RuntimeError::ActivationFailed => Self::ActivationFailed,
+                RuntimeError::ActorDeactivating => Self::ActorDeactivating,
+                RuntimeError::RuntimeAtCapacity => Self::RuntimeAtCapacity,
             }
         }
     }
@@ -285,6 +345,11 @@ pub mod __private {
             actor: &'a mut (dyn Any + Send),
             context: ActorContext<'a, S>,
         ) -> BoxFuture<'a, Result<(), String>>;
+        fn deactivate<'a>(
+            actor: &'a mut (dyn Any + Send),
+            context: ActorContext<'a, S>,
+            reason: DeactivationReason,
+        ) -> BoxFuture<'a, ()>;
         fn make_ref(inner: ActorRef<S>) -> Self::Ref;
     }
 
@@ -292,7 +357,9 @@ pub mod __private {
         pub name: &'static str,
         create: fn(ActorId) -> Box<dyn Any + Send>,
         activate: Activate<S>,
+        deactivate: Deactivate<S>,
         pub mailbox_capacity: Option<usize>,
+        pub idle_timeout: Option<Duration>,
         marker: PhantomData<fn(S)>,
     }
 
@@ -305,7 +372,9 @@ pub mod __private {
                 name: A::NAME,
                 create: |actor_id| Box::new(A::create(actor_id)),
                 activate: A::activate,
+                deactivate: A::deactivate,
                 mailbox_capacity: None,
+                idle_timeout: None,
                 marker: PhantomData,
             }
         }
@@ -314,7 +383,20 @@ pub mod __private {
     pub struct RuntimeInner<S> {
         pub state: Arc<S>,
         pub registrations: HashMap<&'static str, Registration<S>>,
-        pub actors: Mutex<HashMap<ActorAddress, CommandSender<S>>>,
+        pub actors: Mutex<HashMap<ActorAddress, Route<S>>>,
+        pub capacity: Arc<Semaphore>,
+        pub deactivation_timeout: Duration,
+        pub next_generation: AtomicU64,
+    }
+
+    pub struct Route<S> {
+        generation: u64,
+        state: RouteState<S>,
+    }
+
+    enum RouteState<S> {
+        Active(CommandSender<S>),
+        Deactivating,
     }
 
     pub struct ActorRef<S> {
@@ -341,28 +423,60 @@ pub mod __private {
                 return Err(RuntimeError::RuntimeStopped);
             };
 
-            let sender = {
-                let mut actors = runtime.actors.lock();
-                actors
-                    .entry(self.address.clone())
-                    .or_insert_with(|| spawn_actor(runtime.clone(), self.address.clone()))
-                    .clone()
-            };
+            let mut actors = runtime.actors.lock();
+            if let Some(route) = actors.get(&self.address) {
+                return match &route.state {
+                    RouteState::Active(sender) => try_send(sender, command),
+                    RouteState::Deactivating => {
+                        command.fail(RuntimeError::ActorDeactivating);
+                        Err(RuntimeError::ActorDeactivating)
+                    }
+                };
+            }
 
-            sender.try_send(command).map_err(|error| match error {
-                mpsc::error::TrySendError::Full(command) => {
-                    command.fail(RuntimeError::MailboxFull);
-                    RuntimeError::MailboxFull
+            let permit = match runtime.capacity.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    command.fail(RuntimeError::RuntimeAtCapacity);
+                    return Err(RuntimeError::RuntimeAtCapacity);
                 }
-                mpsc::error::TrySendError::Closed(command) => {
-                    command.fail(RuntimeError::ActorStopped);
-                    RuntimeError::ActorStopped
-                }
-            })
+            };
+            let generation = runtime.next_generation.fetch_add(1, Ordering::Relaxed);
+            let sender = spawn_actor(runtime.clone(), self.address.clone(), generation, permit);
+            let result = try_send(&sender, command);
+            actors.insert(
+                self.address.clone(),
+                Route {
+                    generation,
+                    state: RouteState::Active(sender),
+                },
+            );
+            result
         }
     }
 
-    fn spawn_actor<S>(runtime: Arc<RuntimeInner<S>>, address: ActorAddress) -> CommandSender<S>
+    fn try_send<S: 'static>(
+        sender: &CommandSender<S>,
+        command: Command<S>,
+    ) -> Result<(), RuntimeError> {
+        sender.try_send(command).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(command) => {
+                command.fail(RuntimeError::MailboxFull);
+                RuntimeError::MailboxFull
+            }
+            mpsc::error::TrySendError::Closed(command) => {
+                command.fail(RuntimeError::ActorStopped);
+                RuntimeError::ActorStopped
+            }
+        })
+    }
+
+    fn spawn_actor<S>(
+        runtime: Arc<RuntimeInner<S>>,
+        address: ActorAddress,
+        generation: u64,
+        permit: OwnedSemaphorePermit,
+    ) -> CommandSender<S>
     where
         S: Send + Sync + 'static,
     {
@@ -375,10 +489,15 @@ pub mod __private {
             .expect("mailbox capacity was not configured");
         let create = registration.create;
         let activate = registration.activate;
+        let deactivate = registration.deactivate;
+        let idle_timeout = registration
+            .idle_timeout
+            .expect("idle timeout was not configured");
         let mut actor = create(address.actor_id().clone());
         let (sender, mut receiver) = mpsc::channel::<Command<S>>(mailbox_capacity);
         let task_sender = sender.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let activation_context = ActorContext {
                 address: &address,
                 state: runtime.state.as_ref(),
@@ -396,10 +515,43 @@ pub mod __private {
                 while let Ok(command) = receiver.try_recv() {
                     command.fail(RuntimeError::ActivationFailed);
                 }
-                remove_route(&runtime, &address, &task_sender);
+                remove_route(&runtime, &address, generation);
                 return;
             }
-            while let Some(command) = receiver.recv().await {
+            loop {
+                let command = match tokio::time::timeout(idle_timeout, receiver.recv()).await {
+                    Ok(Some(command)) => command,
+                    Ok(None) => {
+                        remove_route(&runtime, &address, generation);
+                        return;
+                    }
+                    Err(_) => {
+                        if !begin_deactivation(&runtime, &address, generation, &task_sender) {
+                            continue;
+                        }
+                        let context = ActorContext {
+                            address: &address,
+                            state: runtime.state.as_ref(),
+                        };
+                        if tokio::time::timeout(
+                            runtime.deactivation_timeout,
+                            deactivate(actor.as_mut(), context, DeactivationReason::Idle),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            tracing::warn!(
+                                actor_type = address.actor_type(),
+                                actor_id = ?address.actor_id(),
+                                lifecycle = "deactivation",
+                                error_category = "DeactivationTimedOut",
+                                "Actor deactivation timed out"
+                            );
+                        }
+                        remove_route(&runtime, &address, generation);
+                        return;
+                    }
+                };
                 let context = ActorContext {
                     address: &address,
                     state: runtime.state.as_ref(),
@@ -417,24 +569,36 @@ pub mod __private {
                     while let Ok(command) = receiver.try_recv() {
                         command.fail(RuntimeError::ActorStopped);
                     }
-                    remove_route(&runtime, &address, &task_sender);
+                    remove_route(&runtime, &address, generation);
                     return;
                 }
             }
-            remove_route(&runtime, &address, &task_sender);
         });
         sender
     }
 
-    fn remove_route<S>(
+    fn begin_deactivation<S>(
         runtime: &RuntimeInner<S>,
         address: &ActorAddress,
+        generation: u64,
         sender: &CommandSender<S>,
-    ) {
+    ) -> bool {
+        let mut actors = runtime.actors.lock();
+        let Some(route) = actors.get_mut(address) else {
+            return false;
+        };
+        if route.generation != generation || sender.capacity() != sender.max_capacity() {
+            return false;
+        }
+        route.state = RouteState::Deactivating;
+        true
+    }
+
+    fn remove_route<S>(runtime: &RuntimeInner<S>, address: &ActorAddress, generation: u64) {
         let mut actors = runtime.actors.lock();
         if actors
             .get(address)
-            .is_some_and(|current| current.same_channel(sender))
+            .is_some_and(|route| route.generation == generation)
         {
             actors.remove(address);
         }
