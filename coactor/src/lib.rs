@@ -11,7 +11,7 @@ use std::{
 
 use parking_lot::Mutex;
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 
 pub use coactor_macros::{actor, command};
 
@@ -145,6 +145,8 @@ pub enum SendError<E = Infallible> {
     ActorDeactivating,
     #[error("the runtime has reached its Active Actor limit")]
     RuntimeAtCapacity,
+    #[error("the runtime is shutting down")]
+    RuntimeShuttingDown,
     #[error("the Active Actor stopped")]
     ActorStopped,
     #[error("the CoActor runtime stopped")]
@@ -158,6 +160,7 @@ pub struct RuntimeBuilder<S> {
     max_active_actors: usize,
     idle_timeout: Duration,
     deactivation_timeout: Duration,
+    shutdown_timeout: Duration,
 }
 
 impl<S> RuntimeBuilder<S>
@@ -172,6 +175,7 @@ where
             max_active_actors: 10_000,
             idle_timeout: Duration::from_secs(60),
             deactivation_timeout: Duration::from_secs(5),
+            shutdown_timeout: Duration::from_secs(30),
         }
     }
 
@@ -192,6 +196,11 @@ where
 
     pub fn deactivation_timeout(mut self, timeout: Duration) -> Self {
         self.deactivation_timeout = timeout;
+        self
+    }
+
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
         self
     }
 
@@ -242,6 +251,8 @@ where
                 capacity: Arc::new(Semaphore::new(self.max_active_actors)),
                 deactivation_timeout: self.deactivation_timeout,
                 next_generation: std::sync::atomic::AtomicU64::new(1),
+                status: std::sync::atomic::AtomicU8::new(__private::RUNNING),
+                shutdown_timeout: self.shutdown_timeout,
             }),
         })
     }
@@ -267,6 +278,10 @@ where
             address: ActorAddress::new(A::NAME, actor_id),
         }))
     }
+
+    pub async fn shutdown(self) {
+        self.inner.shutdown().await;
+    }
 }
 
 #[doc(hidden)]
@@ -276,12 +291,16 @@ pub mod __private {
         future::Future,
         marker::PhantomData,
         pin::Pin,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::atomic::{AtomicU8, AtomicU64, Ordering},
     };
     use tokio::sync::OwnedSemaphorePermit;
 
     pub use futures_util::FutureExt;
     pub use tokio;
+
+    pub const RUNNING: u8 = 0;
+    const SHUTTING_DOWN: u8 = 1;
+    const STOPPED: u8 = 2;
 
     pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -321,6 +340,7 @@ pub mod __private {
         ActivationFailed,
         ActorDeactivating,
         RuntimeAtCapacity,
+        RuntimeShuttingDown,
     }
 
     impl<E> From<RuntimeError> for SendError<E> {
@@ -332,6 +352,7 @@ pub mod __private {
                 RuntimeError::ActivationFailed => Self::ActivationFailed,
                 RuntimeError::ActorDeactivating => Self::ActorDeactivating,
                 RuntimeError::RuntimeAtCapacity => Self::RuntimeAtCapacity,
+                RuntimeError::RuntimeShuttingDown => Self::RuntimeShuttingDown,
             }
         }
     }
@@ -387,11 +408,16 @@ pub mod __private {
         pub capacity: Arc<Semaphore>,
         pub deactivation_timeout: Duration,
         pub next_generation: AtomicU64,
+        pub status: AtomicU8,
+        pub shutdown_timeout: Duration,
     }
 
     pub struct Route<S> {
         generation: u64,
         state: RouteState<S>,
+        shutdown: watch::Sender<bool>,
+        abort: tokio::task::AbortHandle,
+        completed: watch::Receiver<bool>,
     }
 
     enum RouteState<S> {
@@ -424,6 +450,17 @@ pub mod __private {
             };
 
             let mut actors = runtime.actors.lock();
+            match runtime.status.load(Ordering::Acquire) {
+                RUNNING => {}
+                SHUTTING_DOWN => {
+                    command.fail(RuntimeError::RuntimeShuttingDown);
+                    return Err(RuntimeError::RuntimeShuttingDown);
+                }
+                _ => {
+                    command.fail(RuntimeError::RuntimeStopped);
+                    return Err(RuntimeError::RuntimeStopped);
+                }
+            }
             if let Some(route) = actors.get(&self.address) {
                 return match &route.state {
                     RouteState::Active(sender) => try_send(sender, command),
@@ -442,17 +479,27 @@ pub mod __private {
                 }
             };
             let generation = runtime.next_generation.fetch_add(1, Ordering::Relaxed);
-            let sender = spawn_actor(runtime.clone(), self.address.clone(), generation, permit);
-            let result = try_send(&sender, command);
+            let spawned = spawn_actor(runtime.clone(), self.address.clone(), generation, permit);
+            let result = try_send(&spawned.sender, command);
             actors.insert(
                 self.address.clone(),
                 Route {
                     generation,
-                    state: RouteState::Active(sender),
+                    state: RouteState::Active(spawned.sender),
+                    shutdown: spawned.shutdown,
+                    abort: spawned.abort,
+                    completed: spawned.completed,
                 },
             );
             result
         }
+    }
+
+    struct Spawned<S> {
+        sender: CommandSender<S>,
+        shutdown: watch::Sender<bool>,
+        abort: tokio::task::AbortHandle,
+        completed: watch::Receiver<bool>,
     }
 
     fn try_send<S: 'static>(
@@ -476,7 +523,7 @@ pub mod __private {
         address: ActorAddress,
         generation: u64,
         permit: OwnedSemaphorePermit,
-    ) -> CommandSender<S>
+    ) -> Spawned<S>
     where
         S: Send + Sync + 'static,
     {
@@ -496,7 +543,10 @@ pub mod __private {
         let mut actor = create(address.actor_id().clone());
         let (sender, mut receiver) = mpsc::channel::<Command<S>>(mailbox_capacity);
         let task_sender = sender.clone();
-        tokio::spawn(async move {
+        let (shutdown, mut shutdown_receiver) = watch::channel(false);
+        let (completion_sender, completed) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _completion = CompletionGuard(completion_sender);
             let _permit = permit;
             let activation_context = ActorContext {
                 address: &address,
@@ -519,37 +569,71 @@ pub mod __private {
                 return;
             }
             loop {
-                let command = match tokio::time::timeout(idle_timeout, receiver.recv()).await {
-                    Ok(Some(command)) => command,
-                    Ok(None) => {
-                        remove_route(&runtime, &address, generation);
-                        return;
+                let command = tokio::select! {
+                    biased;
+                    changed = shutdown_receiver.changed() => {
+                        if changed.is_ok() && *shutdown_receiver.borrow() {
+                            receiver.close();
+                            while let Some(command) = receiver.recv().await {
+                                let context = ActorContext {
+                                    address: &address,
+                                    state: runtime.state.as_ref(),
+                                };
+                                if command.execute(actor.as_mut(), context).await
+                                    == CommandOutcome::Panicked
+                                {
+                                    receiver.close();
+                                    while let Ok(command) = receiver.try_recv() {
+                                        command.fail(RuntimeError::ActorStopped);
+                                    }
+                                    remove_route(&runtime, &address, generation);
+                                    return;
+                                }
+                            }
+                            let context = ActorContext {
+                                address: &address,
+                                state: runtime.state.as_ref(),
+                            };
+                            deactivate(actor.as_mut(), context, DeactivationReason::Shutdown).await;
+                            remove_route(&runtime, &address, generation);
+                            return;
+                        }
+                        continue;
                     }
-                    Err(_) => {
-                        if !begin_deactivation(&runtime, &address, generation, &task_sender) {
-                            continue;
+                    received = tokio::time::timeout(idle_timeout, receiver.recv()) => {
+                        match received {
+                            Ok(Some(command)) => command,
+                            Ok(None) => {
+                                remove_route(&runtime, &address, generation);
+                                return;
+                            }
+                            Err(_) => {
+                                if !begin_deactivation(&runtime, &address, generation, &task_sender) {
+                                    continue;
+                                }
+                                let context = ActorContext {
+                                    address: &address,
+                                    state: runtime.state.as_ref(),
+                                };
+                                if tokio::time::timeout(
+                                    runtime.deactivation_timeout,
+                                    deactivate(actor.as_mut(), context, DeactivationReason::Idle),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    tracing::warn!(
+                                        actor_type = address.actor_type(),
+                                        actor_id = ?address.actor_id(),
+                                        lifecycle = "deactivation",
+                                        error_category = "DeactivationTimedOut",
+                                        "Actor deactivation timed out"
+                                    );
+                                }
+                                remove_route(&runtime, &address, generation);
+                                return;
+                            }
                         }
-                        let context = ActorContext {
-                            address: &address,
-                            state: runtime.state.as_ref(),
-                        };
-                        if tokio::time::timeout(
-                            runtime.deactivation_timeout,
-                            deactivate(actor.as_mut(), context, DeactivationReason::Idle),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            tracing::warn!(
-                                actor_type = address.actor_type(),
-                                actor_id = ?address.actor_id(),
-                                lifecycle = "deactivation",
-                                error_category = "DeactivationTimedOut",
-                                "Actor deactivation timed out"
-                            );
-                        }
-                        remove_route(&runtime, &address, generation);
-                        return;
                     }
                 };
                 let context = ActorContext {
@@ -574,7 +658,20 @@ pub mod __private {
                 }
             }
         });
-        sender
+        Spawned {
+            sender,
+            shutdown,
+            abort: task.abort_handle(),
+            completed,
+        }
+    }
+
+    struct CompletionGuard(watch::Sender<bool>);
+
+    impl Drop for CompletionGuard {
+        fn drop(&mut self) {
+            let _ = self.0.send(true);
+        }
     }
 
     fn begin_deactivation<S>(
@@ -601,6 +698,57 @@ pub mod __private {
             .is_some_and(|route| route.generation == generation)
         {
             actors.remove(address);
+        }
+    }
+
+    impl<S> RuntimeInner<S>
+    where
+        S: Send + Sync + 'static,
+    {
+        pub async fn shutdown(self: &Arc<Self>) {
+            let (mut completions, aborts) = {
+                let actors = self.actors.lock();
+                if self
+                    .status
+                    .compare_exchange(RUNNING, SHUTTING_DOWN, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
+
+                let mut completions = Vec::with_capacity(actors.len());
+                let mut aborts = Vec::with_capacity(actors.len());
+                for route in actors.values() {
+                    let _ = route.shutdown.send(true);
+                    completions.push(route.completed.clone());
+                    aborts.push(route.abort.clone());
+                }
+                (completions, aborts)
+            };
+
+            let wait = async {
+                for completion in &mut completions {
+                    if !*completion.borrow() {
+                        let _ = completion.wait_for(|completed| *completed).await;
+                    }
+                }
+            };
+            if tokio::time::timeout(self.shutdown_timeout, wait)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    lifecycle = "shutdown",
+                    error_category = "ShutdownTimedOut",
+                    "CoActor runtime shutdown timed out"
+                );
+                for abort in aborts {
+                    abort.abort();
+                }
+                tokio::task::yield_now().await;
+                self.actors.lock().clear();
+            }
+            self.status.store(STOPPED, Ordering::Release);
         }
     }
 }
