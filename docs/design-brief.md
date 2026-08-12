@@ -2,22 +2,22 @@
 
 ## 1. 问题定义
 
-构建一个 Rust stateful entity runtime，重点服务两类负载：
+构建一个 Rust stateful Actor runtime，重点服务两类负载：
 
-1. 在线游戏：每个 game room 一个实体，承担命令排序、tick、热状态与广播。
-2. 协同文档：每个 document 一个实体，承担 mutation 串行化、去重、版本分配与热视图。
+1. 在线游戏：每个 game room 一个 Actor，承担命令排序、tick、热状态与广播。
+2. 协同文档：每个 document 一个 Actor，承担 mutation 串行化、去重、版本分配与热视图。
 
-这不是单纯的 Actor remoting 项目。核心问题是 entity 的完整生命周期：定位、唯一所有权、激活、持久化、故障转移、fencing、回收和升级。
+这不是单纯的 Actor remoting 项目。核心问题是 Actor 的完整生命周期：定位、唯一所有权、启动、持久化、故障转移、fencing、回收和升级。
 
 ## 2. 必须明确的运行时语义
 
-- 调用方只使用 `EntityType + EntityId` 寻址。
-- 同一实体的 mutation 在单 owner 内串行执行。
-- ownership 由 lease/epoch 表示；旧 owner 的持久写必须被存储层拒绝。
-- delivery 采用 at-least-once + command ID 幂等，不承诺神奇的 exactly-once。
-- ACK 的含义必须区分：已入 mailbox、已写 journal、已提交业务状态。
-- 冷实体不对应永久 Tokio task；首次消息触发激活，空闲后安全 passivate。
-- 故障恢复从 snapshot + event/op log 开始，并安全处理重复命令。
+- 调用方只使用由 `ActorType + ActorId` 构成的 Actor Address 寻址。
+- 同一 Actor 的 mutation 在单 Owner 内串行执行。
+- ownership 由 lease/epoch 表示；旧 Owner 的持久数据必须与新 epoch 的状态隔离。
+- 不承诺 exactly-once；首版也尚未定义 durable delivery 与 command dedupe。
+- ACK 的含义必须区分：已入 mailbox、Handler Reply 与未来可能提供的 Durable ACK。
+- 冷 Actor 不对应永久 Tokio task；首次消息触发启动，空闲后安全 passivate。
+- 故障恢复使用 epoch-scoped Actor Store 与固定 Restore Cut；不预设 consumer 必须使用 snapshot + event/op log。
 
 ## 3. 两类负载的不同策略
 
@@ -30,49 +30,43 @@
 
 ### Collaborative document
 
-- 已 ACK operation 必须可恢复。
+- 如果未来对 operation 提供 Durable ACK，则已 durable ACK 的 operation 必须可恢复；首版普通 Handler Reply 不满足该语义。
 - operation 包含 `client_id + op_id + base_version/causal_context + schema_version`。
-- CRDT/OT op log 与 snapshot 是长期真源；entity 是串行器、materialized view 与广播协调器。
+- CRDT/OT op log 与 snapshot 是长期真源；Actor 是串行器、materialized view 与广播协调器。
 - presence/cursor 属于软状态，不进入 durable document log。
 
 ## 4. 建议的首个 vertical slice
 
-先实现单机多实体，再引入分布式 ownership：
+首个版本只实现单进程 Actor runtime：
 
-1. `EntityId`、有界 mailbox、按 key 懒激活。
+1. `ActorAddress`、有界 mailbox、按 Actor ID 懒启动。
 2. idle passivation，保证 passivation 与新消息竞争时不丢消息。
-3. command ID 去重、内存 journal 接口、snapshot/restore。
-4. 两节点 owner directory，使用单调 epoch。
-5. 模拟旧 owner/zombie，证明带旧 epoch 的写被拒绝。
-6. kill -9 恢复测试与重复投递测试。
 
-首个 demo 建议选择回合制 room counter，而不是直接实现 60 Hz 游戏循环或完整 CRDT。
+状态存储、distributed ownership、fencing、恢复与迁移在后续阶段整体推进，不属于首版实现或保证。
+
+首个 demo 选择最小 `CounterActor`，只验证通用 runtime 语义，不实现 60 Hz 游戏循环、room domain 或完整 CRDT。
 
 ## 5. 初始模块草案
 
 ```text
-coactor-core      EntityId, EntityRef, mailbox, lifecycle
-coactor-storage   journal, snapshot, conditional/fenced writes
-coactor-cluster   membership, placement, lease/epoch, handoff
-coactor-runtime   activation registry, routing, admission control
+coactor-core      ActorType, ActorId, ActorAddress, ActorRef, mailbox, lifecycle
+coactor-runtime   Active Actor registry, routing, admission control
 examples/room     stateful room vertical slice
-tests/chaos       crash, partition, duplicate, stale-owner tests
 ```
 
 模块边界只是起点，应由第一个 vertical slice 反推调整。
 
 ## 6. 关键验收问题
 
-1. 两个节点都认为自己是 owner 时，哪个写被拒绝？
-2. 已 ACK 的最后一条命令，节点断电后从哪里恢复？
-3. passivation/handoff 期间到达的消息在哪里排队？
-4. 一百万冷实体占用什么资源？
-5. 热 key 过载时是背压、拒绝、合并还是 OOM？
-6. 旧事件和 snapshot 如何跨版本读取和迁移？
+1. 同一 Actor Address 的并发 command 是否始终由一个 Active Actor 串行处理？
+2. passivation 期间到达的消息在哪里排队，是否可能丢失？
+3. 一百万冷 Actor 占用什么资源？
+4. 热 key 过载时是背压、拒绝、合并还是 OOM？
+5. handler panic 或 Active Actor task 异常结束后，已接纳 command 如何失败？
 
 ## 7. 调研背景
 
-前置调研结论：Ractor、Kameo、Elfo 更适合节点内 Actor 数据面，缺少完整的跨节点 durable entity 生命周期；Coerce、Atomr、Murmer 暂不足以直接承载关键状态真源；Restate Virtual Objects 能力接近，但 Server 当前为 BSL 1.1。
+前置调研结论：Ractor、Kameo、Elfo 更适合节点内 Actor 数据面，缺少完整的跨节点 durable Actor 生命周期；Coerce、Atomr、Murmer 暂不足以直接承载关键状态真源；Restate Virtual Objects 能力接近，但 Server 当前为 BSL 1.1。
 
 原始调研文件位于：
 

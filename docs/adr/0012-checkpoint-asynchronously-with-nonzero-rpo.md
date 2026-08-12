@@ -1,0 +1,3 @@
+# Checkpoint asynchronously with non-zero RPO
+
+CoActor 后续首个 persistence slice 在 Actor Store 第一次由 clean 变 dirty 时启动可配置的 `max_dirty_age` 计时，并由 runtime 串行上传完整 state object；后续 mutation 不重置计时。runtime 提供全局默认值，Actor Type 注册时可以覆盖，不支持按 Actor ID 单独配置。每次 checkpoint 固定一个 Actor Store revision，上传成功只证明该 revision 已持久化；如果上传期间当前 revision 已前进，Store 仍保持 dirty，下一轮计时从 checkpoint 固定后发生的第一次新 mutation 开始。Handler Reply 在本地 KV mutation 完成后即可返回，不等待对象存储，也不提供 `ensure_durable()`，因为面向持续运行的游戏房间和协同文档时，对每次 reply 强制整文件上传代价过高。该 slice 明确接受 crash 可能丢失最近已回复修改、`max_dirty_age` 不是严格 RPO 上限；但计划内 passivation、migration 与 shutdown 必须先成功持久化，否则不得退出。state PUT 在有界重试后仍失败时，Active Actor 进入 Persistence Fault：拒绝所有新 command、停止执行 handler、保留已排队 command 与本地 Store，但不影响同节点其他 Actor。它不尝试推断 handler 是否只读。该决定不属于无存储、单进程的首版范围。

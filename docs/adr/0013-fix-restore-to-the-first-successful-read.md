@@ -1,0 +1,3 @@
+# Fix restore to the first successful state read
+
+新 Owner 获得 Ownership Epoch 后，通过对象存储 LIST 选择严格小于新 epoch、且存在 state object 的最大 epoch；epoch 不要求连续。对该来源 object 的第一次成功 GET 会固定 Restore Cut，其身份由 `{source_epoch, embedded_revision, ETag}` 表示，本次恢复不再重新读取或追逐该旧 object 的更新。这样即使旧 Owner 的普通重试稍后覆盖同一 epoch object，已经开始的恢复仍使用一个确定版本。新 Owner 不需要在开始服务前上传新 epoch baseline，以避免每次 ownership 转移都强制传输完整 Actor Store。若完全没有历史 state object，runtime 为改善首次使用体验而直接创建空 Actor Store；因此首次创建、首次 checkpoint 前崩溃和历史对象被错误删除在该层不可区分。若选中的最大历史 object 存在但完整性、格式或 KV 文件校验失败，activation 进入 Restore Fault，不自动回退到更早 epoch，以免静默丢弃后来状态。历史 epoch 增多后仍需要 retention、GC 或索引策略。
