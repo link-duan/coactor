@@ -1,0 +1,15 @@
+error: all commands on one Actor Type must use the same ActorContext state type
+ --> tests/ui/fail/inconsistent_app_state.rs:5:1
+  |
+5 | #[actor(name = "inconsistent")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `actor` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused imports: `ActorContext` and `ActorId`
+ --> tests/ui/fail/inconsistent_app_state.rs:1:15
+  |
+1 | use coactor::{ActorContext, ActorId, actor};
+  |               ^^^^^^^^^^^^  ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

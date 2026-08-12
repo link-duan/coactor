@@ -12,6 +12,11 @@ pub fn command(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 
 #[proc_macro_attribute]
 pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    if attribute.is_empty() {
+        return compile_error(
+            "#[actor] requires an explicit stable name: #[actor(name = \"...\")]",
+        );
+    }
     let actor_name = parse_macro_input!(attribute as ActorAttribute).name;
     let mut actor_impl = parse_macro_input!(item as ItemImpl);
 
@@ -49,6 +54,16 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         Ok(state) => state,
         Err(message) => return compile_error(message),
     };
+    if let Some(activation) = &activation
+        && let Err(message) = validate_activation(activation, &state_type)
+    {
+        return compile_error(message);
+    }
+    if let Some(deactivation) = &deactivation
+        && let Err(message) = validate_deactivation(deactivation, &state_type)
+    {
+        return compile_error(message);
+    }
 
     let mut generated_messages = Vec::new();
     let mut generated_ref_methods = Vec::new();
@@ -289,6 +304,56 @@ fn validate_command(command: &ImplItemFn, state_type: &Type) -> Result<(), &'sta
         return Err("all commands on one Actor Type must use the same ActorContext state type");
     }
     Ok(())
+}
+
+fn validate_activation(method: &ImplItemFn, state_type: &Type) -> Result<(), &'static str> {
+    if method.sig.asyncness.is_none() {
+        return Err("on_activate must be async");
+    }
+    if method.sig.inputs.len() != 2 || command_state_type(method).as_ref() != Ok(state_type) {
+        return Err("on_activate must take &mut self and &ActorContext with the Actor App State");
+    }
+    if !is_result_of_unit(&method.sig.output) {
+        return Err("on_activate must return Result<(), E>");
+    }
+    Ok(())
+}
+
+fn validate_deactivation(method: &ImplItemFn, state_type: &Type) -> Result<(), &'static str> {
+    if method.sig.asyncness.is_none() {
+        return Err("on_deactivate must be async");
+    }
+    if method.sig.inputs.len() != 3 || command_state_type(method).as_ref() != Ok(state_type) {
+        return Err(
+            "on_deactivate must take &mut self, &ActorContext with the Actor App State, and DeactivationReason",
+        );
+    }
+    if !matches!(method.sig.output, ReturnType::Default) {
+        return Err("on_deactivate must not return a value or error");
+    }
+    Ok(())
+}
+
+fn is_result_of_unit(output: &ReturnType) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    let Type::Path(path) = ty.as_ref() else {
+        return false;
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    if segment.ident != "Result" {
+        return false;
+    }
+    matches!(
+        arguments.args.first(),
+        Some(GenericArgument::Type(Type::Tuple(tuple))) if tuple.elems.is_empty()
+    )
 }
 
 fn command_state_type(command: &ImplItemFn) -> Result<Type, &'static str> {

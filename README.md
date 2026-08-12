@@ -34,6 +34,55 @@ The first version is a single-process Rust library built on the consumer's Tokio
 
 Actor state exists only in memory. After passivation, a process exit, or a crash, the actor starts again from empty state.
 
+## Quick start
+
+CoActor is embedded in an existing Tokio application. Define an Actor with an explicit stable Actor Type name, mark each caller-visible command, register the Actor Type before runtime startup, then keep and clone its generated typed Actor Ref:
+
+```rust
+use coactor::{ActorContext, ActorId, RuntimeBuilder, actor};
+
+struct CounterActor(i64);
+
+#[actor(name = "counter")]
+impl CounterActor {
+    pub fn new(_actor_id: ActorId) -> Self {
+        Self(0)
+    }
+
+    #[coactor::command]
+    pub async fn add(&mut self, _context: &ActorContext<'_, ()>, amount: i64) -> i64 {
+        self.0 += amount;
+        self.0
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let runtime = RuntimeBuilder::new(())
+        .register::<CounterActor>()
+        .build()
+        .unwrap();
+    let counter = runtime
+        .actor_ref::<CounterActor>(ActorId::from("room-7"))
+        .unwrap();
+
+    assert_eq!(counter.add(2).await.unwrap(), 2);
+    runtime.shutdown().await;
+}
+```
+
+Run the complete example with:
+
+```console
+cargo run -p coactor --example counter
+```
+
+The generated Actor Ref is a weak, stable address handle. Obtaining or cloning it does not activate an Actor or keep the runtime alive. A method call lazily activates the addressed Actor, and calls for that Active Actor execute serially through its bounded mailbox.
+
+`RuntimeBuilder` provides runtime defaults for mailbox capacity, idle timeout, deactivation timeout, global Active Actor capacity, and shutdown timeout. `ActorTypeConfig` can override mailbox capacity and idle timeout for one Actor Type. Always await `Runtime::shutdown`; dropping a runtime without graceful shutdown has no drain or cleanup guarantee.
+
+An in-process Handler Reply only means that the command handler completed. It is not a durable acknowledgment. Idle passivation, panic, process termination, or runtime restart discards the Actor's in-memory state.
+
 ## Not currently provided
 
 The first version does not provide:

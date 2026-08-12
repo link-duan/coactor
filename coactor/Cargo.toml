@@ -16,4 +16,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+tracing-subscriber = { version = "0.3.19", features = ["fmt"] }
+trybuild = "1.0.105"
 
+[[example]]
+name = "counter"
+path = "examples/counter.rs"
