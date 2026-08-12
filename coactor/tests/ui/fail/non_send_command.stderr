@@ -16,6 +16,61 @@ note: required by a bound in `coactor::__private::ErasedCommand`
   |     pub trait ErasedCommand<S>: Send + 'static {
   |                                 ^^^^ required by this bound in `ErasedCommand`
 
+error[E0277]: `Rc<u8>` cannot be sent between threads safely
+ --> tests/ui/fail/non_send_command.rs:7:1
+  |
+7 | #[actor(name = "non-send")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<u8>` cannot be sent between threads safely
+  |
+  = help: within `(Rc<u8>,)`, the trait `Send` is not implemented for `Rc<u8>`
+  = note: required because it appears within the type `(Rc<u8>,)`
+note: required by a bound in `__coactor_assert_send_static`
+ --> tests/ui/fail/non_send_command.rs:7:1
+  |
+7 | #[actor(name = "non-send")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `__coactor_assert_send_static`
+  = note: this error originates in the attribute macro `actor` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Rc<u8>` cannot be sent between threads safely
+  --> tests/ui/fail/non_send_command.rs:14:85
+   |
+14 |     pub async fn call(&mut self, _context: &ActorContext<'_, ()>, value: Rc<u8>) -> Rc<u8> {
+   |                                                                                     ^^^^^^ `Rc<u8>` cannot be sent between threads safely
+   |
+   = help: the trait `Send` is not implemented for `Rc<u8>`
+note: required by a bound in `__coactor_assert_send_static`
+  --> tests/ui/fail/non_send_command.rs:7:1
+   |
+ 7 | #[actor(name = "non-send")]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `__coactor_assert_send_static`
+   = note: this error originates in the attribute macro `actor` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Rc<u8>` cannot be sent between threads safely
+ --> tests/ui/fail/non_send_command.rs:7:1
+  |
+7 | #[actor(name = "non-send")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Rc<u8>` cannot be sent between threads safely
+  |
+  = help: within `__NonSendCallCommand`, the trait `Send` is not implemented for `Rc<u8>`
+note: required because it appears within the type `__NonSendCallCommand`
+ --> tests/ui/fail/non_send_command.rs:8:6
+  |
+8 | impl NonSend {
+  |      ^^^^^^^
+  = note: required for `std::ptr::Unique<__NonSendCallCommand>` to implement `Send`
+note: required because it appears within the type `Box<__NonSendCallCommand>`
+ --> $RUST/alloc/src/boxed.rs
+  |
+  | pub struct Box<
+  |            ^^^
+note: required because it's used within this closure
+ --> tests/ui/fail/non_send_command.rs:7:1
+  |
+7 | #[actor(name = "non-send")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: required for the cast from `Box<{closure@$DIR/tests/ui/fail/non_send_command.rs:7:1: 7:28}>` to `Box<(dyn FnOnce() + Send + 'static)>`
+  = note: this error originates in the attribute macro `actor` (in Nightly builds, run with -Z macro-backtrace for more info)
+
 error: future cannot be sent between threads safely
  --> tests/ui/fail/non_send_command.rs:7:1
   |

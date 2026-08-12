@@ -22,6 +22,35 @@ struct LifecycleActor {
     value: i64,
 }
 
+struct PanickingActivationActor;
+
+#[actor(name = "panicking-activation")]
+impl PanickingActivationActor {
+    pub fn new(_actor_id: ActorId) -> Self {
+        Self
+    }
+
+    pub async fn on_activate(
+        &mut self,
+        context: &ActorContext<'_, AppState>,
+    ) -> Result<(), &'static str> {
+        if context
+            .state()
+            .activation_attempts
+            .fetch_add(1, Ordering::SeqCst)
+            == 0
+        {
+            panic!("activation panic");
+        }
+        Ok(())
+    }
+
+    #[coactor::command]
+    pub async fn value(&mut self, _context: &ActorContext<'_, AppState>) -> i64 {
+        7
+    }
+}
+
 #[actor(name = "lifecycle")]
 impl LifecycleActor {
     pub fn new(_actor_id: ActorId) -> Self {
@@ -185,4 +214,26 @@ async fn activation_failure_releases_runtime_capacity() {
     state.activation_entered.notified().await;
     state.activation_release.notify_one();
     assert_eq!(replacement.await.unwrap().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn activation_panic_does_not_leave_a_closed_route_registered() {
+    let state = AppState {
+        activation_attempts: Arc::new(AtomicUsize::new(0)),
+        activation_entered: Arc::new(Notify::new()),
+        activation_release: Arc::new(Notify::new()),
+        panic_entered: Arc::new(Notify::new()),
+        panic_release: Arc::new(Notify::new()),
+    };
+    let runtime = RuntimeBuilder::new(state)
+        .max_active_actors(1)
+        .register::<PanickingActivationActor>()
+        .build()
+        .expect("runtime should build");
+    let actor = runtime
+        .actor_ref::<PanickingActivationActor>(ActorId::from("panic-once"))
+        .expect("registered Actor Type");
+
+    assert_eq!(actor.value().await, Err(SendError::ActorStopped));
+    assert_eq!(actor.value().await.unwrap(), 7);
 }

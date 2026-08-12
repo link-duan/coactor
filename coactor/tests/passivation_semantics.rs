@@ -22,6 +22,29 @@ struct PassivatingActor {
     value: i64,
 }
 
+struct PanickingDeactivationActor;
+
+#[actor(name = "panicking-deactivation")]
+impl PanickingDeactivationActor {
+    pub fn new(_actor_id: ActorId) -> Self {
+        Self
+    }
+
+    pub async fn on_deactivate(
+        &mut self,
+        context: &ActorContext<'_, AppState>,
+        _reason: DeactivationReason,
+    ) {
+        context.state().deactivation_entered.notify_one();
+        panic!("deactivation panic");
+    }
+
+    #[coactor::command]
+    pub async fn value(&mut self, _context: &ActorContext<'_, AppState>) -> i64 {
+        11
+    }
+}
+
 #[actor(name = "passivating")]
 impl PassivatingActor {
     pub fn new(_actor_id: ActorId) -> Self {
@@ -180,4 +203,24 @@ async fn calls_racing_with_passivation_are_never_lost() {
             other => panic!("unexpected race result: {other:?}"),
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_deactivation_panic_does_not_poison_the_actor_address() {
+    let state = state();
+    let runtime = RuntimeBuilder::new(state.clone())
+        .idle_timeout(Duration::from_secs(1))
+        .register::<PanickingDeactivationActor>()
+        .build()
+        .expect("runtime should build");
+    let actor = runtime
+        .actor_ref::<PanickingDeactivationActor>(ActorId::from("panic-idle"))
+        .expect("registered Actor Type");
+
+    assert_eq!(actor.value().await.unwrap(), 11);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    state.deactivation_entered.notified().await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(actor.value().await.unwrap(), 11);
 }

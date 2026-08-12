@@ -26,6 +26,10 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         _ => return compile_error("actor can only be applied to an inherent impl"),
     };
     let ref_ident = format_ident!("{}Ref", actor_ident);
+    let constructor = actor_impl.items.iter().find_map(|item| match item {
+        ImplItem::Fn(method) if method.sig.ident == "new" => Some(method.clone()),
+        _ => None,
+    });
 
     let commands: Vec<ImplItemFn> = actor_impl
         .items
@@ -48,6 +52,12 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     if commands.is_empty() {
         return compile_error("an actor must declare at least one #[command]");
+    }
+    let Some(constructor) = constructor else {
+        return compile_error("an actor must declare pub fn new(actor_id: ActorId) -> Self");
+    };
+    if let Err(message) = validate_constructor(&constructor) {
+        return compile_error(message);
     }
 
     let state_type = match command_state_type(&commands[0]) {
@@ -94,10 +104,13 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                         ::coactor::__private::CommandOutcome::Completed
                     }
                     ::core::result::Result::Err(_) => {
-                        let _ = self.reply.send(::core::result::Result::Err(
-                            ::coactor::SendError::ActorStopped,
-                        ));
-                        ::coactor::__private::CommandOutcome::Panicked
+                        ::coactor::__private::CommandOutcome::Panicked(
+                            ::std::boxed::Box::new(move || {
+                                let _ = self.reply.send(::core::result::Result::Err(
+                                    ::coactor::SendError::ActorStopped,
+                                ));
+                            })
+                        )
                     }
                 }
             }
@@ -114,10 +127,13 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                         ::coactor::__private::CommandOutcome::Completed
                     }
                     ::core::result::Result::Err(_) => {
-                        let _ = self.reply.send(::core::result::Result::Err(
-                            ::coactor::SendError::ActorStopped,
-                        ));
-                        ::coactor::__private::CommandOutcome::Panicked
+                        ::coactor::__private::CommandOutcome::Panicked(
+                            ::std::boxed::Box::new(move || {
+                                let _ = self.reply.send(::core::result::Result::Err(
+                                    ::coactor::SendError::ActorStopped,
+                                ));
+                            })
+                        )
                     }
                 }
             }
@@ -159,6 +175,11 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
                 #(#argument_names: #argument_types),*
             ) -> ::core::result::Result<#reply_type, ::coactor::SendError<#error_type>> {
+                fn __coactor_assert_send_static<T: ::core::marker::Send + 'static>() {}
+                fn __coactor_assert_error<T: ::core::fmt::Debug + ::core::marker::Send + 'static>() {}
+                __coactor_assert_send_static::<(#(#argument_types,)*)>();
+                __coactor_assert_send_static::<#reply_type>();
+                __coactor_assert_error::<#error_type>();
                 let (reply, receive) = ::coactor::__private::tokio::sync::oneshot::channel();
                 self.inner
                     .send(::std::boxed::Box::new(#message_ident {
@@ -306,6 +327,27 @@ fn validate_command(command: &ImplItemFn, state_type: &Type) -> Result<(), &'sta
     Ok(())
 }
 
+fn validate_constructor(method: &ImplItemFn) -> Result<(), &'static str> {
+    if !matches!(method.vis, syn::Visibility::Public(_))
+        || method.sig.asyncness.is_some()
+        || method.sig.inputs.len() != 1
+    {
+        return Err("actor constructor must be pub fn new(actor_id: ActorId) -> Self");
+    }
+    let Some(FnArg::Typed(argument)) = method.sig.inputs.first() else {
+        return Err("actor constructor must be pub fn new(actor_id: ActorId) -> Self");
+    };
+    if !type_ends_with(argument.ty.as_ref(), "ActorId")
+        || !matches!(
+            &method.sig.output,
+            ReturnType::Type(_, ty) if matches!(ty.as_ref(), Type::Path(path) if path.path.is_ident("Self"))
+        )
+    {
+        return Err("actor constructor must be pub fn new(actor_id: ActorId) -> Self");
+    }
+    Ok(())
+}
+
 fn validate_activation(method: &ImplItemFn, state_type: &Type) -> Result<(), &'static str> {
     if method.sig.asyncness.is_none() {
         return Err("on_activate must be async");
@@ -328,10 +370,23 @@ fn validate_deactivation(method: &ImplItemFn, state_type: &Type) -> Result<(), &
             "on_deactivate must take &mut self, &ActorContext with the Actor App State, and DeactivationReason",
         );
     }
+    let Some(FnArg::Typed(reason)) = method.sig.inputs.iter().nth(2) else {
+        return Err("on_deactivate must take DeactivationReason as its final parameter");
+    };
+    if !type_ends_with(reason.ty.as_ref(), "DeactivationReason") {
+        return Err("on_deactivate must take DeactivationReason as its final parameter");
+    }
     if !matches!(method.sig.output, ReturnType::Default) {
         return Err("on_deactivate must not return a value or error");
     }
     Ok(())
+}
+
+fn type_ends_with(ty: &Type, name: &str) -> bool {
+    matches!(
+        ty,
+        Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == name)
+    )
 }
 
 fn is_result_of_unit(output: &ReturnType) -> bool {

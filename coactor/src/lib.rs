@@ -97,6 +97,8 @@ pub enum BuildError {
     DuplicateActorType(&'static str),
     #[error("mailbox capacity must be greater than zero")]
     InvalidMailboxCapacity,
+    #[error("max_active_actors must be greater than zero")]
+    InvalidMaxActiveActors,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -224,8 +226,11 @@ where
     }
 
     pub fn build(self) -> Result<Runtime<S>, BuildError> {
-        if self.mailbox_capacity == 0 || self.max_active_actors == 0 {
+        if self.mailbox_capacity == 0 {
             return Err(BuildError::InvalidMailboxCapacity);
+        }
+        if self.max_active_actors == 0 {
+            return Err(BuildError::InvalidMaxActiveActors);
         }
         let mut registrations = HashMap::new();
         for mut registration in self.registrations {
@@ -326,10 +331,9 @@ pub mod __private {
         DeactivationReason,
     ) -> BoxFuture<'a, ()>;
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum CommandOutcome {
         Completed,
-        Panicked,
+        Panicked(Box<dyn FnOnce() + Send>),
     }
 
     #[derive(Clone, Copy)]
@@ -415,6 +419,7 @@ pub mod __private {
     pub struct Route<S> {
         generation: u64,
         state: RouteState<S>,
+        _capacity: OwnedSemaphorePermit,
         shutdown: watch::Sender<bool>,
         abort: tokio::task::AbortHandle,
         completed: watch::Receiver<bool>,
@@ -443,7 +448,7 @@ pub mod __private {
     where
         S: Send + Sync + 'static,
     {
-        pub fn send(&self, command: Command<S>) -> Result<(), RuntimeError> {
+        pub fn send(&self, mut command: Command<S>) -> Result<(), RuntimeError> {
             let Some(runtime) = self.runtime.upgrade() else {
                 command.fail(RuntimeError::RuntimeStopped);
                 return Err(RuntimeError::RuntimeStopped);
@@ -462,13 +467,32 @@ pub mod __private {
                 }
             }
             if let Some(route) = actors.get(&self.address) {
-                return match &route.state {
-                    RouteState::Active(sender) => try_send(sender, command),
+                match &route.state {
+                    RouteState::Active(sender) => match sender.try_send(command) {
+                        Ok(()) => return Ok(()),
+                        Err(mpsc::error::TrySendError::Full(command)) => {
+                            command.fail(RuntimeError::MailboxFull);
+                            return Err(RuntimeError::MailboxFull);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(returned)) => {
+                            let generation = route.generation;
+                            actors.remove(&self.address);
+                            command = returned;
+                            tracing::debug!(
+                                actor_type = self.address.actor_type(),
+                                actor_id = ?self.address.actor_id(),
+                                generation,
+                                lifecycle = "routing",
+                                error_category = "ClosedRouteReplaced",
+                                "Replacing a closed Actor route"
+                            );
+                        }
+                    },
                     RouteState::Deactivating => {
                         command.fail(RuntimeError::ActorDeactivating);
-                        Err(RuntimeError::ActorDeactivating)
+                        return Err(RuntimeError::ActorDeactivating);
                     }
-                };
+                }
             }
 
             let permit = match runtime.capacity.clone().try_acquire_owned() {
@@ -479,13 +503,14 @@ pub mod __private {
                 }
             };
             let generation = runtime.next_generation.fetch_add(1, Ordering::Relaxed);
-            let spawned = spawn_actor(runtime.clone(), self.address.clone(), generation, permit);
+            let spawned = spawn_actor(runtime.clone(), self.address.clone(), generation);
             let result = try_send(&spawned.sender, command);
             actors.insert(
                 self.address.clone(),
                 Route {
                     generation,
                     state: RouteState::Active(spawned.sender),
+                    _capacity: permit,
                     shutdown: spawned.shutdown,
                     abort: spawned.abort,
                     completed: spawned.completed,
@@ -522,7 +547,6 @@ pub mod __private {
         runtime: Arc<RuntimeInner<S>>,
         address: ActorAddress,
         generation: u64,
-        permit: OwnedSemaphorePermit,
     ) -> Spawned<S>
     where
         S: Send + Sync + 'static,
@@ -546,27 +570,67 @@ pub mod __private {
         let (shutdown, mut shutdown_receiver) = watch::channel(false);
         let (completion_sender, completed) = watch::channel(false);
         let task = tokio::spawn(async move {
-            let _completion = CompletionGuard(completion_sender);
-            let _permit = permit;
+            let _task_guard = ActorTaskGuard {
+                runtime: runtime.clone(),
+                address: address.clone(),
+                generation,
+                completion: completion_sender,
+            };
             let activation_context = ActorContext {
                 address: &address,
                 state: runtime.state.as_ref(),
             };
-            if let Err(error) = activate(actor.as_mut(), activation_context).await {
-                tracing::error!(
-                    actor_type = address.actor_type(),
-                    actor_id = ?address.actor_id(),
-                    lifecycle = "activation",
-                    error_category = "ActivationFailed",
-                    error = %error,
-                    "Actor activation failed"
-                );
-                receiver.close();
-                while let Ok(command) = receiver.try_recv() {
-                    command.fail(RuntimeError::ActivationFailed);
+            tracing::debug!(
+                actor_type = address.actor_type(),
+                actor_id = ?address.actor_id(),
+                lifecycle = "activation",
+                error_category = "None",
+                "Actor activation started"
+            );
+            match std::panic::AssertUnwindSafe(activate(actor.as_mut(), activation_context))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(())) => {
+                    tracing::debug!(
+                        actor_type = address.actor_type(),
+                        actor_id = ?address.actor_id(),
+                        lifecycle = "activation",
+                        error_category = "None",
+                        "Actor activation completed"
+                    );
                 }
-                remove_route(&runtime, &address, generation);
-                return;
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        actor_type = address.actor_type(),
+                        actor_id = ?address.actor_id(),
+                        lifecycle = "activation",
+                        error_category = "ActivationFailed",
+                        error = %error,
+                        "Actor activation failed"
+                    );
+                    receiver.close();
+                    remove_route(&runtime, &address, generation);
+                    while let Ok(command) = receiver.try_recv() {
+                        command.fail(RuntimeError::ActivationFailed);
+                    }
+                    return;
+                }
+                Err(_) => {
+                    tracing::error!(
+                        actor_type = address.actor_type(),
+                        actor_id = ?address.actor_id(),
+                        lifecycle = "activation",
+                        error_category = "ActorStopped",
+                        "Actor activation panicked"
+                    );
+                    receiver.close();
+                    remove_route(&runtime, &address, generation);
+                    while let Ok(command) = receiver.try_recv() {
+                        command.fail(RuntimeError::ActorStopped);
+                    }
+                    return;
+                }
             }
             loop {
                 let command = tokio::select! {
@@ -575,18 +639,14 @@ pub mod __private {
                         if changed.is_ok() && *shutdown_receiver.borrow() {
                             receiver.close();
                             while let Some(command) = receiver.recv().await {
-                                let context = ActorContext {
-                                    address: &address,
-                                    state: runtime.state.as_ref(),
-                                };
-                                if command.execute(actor.as_mut(), context).await
-                                    == CommandOutcome::Panicked
-                                {
-                                    receiver.close();
-                                    while let Ok(command) = receiver.try_recv() {
-                                        command.fail(RuntimeError::ActorStopped);
-                                    }
-                                    remove_route(&runtime, &address, generation);
+                                if !execute_command(
+                                    command,
+                                    actor.as_mut(),
+                                    &runtime,
+                                    &address,
+                                    generation,
+                                    &mut receiver,
+                                ).await {
                                     return;
                                 }
                             }
@@ -594,7 +654,39 @@ pub mod __private {
                                 address: &address,
                                 state: runtime.state.as_ref(),
                             };
-                            deactivate(actor.as_mut(), context, DeactivationReason::Shutdown).await;
+                            tracing::debug!(
+                                actor_type = address.actor_type(),
+                                actor_id = ?address.actor_id(),
+                                lifecycle = "deactivation",
+                                error_category = "None",
+                                reason = "Shutdown",
+                                "Actor shutdown deactivation started"
+                            );
+                            match std::panic::AssertUnwindSafe(deactivate(
+                                actor.as_mut(),
+                                context,
+                                DeactivationReason::Shutdown,
+                            ))
+                            .catch_unwind()
+                            .await
+                            {
+                                Ok(()) => tracing::debug!(
+                                    actor_type = address.actor_type(),
+                                    actor_id = ?address.actor_id(),
+                                    lifecycle = "deactivation",
+                                    error_category = "None",
+                                    reason = "Shutdown",
+                                    "Actor shutdown deactivation completed"
+                                ),
+                                Err(_) => tracing::error!(
+                                    actor_type = address.actor_type(),
+                                    actor_id = ?address.actor_id(),
+                                    lifecycle = "deactivation",
+                                    error_category = "ActorStopped",
+                                    reason = "Shutdown",
+                                    "Actor shutdown deactivation panicked"
+                                ),
+                            }
                             remove_route(&runtime, &address, generation);
                             return;
                         }
@@ -615,20 +707,48 @@ pub mod __private {
                                     address: &address,
                                     state: runtime.state.as_ref(),
                                 };
-                                if tokio::time::timeout(
+                                tracing::debug!(
+                                    actor_type = address.actor_type(),
+                                    actor_id = ?address.actor_id(),
+                                    lifecycle = "deactivation",
+                                    error_category = "None",
+                                    reason = "Idle",
+                                    "Actor idle deactivation started"
+                                );
+                                match tokio::time::timeout(
                                     runtime.deactivation_timeout,
-                                    deactivate(actor.as_mut(), context, DeactivationReason::Idle),
+                                    std::panic::AssertUnwindSafe(deactivate(
+                                        actor.as_mut(),
+                                        context,
+                                        DeactivationReason::Idle,
+                                    ))
+                                    .catch_unwind(),
                                 )
                                 .await
-                                .is_err()
                                 {
-                                    tracing::warn!(
+                                    Err(_) => tracing::warn!(
                                         actor_type = address.actor_type(),
                                         actor_id = ?address.actor_id(),
                                         lifecycle = "deactivation",
                                         error_category = "DeactivationTimedOut",
                                         "Actor deactivation timed out"
-                                    );
+                                    ),
+                                    Ok(Ok(())) => tracing::debug!(
+                                        actor_type = address.actor_type(),
+                                        actor_id = ?address.actor_id(),
+                                        lifecycle = "deactivation",
+                                        error_category = "None",
+                                        reason = "Idle",
+                                        "Actor idle deactivation completed"
+                                    ),
+                                    Ok(Err(_)) => tracing::error!(
+                                        actor_type = address.actor_type(),
+                                        actor_id = ?address.actor_id(),
+                                        lifecycle = "deactivation",
+                                        error_category = "ActorStopped",
+                                        reason = "Idle",
+                                        "Actor idle deactivation panicked"
+                                    ),
                                 }
                                 remove_route(&runtime, &address, generation);
                                 return;
@@ -636,24 +756,16 @@ pub mod __private {
                         }
                     }
                 };
-                let context = ActorContext {
-                    address: &address,
-                    state: runtime.state.as_ref(),
-                };
-                let outcome = command.execute(actor.as_mut(), context).await;
-                if outcome == CommandOutcome::Panicked {
-                    tracing::error!(
-                        actor_type = address.actor_type(),
-                        actor_id = ?address.actor_id(),
-                        lifecycle = "command",
-                        error_category = "ActorStopped",
-                        "Actor command handler panicked"
-                    );
-                    receiver.close();
-                    while let Ok(command) = receiver.try_recv() {
-                        command.fail(RuntimeError::ActorStopped);
-                    }
-                    remove_route(&runtime, &address, generation);
+                if !execute_command(
+                    command,
+                    actor.as_mut(),
+                    &runtime,
+                    &address,
+                    generation,
+                    &mut receiver,
+                )
+                .await
+                {
                     return;
                 }
             }
@@ -666,12 +778,53 @@ pub mod __private {
         }
     }
 
-    struct CompletionGuard(watch::Sender<bool>);
+    struct ActorTaskGuard<S> {
+        runtime: Arc<RuntimeInner<S>>,
+        address: ActorAddress,
+        generation: u64,
+        completion: watch::Sender<bool>,
+    }
 
-    impl Drop for CompletionGuard {
+    impl<S> Drop for ActorTaskGuard<S> {
         fn drop(&mut self) {
-            let _ = self.0.send(true);
+            remove_route(&self.runtime, &self.address, self.generation);
+            let _ = self.completion.send(true);
         }
+    }
+
+    async fn execute_command<S>(
+        command: Command<S>,
+        actor: &mut (dyn Any + Send),
+        runtime: &RuntimeInner<S>,
+        address: &ActorAddress,
+        generation: u64,
+        receiver: &mut mpsc::Receiver<Command<S>>,
+    ) -> bool
+    where
+        S: Send + Sync + 'static,
+    {
+        let context = ActorContext {
+            address,
+            state: runtime.state.as_ref(),
+        };
+        let CommandOutcome::Panicked(fail_current) = command.execute(actor, context).await else {
+            return true;
+        };
+
+        tracing::error!(
+            actor_type = address.actor_type(),
+            actor_id = ?address.actor_id(),
+            lifecycle = "command",
+            error_category = "ActorStopped",
+            "Actor command handler panicked"
+        );
+        receiver.close();
+        remove_route(runtime, address, generation);
+        while let Ok(command) = receiver.try_recv() {
+            command.fail(RuntimeError::ActorStopped);
+        }
+        fail_current();
+        false
     }
 
     fn begin_deactivation<S>(
@@ -706,6 +859,11 @@ pub mod __private {
         S: Send + Sync + 'static,
     {
         pub async fn shutdown(self: &Arc<Self>) {
+            tracing::debug!(
+                lifecycle = "shutdown",
+                error_category = "None",
+                "CoActor runtime shutdown started"
+            );
             let (mut completions, aborts) = {
                 let actors = self.actors.lock();
                 if self
@@ -749,6 +907,11 @@ pub mod __private {
                 self.actors.lock().clear();
             }
             self.status.store(STOPPED, Ordering::Release);
+            tracing::debug!(
+                lifecycle = "shutdown",
+                error_category = "None",
+                "CoActor runtime shutdown completed"
+            );
         }
     }
 }
