@@ -1,0 +1,20 @@
+[workspace]
+members = ["coactor", "coactor-macros"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/link-duan/coactor"
+rust-version = "1.85"
+
+[workspace.dependencies]
+futures-util = "0.3.31"
+parking_lot = "0.12.4"
+proc-macro2 = "1.0.95"
+quote = "1.0.40"
+syn = { version = "2.0.104", features = ["full"] }
+thiserror = "2.0.12"
+tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+tracing = "0.1.41"
+
