@@ -94,6 +94,8 @@ impl<'a, S> ActorContext<'a, S> {
 pub enum BuildError {
     #[error("Actor Type `{0}` was registered more than once")]
     DuplicateActorType(&'static str),
+    #[error("mailbox capacity must be greater than zero")]
+    InvalidMailboxCapacity,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -102,10 +104,28 @@ pub enum ActorRefError {
     ActorTypeNotRegistered(&'static str),
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ActorTypeConfig {
+    mailbox_capacity: Option<usize>,
+}
+
+impl ActorTypeConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mailbox_capacity(mut self, capacity: usize) -> Self {
+        self.mailbox_capacity = Some(capacity);
+        self
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SendError<E = Infallible> {
     #[error("handler failed: {0:?}")]
     HandlerError(E),
+    #[error("the Active Actor mailbox is full")]
+    MailboxFull,
     #[error("the Active Actor stopped")]
     ActorStopped,
     #[error("the CoActor runtime stopped")]
@@ -115,6 +135,7 @@ pub enum SendError<E = Infallible> {
 pub struct RuntimeBuilder<S> {
     state: S,
     registrations: Vec<__private::Registration<S>>,
+    mailbox_capacity: usize,
 }
 
 impl<S> RuntimeBuilder<S>
@@ -125,7 +146,13 @@ where
         Self {
             state,
             registrations: Vec::new(),
+            mailbox_capacity: 32,
         }
+    }
+
+    pub fn mailbox_capacity(mut self, capacity: usize) -> Self {
+        self.mailbox_capacity = capacity;
+        self
     }
 
     pub fn register<A>(mut self) -> Self
@@ -136,9 +163,28 @@ where
         self
     }
 
+    pub fn register_with<A>(mut self, config: ActorTypeConfig) -> Self
+    where
+        A: __private::ActorType<S>,
+    {
+        let mut registration = __private::Registration::of::<A>();
+        registration.mailbox_capacity = config.mailbox_capacity;
+        self.registrations.push(registration);
+        self
+    }
+
     pub fn build(self) -> Result<Runtime<S>, BuildError> {
+        if self.mailbox_capacity == 0 {
+            return Err(BuildError::InvalidMailboxCapacity);
+        }
         let mut registrations = HashMap::new();
-        for registration in self.registrations {
+        for mut registration in self.registrations {
+            if registration.mailbox_capacity == Some(0) {
+                return Err(BuildError::InvalidMailboxCapacity);
+            }
+            if registration.mailbox_capacity.is_none() {
+                registration.mailbox_capacity = Some(self.mailbox_capacity);
+            }
             let name = registration.name;
             if registrations.insert(name, registration).is_some() {
                 return Err(BuildError::DuplicateActorType(name));
@@ -196,12 +242,13 @@ pub mod __private {
     }
 
     type Command<S> = Box<dyn ErasedCommand<S>>;
-    type CommandSender<S> = mpsc::UnboundedSender<Command<S>>;
+    type CommandSender<S> = mpsc::Sender<Command<S>>;
 
     #[derive(Clone, Copy)]
     pub enum RuntimeError {
         ActorStopped,
         RuntimeStopped,
+        MailboxFull,
     }
 
     impl<E> From<RuntimeError> for SendError<E> {
@@ -209,6 +256,7 @@ pub mod __private {
             match value {
                 RuntimeError::ActorStopped => Self::ActorStopped,
                 RuntimeError::RuntimeStopped => Self::RuntimeStopped,
+                RuntimeError::MailboxFull => Self::MailboxFull,
             }
         }
     }
@@ -224,6 +272,7 @@ pub mod __private {
     pub struct Registration<S> {
         pub name: &'static str,
         create: fn(ActorId) -> Box<dyn Any + Send>,
+        pub mailbox_capacity: Option<usize>,
         marker: PhantomData<fn(S)>,
     }
 
@@ -235,6 +284,7 @@ pub mod __private {
             Self {
                 name: A::NAME,
                 create: |actor_id| Box::new(A::create(actor_id)),
+                mailbox_capacity: None,
                 marker: PhantomData,
             }
         }
@@ -278,9 +328,15 @@ pub mod __private {
                     .clone()
             };
 
-            sender.send(command).map_err(|error| {
-                error.0.fail(RuntimeError::ActorStopped);
-                RuntimeError::ActorStopped
+            sender.try_send(command).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(command) => {
+                    command.fail(RuntimeError::MailboxFull);
+                    RuntimeError::MailboxFull
+                }
+                mpsc::error::TrySendError::Closed(command) => {
+                    command.fail(RuntimeError::ActorStopped);
+                    RuntimeError::ActorStopped
+                }
             })
         }
     }
@@ -289,12 +345,15 @@ pub mod __private {
     where
         S: Send + Sync + 'static,
     {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<Command<S>>();
         let registration = runtime
             .registrations
             .get(address.actor_type())
             .expect("Actor Type registration disappeared");
+        let mailbox_capacity = registration
+            .mailbox_capacity
+            .expect("mailbox capacity was not configured");
         let mut actor = (registration.create)(address.actor_id().clone());
+        let (sender, mut receiver) = mpsc::channel::<Command<S>>(mailbox_capacity);
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
                 let context = ActorContext {
