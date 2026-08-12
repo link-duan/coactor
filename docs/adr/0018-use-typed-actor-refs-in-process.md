@@ -6,7 +6,7 @@ Actor Ref 是稳定地址句柄而非 Active Actor 强引用：获取、持有�
 
 Actor Ref 也只弱引用 CoActor runtime，不延长 runtime 生命周期；runtime 已停止或最后一个强 handle 释放后，已有 Ref 的调用返回 `RuntimeStopped`。runtime 的所有权和 shutdown 仍由 consumer 显式管理。
 
-Actor Type 通过约定的同步 `new(actor_id)` 构造初始实例，不额外注册自定义 factory；需要异步执行的初始化统一放入 activation lifecycle，由 macro 在编译期连接这些约定。
+Actor Type 通过约定的同步 `new(actor_id, Arc<AppState>)` 构造初始实例，不额外注册自定义 factory；需要异步执行的初始化统一放入 activation lifecycle，由 macro 在编译期连接这些约定。
 
 只有显式标记 `#[command]` 的方法进入生成的 Actor Ref API；其他方法保持 Actor 内部实现，避免 public async helper 因可见性而意外成为消息协议的一部分。
 

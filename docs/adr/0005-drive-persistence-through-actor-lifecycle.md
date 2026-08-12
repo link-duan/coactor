@@ -4,7 +4,7 @@ CoActor 首版保留异步 Actor lifecycle：runtime 必须等待 activation lif
 
 activation lifecycle 的具体 consumer error 仅记录到日志与 tracing，caller 统一收到无 payload 的 `SendError::ActivationFailed`。这样每个 generated Actor method 只需要携带自身 handler error 类型，不需要再叠加 Actor lifecycle error 泛型。
 
-两个 lifecycle hook 都是可选的；未实现 activation hook 等同于立即成功，未实现 deactivation hook 等同于立即完成。简单 Actor 因此只需同步 `new(actor_id)` 和 `#[command]` methods。
+两个 lifecycle hook 都是可选的；未实现 activation hook 等同于立即成功，未实现 deactivation hook 等同于立即完成。简单 Actor 因此只需同步 `new(actor_id, Arc<AppState>)` 和 `#[command]` methods。
 
 hook 使用固定方法名 `on_activate` 与 `on_deactivate`，而不是额外 attribute；macro 只需识别并校验这两个可选签名。
 
