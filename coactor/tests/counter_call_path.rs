@@ -1,33 +1,60 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use coactor::{
-    ActorAddress, ActorContext, ActorId, ActorRefError, BuildError, RuntimeBuilder, actor,
+    ActorAddress, ActorId, ActorRefError, BuildError, CommandContext, RuntimeBuilder, actor,
 };
 
 static CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Default)]
 struct AppState {
     offset: i64,
+    injected_pointers: Arc<Mutex<Vec<usize>>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            injected_pointers: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 }
 
 struct CounterActor {
+    state: Arc<AppState>,
     value: i64,
 }
 
 #[actor(name = "counter")]
 impl CounterActor {
-    pub fn new(actor_id: ActorId) -> Self {
+    pub fn new(actor_id: ActorId, state: Arc<AppState>) -> Self {
         if actor_id.as_bytes() == b"room-7" {
             CONSTRUCTIONS.fetch_add(1, Ordering::SeqCst);
         }
-        Self { value: 0 }
+        state
+            .injected_pointers
+            .lock()
+            .unwrap()
+            .push(Arc::as_ptr(&state) as usize);
+        Self { state, value: 0 }
     }
 
     #[coactor::command]
-    pub async fn add(&mut self, context: &ActorContext<'_, AppState>, amount: i64) -> i64 {
-        self.value += amount + context.state().offset;
+    pub async fn add(&mut self, context: &CommandContext, amount: i64) -> i64 {
+        assert_eq!(context.actor_address().actor_type(), "counter");
+        self.value += amount + self.state.offset;
         self.value
+    }
+
+    #[coactor::command]
+    pub async fn identity(&mut self, context: &CommandContext) -> (String, Vec<u8>) {
+        (
+            context.actor_address().actor_type().to_owned(),
+            context.actor_id().as_bytes().to_vec(),
+        )
     }
 }
 
@@ -35,12 +62,12 @@ struct DuplicateCounterActor;
 
 #[actor(name = "counter")]
 impl DuplicateCounterActor {
-    pub fn new(_actor_id: ActorId) -> Self {
+    pub fn new(_actor_id: ActorId, _state: Arc<AppState>) -> Self {
         Self
     }
 
     #[coactor::command]
-    pub async fn value(&mut self, _context: &ActorContext<'_, AppState>) -> i64 {
+    pub async fn value(&mut self, _context: &CommandContext) -> i64 {
         0
     }
 }
@@ -49,12 +76,12 @@ struct UnregisteredActor;
 
 #[actor(name = "unregistered")]
 impl UnregisteredActor {
-    pub fn new(_actor_id: ActorId) -> Self {
+    pub fn new(_actor_id: ActorId, _state: Arc<AppState>) -> Self {
         Self
     }
 
     #[coactor::command]
-    pub async fn value(&mut self, _context: &ActorContext<'_, AppState>) -> i64 {
+    pub async fn value(&mut self, _context: &CommandContext) -> i64 {
         0
     }
 }
@@ -62,10 +89,13 @@ impl UnregisteredActor {
 #[tokio::test]
 async fn counter_activates_lazily_and_returns_a_typed_result() {
     CONSTRUCTIONS.store(0, Ordering::SeqCst);
-    let runtime = RuntimeBuilder::new(AppState { offset: 1 })
-        .register::<CounterActor>()
-        .build()
-        .expect("runtime should build");
+    let runtime = RuntimeBuilder::new(AppState {
+        offset: 1,
+        ..AppState::default()
+    })
+    .register::<CounterActor>()
+    .build()
+    .expect("runtime should build");
 
     let counter = runtime
         .actor_ref::<CounterActor>(ActorId::from("room-7"))
@@ -120,7 +150,9 @@ fn unregistered_actor_type_fails_before_activation() {
 
 #[tokio::test]
 async fn actor_ids_are_isolated_while_refs_for_one_address_share_state() {
-    let runtime = RuntimeBuilder::new(AppState::default())
+    let state = AppState::default();
+    let injected_pointers = state.injected_pointers.clone();
+    let runtime = RuntimeBuilder::new(state)
         .register::<CounterActor>()
         .build()
         .expect("runtime should build");
@@ -138,4 +170,15 @@ async fn actor_ids_are_isolated_while_refs_for_one_address_share_state() {
     assert_eq!(first.add(2).await.expect("command should succeed"), 2);
     assert_eq!(same.add(3).await.expect("command should succeed"), 5);
     assert_eq!(second.add(4).await.expect("command should succeed"), 4);
+    assert_eq!(
+        first.identity().await.unwrap(),
+        ("counter".to_owned(), b"first".to_vec())
+    );
+    assert_eq!(
+        second.identity().await.unwrap(),
+        ("counter".to_owned(), b"second".to_vec())
+    );
+    let pointers = injected_pointers.lock().unwrap();
+    assert_eq!(pointers.len(), 2);
+    assert_eq!(pointers[0], pointers[1]);
 }

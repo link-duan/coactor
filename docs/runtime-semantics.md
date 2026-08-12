@@ -26,21 +26,19 @@
 ## Active Actor and execution
 
 - runtime 启动时没有每 Actor 常驻的 task。首条被接纳的命令为对应 Actor 创建 Active Actor。
-- Actor Type 通过约定的同步 `new(actor_id)` 构造实例，不提供独立 factory registration；异步初始化由 activation lifecycle 承担。
-- `new` 的参数统一为 runtime `ActorId` 稳定字节包装；Actor 内如需业务 ID 类型，由 consumer 自行解析。
-- lifecycle 与 command 执行时由 runtime 提供只读 `ActorContext`，用于访问当前 Actor identity 与 consumer shared state；`new(actor_id)` 不接收这些异步或共享依赖。
-- 首版 Actor Context 不包含 runtime handle，也不能从 Actor 内获取其他 Actor Ref 或发起跨 Actor 调用。
-- context 数据格式仅为当前 Actor Address 与 App State 的借用，公开 `actor_id()`、`actor_address()`、`state()`；其他 runtime 控制状态保持私有。
-- context 不提供自身 Actor Ref，避免独占执行中的 method await self-call。
-- shared state 是每个 runtime 唯一的 consumer 强类型 `AppState`，所有已注册 Actor Type 使用同一类型；context 通过编译期类型访问，不提供按 `TypeId` 动态查找。
+- Actor Type 通过约定的同步 `new(actor_id, Arc<AppState>)` 构造实例，不提供独立 factory registration；异步初始化由 activation lifecycle 承担。
+- `new` 接收 runtime `ActorId` 和共享 App State；Actor 自行保存完整 `Arc` 或提取所需依赖。
+- 每个 command invocation 由 runtime 创建一个只读 `CommandContext`，首版仅提供当前 `actor_id()` 与 `actor_address()`。
+- `CommandContext` 无生命周期参数、无 App State 泛型且不实现 `Clone`；它不包含 runtime handle、自身 Actor Ref 或跨 Actor 调用能力。
+- shared state 是每个 runtime 唯一的 consumer 强类型 `AppState`，所有已注册 Actor Type 使用同一实例；不提供按 `TypeId` 动态查找。
 - `AppState` 必须为 `Send + Sync + 'static`。
-- builder 接收 App State 所有权，runtime 内部使用 `Arc` 共享；正常 context 访问返回 `&AppState`。
-- Actor 实现的方法签名显式接收借用的 `ActorContext<AppState>`，但 generated Actor Ref API 不向 caller 暴露 context 参数。context 只在当前 lifecycle/command 调用期间有效。
-- `#[coactor::actor]` 不包含单独的 state type 参数；App State 类型由显式 context 参数决定，同一 Actor Type 内必须一致。
+- builder 接收 App State 所有权，runtime 内部使用 `Arc` 共享，并在每次 lazy activation 时 clone 给 Actor 构造器。
+- Actor command 显式接收 `&CommandContext`，generated Actor Ref API 不向 caller 暴露该参数；context 只在当前 command invocation 中有效。
+- `#[coactor::actor]` 不包含单独的 state type 参数；App State 类型由构造器的 `Arc<AppState>` 参数决定。
 - 每个 Active Actor 拥有一个 mailbox 和一份热状态。
 - runtime await 异步 activation lifecycle，成功完成后才开始处理 mailbox；首版 lifecycle 不执行 runtime state restore。
 - lifecycle hooks 为可选；缺少 activation hook 等同于立即成功，缺少 deactivation hook 等同于立即完成。
-- hook 名称固定为 `on_activate` 与 `on_deactivate`，由 Actor macro 识别并校验，不使用额外 lifecycle attribute。
+- hook 名称固定为 `on_activate(&mut self)` 与 `on_deactivate(&mut self, reason)`，由 Actor macro 识别并校验，不接收 context。
 - `on_deactivate` 的首版 reason 只有 `Idle` 与 `Shutdown`。
 - activation 期间到达的 command 继续进入同一个 bounded mailbox并计入容量；不创建额外队列。成功后按接纳顺序处理，满载返回 `MailboxFull`。
 - activation lifecycle 返回错误时，当前 Active Actor 不进入服务态，mailbox 中全部 command 返回 `ActivationFailed`，对应本地路由被移除；后续 command 可以创建新的 Active Actor 并重试 activation。失败实例不调用 deactivation lifecycle。
@@ -81,7 +79,7 @@
 - Active Actor 异常退出后，下一次发送可以替换已关闭的本地路由并重新启动；先前内存状态和未回复命令没有恢复保证。
 - command handler panic 会立即终止整个 Active Actor；当前及 mailbox 中已接纳但未处理的 command 返回 `ActorStopped`，不调用 deactivation lifecycle，并移除本地路由。后续 command 从空状态创建新实例；首版不重放或原地重启。
 - command handler 正常返回业务错误只结束当前 command；Active Actor 保持运行并继续消费 mailbox。runtime 不解释业务错误，也不据此重启或 passivate Actor。
-- idle passivation 后再次访问同一 Actor Address 也通过 `new(actor_id)` 从空状态重新启动。
+- idle passivation 后再次访问同一 Actor Address 也通过 `new(actor_id, Arc<AppState>)` 从空状态重新启动。
 - 当前不提供 exactly-once、at-least-once、跨节点单 writer、故障转移或迁移保证。
 
 ## Graceful shutdown

@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use coactor::{ActorContext, ActorId, RuntimeBuilder, SendError, actor};
+use coactor::{ActorId, CommandContext, RuntimeBuilder, SendError, actor};
 use tokio::sync::Notify;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -42,46 +42,34 @@ struct FailingActor;
 
 #[actor(name = "traced-failure")]
 impl FailingActor {
-    pub fn new(_actor_id: ActorId) -> Self {
+    pub fn new(_actor_id: ActorId, _state: Arc<()>) -> Self {
         Self
     }
 
-    pub async fn on_activate(
-        &mut self,
-        _context: &ActorContext<'_, ()>,
-    ) -> Result<(), &'static str> {
+    pub async fn on_activate(&mut self) -> Result<(), &'static str> {
         Err("private-activation-detail")
     }
 
     #[coactor::command]
-    pub async fn secret_command(&mut self, _context: &ActorContext<'_, ()>, _secret: &'static str) {
-    }
+    pub async fn secret_command(&mut self, _context: &CommandContext, _secret: &'static str) {}
 }
 
 struct LifecycleActor;
 
 #[actor(name = "traced-lifecycle")]
 impl LifecycleActor {
-    pub fn new(_actor_id: ActorId) -> Self {
+    pub fn new(_actor_id: ActorId, _state: Arc<()>) -> Self {
         Self
     }
 
-    pub async fn on_activate(
-        &mut self,
-        _context: &ActorContext<'_, ()>,
-    ) -> Result<(), &'static str> {
+    pub async fn on_activate(&mut self) -> Result<(), &'static str> {
         Ok(())
     }
 
-    pub async fn on_deactivate(
-        &mut self,
-        _context: &ActorContext<'_, ()>,
-        _reason: coactor::DeactivationReason,
-    ) {
-    }
+    pub async fn on_deactivate(&mut self, _reason: coactor::DeactivationReason) {}
 
     #[coactor::command]
-    pub async fn ping(&mut self, _context: &ActorContext<'_, ()>) {}
+    pub async fn ping(&mut self, _context: &CommandContext) {}
 }
 
 #[derive(Clone)]
@@ -94,49 +82,45 @@ struct PanicActor;
 
 #[actor(name = "traced-panic")]
 impl PanicActor {
-    pub fn new(_actor_id: ActorId) -> Self {
+    pub fn new(_actor_id: ActorId, _state: Arc<FailureState>) -> Self {
         Self
     }
 
     #[coactor::command]
-    pub async fn panic_now(&mut self, _context: &ActorContext<'_, FailureState>) {
+    pub async fn panic_now(&mut self, _context: &CommandContext) {
         panic!("handler panic")
     }
 }
 
-struct DeactivationTimeoutActor;
+struct DeactivationTimeoutActor(Arc<FailureState>);
 
 #[actor(name = "traced-deactivation-timeout")]
 impl DeactivationTimeoutActor {
-    pub fn new(_actor_id: ActorId) -> Self {
-        Self
+    pub fn new(_actor_id: ActorId, state: Arc<FailureState>) -> Self {
+        Self(state)
     }
 
-    pub async fn on_deactivate(
-        &mut self,
-        context: &ActorContext<'_, FailureState>,
-        _reason: coactor::DeactivationReason,
-    ) {
-        context.state().entered.notify_one();
-        context.state().release.notified().await;
+    pub async fn on_deactivate(&mut self, _reason: coactor::DeactivationReason) {
+        self.0.entered.notify_one();
+        self.0.release.notified().await;
     }
 
     #[coactor::command]
-    pub async fn ping(&mut self, _context: &ActorContext<'_, FailureState>) {}
+    pub async fn ping(&mut self, _context: &CommandContext) {}
 }
 
-struct ShutdownTimeoutActor;
+struct ShutdownTimeoutActor(Arc<FailureState>);
 
 #[actor(name = "traced-shutdown-timeout")]
 impl ShutdownTimeoutActor {
-    pub fn new(_actor_id: ActorId) -> Self {
-        Self
+    pub fn new(_actor_id: ActorId, state: Arc<FailureState>) -> Self {
+        Self(state)
     }
 
     #[coactor::command]
-    pub async fn block(&mut self, context: &ActorContext<'_, FailureState>) {
-        context.state().entered.notify_one();
-        context.state().release.notified().await;
+    pub async fn block(&mut self, _context: &CommandContext) {
+        self.0.entered.notify_one();
+        self.0.release.notified().await;
     }
 }
 

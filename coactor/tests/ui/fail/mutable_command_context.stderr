@@ -1,13 +1,13 @@
-error: #[command] methods must be public
- --> tests/ui/fail/private_command.rs:6:1
+error: #[command] must take &CommandContext after &mut self
+ --> tests/ui/fail/mutable_command_context.rs:7:1
   |
-6 | #[actor(name = "private")]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+7 | #[actor(name = "mutable-command-context")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: this error originates in the attribute macro `actor` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 warning: unused import: `std::sync::Arc`
- --> tests/ui/fail/private_command.rs:1:5
+ --> tests/ui/fail/mutable_command_context.rs:1:5
   |
 1 | use std::sync::Arc;
   |     ^^^^^^^^^^^^^^
@@ -15,7 +15,7 @@ warning: unused import: `std::sync::Arc`
   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
 
 warning: unused imports: `ActorId` and `CommandContext`
- --> tests/ui/fail/private_command.rs:2:15
+ --> tests/ui/fail/mutable_command_context.rs:3:15
   |
-2 | use coactor::{ActorId, CommandContext, actor};
+3 | use coactor::{ActorId, CommandContext, actor};
   |               ^^^^^^^  ^^^^^^^^^^^^^^

@@ -32,10 +32,10 @@ note: required by a bound in `__coactor_assert_send_static`
   = note: this error originates in the attribute macro `actor` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: `Rc<u8>` cannot be sent between threads safely
-  --> tests/ui/fail/non_send_command.rs:14:85
+  --> tests/ui/fail/non_send_command.rs:14:79
    |
-14 |     pub async fn call(&mut self, _context: &ActorContext<'_, ()>, value: Rc<u8>) -> Rc<u8> {
-   |                                                                                     ^^^^^^ `Rc<u8>` cannot be sent between threads safely
+14 |     pub async fn call(&mut self, _context: &CommandContext, value: Rc<u8>) -> Rc<u8> {
+   |                                                                               ^^^^^^ `Rc<u8>` cannot be sent between threads safely
    |
    = help: the trait `Send` is not implemented for `Rc<u8>`
 note: required by a bound in `__coactor_assert_send_static`

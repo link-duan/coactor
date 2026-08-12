@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use coactor::{ActorContext, ActorId, RuntimeBuilder, SendError, actor};
+use coactor::{ActorId, CommandContext, RuntimeBuilder, SendError, actor};
 use tokio::sync::Notify;
 
 #[derive(Clone)]
@@ -19,54 +19,44 @@ struct AppState {
 }
 
 struct LifecycleActor {
+    state: Arc<AppState>,
     value: i64,
 }
 
-struct PanickingActivationActor;
+struct PanickingActivationActor(Arc<AppState>);
 
 #[actor(name = "panicking-activation")]
 impl PanickingActivationActor {
-    pub fn new(_actor_id: ActorId) -> Self {
-        Self
+    pub fn new(_actor_id: ActorId, state: Arc<AppState>) -> Self {
+        Self(state)
     }
 
-    pub async fn on_activate(
-        &mut self,
-        context: &ActorContext<'_, AppState>,
-    ) -> Result<(), &'static str> {
-        if context
-            .state()
-            .activation_attempts
-            .fetch_add(1, Ordering::SeqCst)
-            == 0
-        {
+    pub async fn on_activate(&mut self) -> Result<(), &'static str> {
+        if self.0.activation_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
             panic!("activation panic");
         }
         Ok(())
     }
 
     #[coactor::command]
-    pub async fn value(&mut self, _context: &ActorContext<'_, AppState>) -> i64 {
+    pub async fn value(&mut self, _context: &CommandContext) -> i64 {
         7
     }
 }
 
 #[actor(name = "lifecycle")]
 impl LifecycleActor {
-    pub fn new(_actor_id: ActorId) -> Self {
-        Self { value: 0 }
+    pub fn new(_actor_id: ActorId, state: Arc<AppState>) -> Self {
+        Self { state, value: 0 }
     }
 
-    pub async fn on_activate(
-        &mut self,
-        context: &ActorContext<'_, AppState>,
-    ) -> Result<(), &'static str> {
-        let attempt = context
-            .state()
+    pub async fn on_activate(&mut self) -> Result<(), &'static str> {
+        let attempt = self
+            .state
             .activation_attempts
             .fetch_add(1, Ordering::SeqCst);
-        context.state().activation_entered.notify_one();
-        context.state().activation_release.notified().await;
+        self.state.activation_entered.notify_one();
+        self.state.activation_release.notified().await;
         if attempt == 0 {
             Err("first activation fails")
         } else {
@@ -75,15 +65,15 @@ impl LifecycleActor {
     }
 
     #[coactor::command]
-    pub async fn add(&mut self, _context: &ActorContext<'_, AppState>, amount: i64) -> i64 {
+    pub async fn add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
         self.value += amount;
         self.value
     }
 
     #[coactor::command]
-    pub async fn panic_after_mutation(&mut self, context: &ActorContext<'_, AppState>) -> i64 {
-        context.state().panic_entered.notify_one();
-        context.state().panic_release.notified().await;
+    pub async fn panic_after_mutation(&mut self, _context: &CommandContext) -> i64 {
+        self.state.panic_entered.notify_one();
+        self.state.panic_release.notified().await;
         self.value = 99;
         panic!("boom")
     }

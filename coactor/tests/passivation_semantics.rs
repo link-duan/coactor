@@ -7,7 +7,7 @@ use std::{
 };
 
 use coactor::{
-    ActorContext, ActorId, ActorTypeConfig, DeactivationReason, RuntimeBuilder, SendError, actor,
+    ActorId, ActorTypeConfig, CommandContext, DeactivationReason, RuntimeBuilder, SendError, actor,
 };
 use tokio::sync::Notify;
 
@@ -19,51 +19,44 @@ struct AppState {
 }
 
 struct PassivatingActor {
+    state: Arc<AppState>,
     value: i64,
 }
 
-struct PanickingDeactivationActor;
+struct PanickingDeactivationActor(Arc<AppState>);
 
 #[actor(name = "panicking-deactivation")]
 impl PanickingDeactivationActor {
-    pub fn new(_actor_id: ActorId) -> Self {
-        Self
+    pub fn new(_actor_id: ActorId, state: Arc<AppState>) -> Self {
+        Self(state)
     }
 
-    pub async fn on_deactivate(
-        &mut self,
-        context: &ActorContext<'_, AppState>,
-        _reason: DeactivationReason,
-    ) {
-        context.state().deactivation_entered.notify_one();
+    pub async fn on_deactivate(&mut self, _reason: DeactivationReason) {
+        self.0.deactivation_entered.notify_one();
         panic!("deactivation panic");
     }
 
     #[coactor::command]
-    pub async fn value(&mut self, _context: &ActorContext<'_, AppState>) -> i64 {
+    pub async fn value(&mut self, _context: &CommandContext) -> i64 {
         11
     }
 }
 
 #[actor(name = "passivating")]
 impl PassivatingActor {
-    pub fn new(_actor_id: ActorId) -> Self {
-        Self { value: 0 }
+    pub fn new(_actor_id: ActorId, state: Arc<AppState>) -> Self {
+        Self { state, value: 0 }
     }
 
-    pub async fn on_deactivate(
-        &mut self,
-        context: &ActorContext<'_, AppState>,
-        reason: DeactivationReason,
-    ) {
+    pub async fn on_deactivate(&mut self, reason: DeactivationReason) {
         assert_eq!(reason, DeactivationReason::Idle);
-        context.state().deactivations.fetch_add(1, Ordering::SeqCst);
-        context.state().deactivation_entered.notify_one();
-        context.state().deactivation_release.notified().await;
+        self.state.deactivations.fetch_add(1, Ordering::SeqCst);
+        self.state.deactivation_entered.notify_one();
+        self.state.deactivation_release.notified().await;
     }
 
     #[coactor::command]
-    pub async fn add(&mut self, _context: &ActorContext<'_, AppState>, amount: i64) -> i64 {
+    pub async fn add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
         self.value += amount;
         self.value
     }

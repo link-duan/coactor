@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use coactor::{ActorContext, ActorId, DeactivationReason, RuntimeBuilder, SendError, actor};
+use coactor::{ActorId, CommandContext, DeactivationReason, RuntimeBuilder, SendError, actor};
 use tokio::sync::Notify;
 
 #[derive(Clone)]
@@ -14,55 +14,44 @@ struct AppState {
 }
 
 struct CounterActor {
+    state: Arc<AppState>,
     value: i64,
 }
 
 #[actor(name = "vertical-counter")]
 impl CounterActor {
-    pub fn new(_actor_id: ActorId) -> Self {
-        Self { value: 0 }
+    pub fn new(_actor_id: ActorId, state: Arc<AppState>) -> Self {
+        Self { state, value: 0 }
     }
 
-    pub async fn on_activate(
-        &mut self,
-        context: &ActorContext<'_, AppState>,
-    ) -> Result<(), &'static str> {
-        context.state().lifecycle.lock().unwrap().push("activate");
+    pub async fn on_activate(&mut self) -> Result<(), &'static str> {
+        self.state.lifecycle.lock().unwrap().push("activate");
         Ok(())
     }
 
-    pub async fn on_deactivate(
-        &mut self,
-        context: &ActorContext<'_, AppState>,
-        reason: DeactivationReason,
-    ) {
-        context
-            .state()
-            .lifecycle
-            .lock()
-            .unwrap()
-            .push(match reason {
-                DeactivationReason::Idle => "idle",
-                DeactivationReason::Shutdown => "shutdown",
-            });
+    pub async fn on_deactivate(&mut self, reason: DeactivationReason) {
+        self.state.lifecycle.lock().unwrap().push(match reason {
+            DeactivationReason::Idle => "idle",
+            DeactivationReason::Shutdown => "shutdown",
+        });
     }
 
     #[coactor::command]
-    pub async fn add(&mut self, _context: &ActorContext<'_, AppState>, amount: i64) -> i64 {
+    pub async fn add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
         self.value += amount;
         self.value
     }
 
     #[coactor::command]
-    pub async fn blocked_add(&mut self, context: &ActorContext<'_, AppState>, amount: i64) -> i64 {
-        context.state().entered.notify_one();
-        context.state().release.notified().await;
+    pub async fn blocked_add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
+        self.state.entered.notify_one();
+        self.state.release.notified().await;
         self.value += amount;
         self.value
     }
 
     #[coactor::command]
-    pub async fn panic_now(&mut self, _context: &ActorContext<'_, AppState>) {
+    pub async fn panic_now(&mut self, _context: &CommandContext) {
         panic!("counter failure")
     }
 }

@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use coactor::{ActorContext, ActorId, RuntimeBuilder, actor};
+use coactor::{ActorId, CommandContext, RuntimeBuilder, actor};
 
 #[derive(Clone)]
 struct AppState {
@@ -8,18 +8,19 @@ struct AppState {
 }
 
 struct CounterActor {
+    state: Arc<AppState>,
     value: i64,
 }
 
 #[actor(name = "counter")]
 impl CounterActor {
-    pub fn new(_actor_id: ActorId) -> Self {
-        Self { value: 0 }
+    pub fn new(_actor_id: ActorId, state: Arc<AppState>) -> Self {
+        Self { state, value: 0 }
     }
 
     #[coactor::command]
-    pub async fn add(&mut self, context: &ActorContext<'_, AppState>, amount: i64) -> i64 {
-        self.value += amount * context.state().increment_scale;
+    pub async fn add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
+        self.value += amount * self.state.increment_scale;
         self.value
     }
 }

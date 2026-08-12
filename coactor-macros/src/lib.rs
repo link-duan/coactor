@@ -54,23 +54,24 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         return compile_error("an actor must declare at least one #[command]");
     }
     let Some(constructor) = constructor else {
-        return compile_error("an actor must declare pub fn new(actor_id: ActorId) -> Self");
+        return compile_error(
+            "an actor must declare pub fn new(actor_id: ActorId, app_state: Arc<AppState>) -> Self",
+        );
     };
     if let Err(message) = validate_constructor(&constructor) {
         return compile_error(message);
     }
-
-    let state_type = match command_state_type(&commands[0]) {
+    let state_type = match constructor_state_type(&constructor) {
         Ok(state) => state,
         Err(message) => return compile_error(message),
     };
     if let Some(activation) = &activation
-        && let Err(message) = validate_activation(activation, &state_type)
+        && let Err(message) = validate_activation(activation)
     {
         return compile_error(message);
     }
     if let Some(deactivation) = &deactivation
-        && let Err(message) = validate_deactivation(deactivation, &state_type)
+        && let Err(message) = validate_deactivation(deactivation)
     {
         return compile_error(message);
     }
@@ -79,7 +80,7 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let mut generated_ref_methods = Vec::new();
 
     for command in &commands {
-        if let Err(message) = validate_command(command, &state_type) {
+        if let Err(message) = validate_command(command) {
             return compile_error(message);
         }
 
@@ -151,7 +152,7 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                 fn execute<'a>(
                     self: ::std::boxed::Box<Self>,
                     actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
-                    context: ::coactor::ActorContext<'a, #state_type>,
+                    context: ::coactor::CommandContext,
                 ) -> ::coactor::__private::BoxFuture<'a, ::coactor::__private::CommandOutcome> {
                     ::std::boxed::Box::pin(async move {
                         let actor = actor
@@ -197,13 +198,12 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             fn activate<'a>(
                 actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
-                context: ::coactor::ActorContext<'a, #state_type>,
             ) -> ::coactor::__private::BoxFuture<'a, ::core::result::Result<(), ::std::string::String>> {
                 ::std::boxed::Box::pin(async move {
                     let actor = actor
                         .downcast_mut::<#actor_type>()
                         .expect("CoActor registered an incompatible Actor Type");
-                    actor.on_activate(&context).await.map_err(|error| ::std::format!("{error:?}"))
+                    actor.on_activate().await.map_err(|error| ::std::format!("{error:?}"))
                 })
             }
         }
@@ -211,7 +211,6 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             fn activate<'a>(
                 _actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
-                _context: ::coactor::ActorContext<'a, #state_type>,
             ) -> ::coactor::__private::BoxFuture<'a, ::core::result::Result<(), ::std::string::String>> {
                 ::std::boxed::Box::pin(async { ::core::result::Result::Ok(()) })
             }
@@ -221,14 +220,13 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             fn deactivate<'a>(
                 actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
-                context: ::coactor::ActorContext<'a, #state_type>,
                 reason: ::coactor::DeactivationReason,
             ) -> ::coactor::__private::BoxFuture<'a, ()> {
                 ::std::boxed::Box::pin(async move {
                     let actor = actor
                         .downcast_mut::<#actor_type>()
                         .expect("CoActor registered an incompatible Actor Type");
-                    actor.on_deactivate(&context, reason).await
+                    actor.on_deactivate(reason).await
                 })
             }
         }
@@ -236,7 +234,6 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             fn deactivate<'a>(
                 _actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
-                _context: ::coactor::ActorContext<'a, #state_type>,
                 _reason: ::coactor::DeactivationReason,
             ) -> ::coactor::__private::BoxFuture<'a, ()> {
                 ::std::boxed::Box::pin(async {})
@@ -262,8 +259,11 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
             const NAME: &'static str = #actor_name;
             type Ref = #ref_ident;
 
-            fn create(actor_id: ::coactor::ActorId) -> Self {
-                Self::new(actor_id)
+            fn create(
+                actor_id: ::coactor::ActorId,
+                state: ::std::sync::Arc<#state_type>,
+            ) -> Self {
+                Self::new(actor_id, state)
             }
 
             #activate
@@ -314,15 +314,15 @@ fn take_command_attribute(attributes: &mut Vec<Attribute>) -> bool {
     found
 }
 
-fn validate_command(command: &ImplItemFn, state_type: &Type) -> Result<(), &'static str> {
+fn validate_command(command: &ImplItemFn) -> Result<(), &'static str> {
     if !matches!(command.vis, syn::Visibility::Public(_)) {
         return Err("#[command] methods must be public");
     }
     if command.sig.asyncness.is_none() {
         return Err("#[command] methods must be async");
     }
-    if command_state_type(command).as_ref() != Ok(state_type) {
-        return Err("all commands on one Actor Type must use the same ActorContext state type");
+    if !has_command_context(command) {
+        return Err("#[command] must take &CommandContext after &mut self");
     }
     Ok(())
 }
@@ -330,12 +330,16 @@ fn validate_command(command: &ImplItemFn, state_type: &Type) -> Result<(), &'sta
 fn validate_constructor(method: &ImplItemFn) -> Result<(), &'static str> {
     if !matches!(method.vis, syn::Visibility::Public(_))
         || method.sig.asyncness.is_some()
-        || method.sig.inputs.len() != 1
+        || method.sig.inputs.len() != 2
     {
-        return Err("actor constructor must be pub fn new(actor_id: ActorId) -> Self");
+        return Err(
+            "actor constructor must be pub fn new(actor_id: ActorId, app_state: Arc<AppState>) -> Self",
+        );
     }
     let Some(FnArg::Typed(argument)) = method.sig.inputs.first() else {
-        return Err("actor constructor must be pub fn new(actor_id: ActorId) -> Self");
+        return Err(
+            "actor constructor must be pub fn new(actor_id: ActorId, app_state: Arc<AppState>) -> Self",
+        );
     };
     if !type_ends_with(argument.ty.as_ref(), "ActorId")
         || !matches!(
@@ -343,17 +347,19 @@ fn validate_constructor(method: &ImplItemFn) -> Result<(), &'static str> {
             ReturnType::Type(_, ty) if matches!(ty.as_ref(), Type::Path(path) if path.path.is_ident("Self"))
         )
     {
-        return Err("actor constructor must be pub fn new(actor_id: ActorId) -> Self");
+        return Err(
+            "actor constructor must be pub fn new(actor_id: ActorId, app_state: Arc<AppState>) -> Self",
+        );
     }
     Ok(())
 }
 
-fn validate_activation(method: &ImplItemFn, state_type: &Type) -> Result<(), &'static str> {
+fn validate_activation(method: &ImplItemFn) -> Result<(), &'static str> {
     if method.sig.asyncness.is_none() {
         return Err("on_activate must be async");
     }
-    if method.sig.inputs.len() != 2 || command_state_type(method).as_ref() != Ok(state_type) {
-        return Err("on_activate must take &mut self and &ActorContext with the Actor App State");
+    if method.sig.inputs.len() != 1 {
+        return Err("on_activate must take only &mut self");
     }
     if !is_result_of_unit(&method.sig.output) {
         return Err("on_activate must return Result<(), E>");
@@ -361,16 +367,14 @@ fn validate_activation(method: &ImplItemFn, state_type: &Type) -> Result<(), &'s
     Ok(())
 }
 
-fn validate_deactivation(method: &ImplItemFn, state_type: &Type) -> Result<(), &'static str> {
+fn validate_deactivation(method: &ImplItemFn) -> Result<(), &'static str> {
     if method.sig.asyncness.is_none() {
         return Err("on_deactivate must be async");
     }
-    if method.sig.inputs.len() != 3 || command_state_type(method).as_ref() != Ok(state_type) {
-        return Err(
-            "on_deactivate must take &mut self, &ActorContext with the Actor App State, and DeactivationReason",
-        );
+    if method.sig.inputs.len() != 2 {
+        return Err("on_deactivate must take &mut self and DeactivationReason");
     }
-    let Some(FnArg::Typed(reason)) = method.sig.inputs.iter().nth(2) else {
+    let Some(FnArg::Typed(reason)) = method.sig.inputs.iter().nth(1) else {
         return Err("on_deactivate must take DeactivationReason as its final parameter");
     };
     if !type_ends_with(reason.ty.as_ref(), "DeactivationReason") {
@@ -411,33 +415,38 @@ fn is_result_of_unit(output: &ReturnType) -> bool {
     )
 }
 
-fn command_state_type(command: &ImplItemFn) -> Result<Type, &'static str> {
-    let Some(FnArg::Typed(context)) = command.sig.inputs.iter().nth(1) else {
-        return Err("#[command] must take &ActorContext<State> after &mut self");
+fn constructor_state_type(constructor: &ImplItemFn) -> Result<Type, &'static str> {
+    let Some(FnArg::Typed(state)) = constructor.sig.inputs.iter().nth(1) else {
+        return Err(
+            "actor constructor must be pub fn new(actor_id: ActorId, app_state: Arc<AppState>) -> Self",
+        );
     };
-    let Type::Reference(reference) = context.ty.as_ref() else {
-        return Err("ActorContext must be borrowed");
-    };
-    let Type::Path(TypePath { path, .. }) = reference.elem.as_ref() else {
-        return Err("expected ActorContext<State>");
+    let Type::Path(TypePath { path, .. }) = state.ty.as_ref() else {
+        return Err("actor constructor App State must use Arc<AppState>");
     };
     let Some(segment) = path.segments.last() else {
-        return Err("expected ActorContext<State>");
+        return Err("actor constructor App State must use Arc<AppState>");
     };
-    if segment.ident != "ActorContext" {
-        return Err("expected ActorContext<State>");
+    if segment.ident != "Arc" {
+        return Err("actor constructor App State must use Arc<AppState>");
     }
     let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-        return Err("expected ActorContext<State>");
+        return Err("actor constructor App State must use Arc<AppState>");
     };
-    arguments
-        .args
-        .iter()
-        .find_map(|argument| match argument {
-            GenericArgument::Type(state) => Some(state.clone()),
-            _ => None,
-        })
-        .ok_or("ActorContext must declare its App State type")
+    match arguments.args.first() {
+        Some(GenericArgument::Type(state)) if arguments.args.len() == 1 => Ok(state.clone()),
+        _ => Err("actor constructor App State must use Arc<AppState>"),
+    }
+}
+
+fn has_command_context(command: &ImplItemFn) -> bool {
+    let Some(FnArg::Typed(context)) = command.sig.inputs.iter().nth(1) else {
+        return false;
+    };
+    let Type::Reference(reference) = context.ty.as_ref() else {
+        return false;
+    };
+    reference.mutability.is_none() && type_ends_with(reference.elem.as_ref(), "CommandContext")
 }
 
 fn command_arguments(command: &ImplItemFn) -> Vec<(syn::Ident, Type)> {

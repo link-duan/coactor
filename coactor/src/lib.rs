@@ -72,22 +72,17 @@ impl ActorAddress {
     }
 }
 
-pub struct ActorContext<'a, S> {
-    address: &'a ActorAddress,
-    state: &'a S,
+pub struct CommandContext {
+    address: ActorAddress,
 }
 
-impl<'a, S> ActorContext<'a, S> {
+impl CommandContext {
     pub fn actor_id(&self) -> &ActorId {
         self.address.actor_id()
     }
 
     pub fn actor_address(&self) -> &ActorAddress {
-        self.address
-    }
-
-    pub fn state(&self) -> &S {
-        self.state
+        &self.address
     }
 }
 
@@ -313,7 +308,7 @@ pub mod __private {
         fn execute<'a>(
             self: Box<Self>,
             actor: &'a mut (dyn Any + Send),
-            context: ActorContext<'a, S>,
+            context: CommandContext,
         ) -> BoxFuture<'a, CommandOutcome>;
 
         fn fail(self: Box<Self>, error: RuntimeError);
@@ -321,15 +316,8 @@ pub mod __private {
 
     type Command<S> = Box<dyn ErasedCommand<S>>;
     type CommandSender<S> = mpsc::Sender<Command<S>>;
-    type Activate<S> = for<'a> fn(
-        &'a mut (dyn Any + Send),
-        ActorContext<'a, S>,
-    ) -> BoxFuture<'a, Result<(), String>>;
-    type Deactivate<S> = for<'a> fn(
-        &'a mut (dyn Any + Send),
-        ActorContext<'a, S>,
-        DeactivationReason,
-    ) -> BoxFuture<'a, ()>;
+    type Activate = for<'a> fn(&'a mut (dyn Any + Send)) -> BoxFuture<'a, Result<(), String>>;
+    type Deactivate = for<'a> fn(&'a mut (dyn Any + Send), DeactivationReason) -> BoxFuture<'a, ()>;
 
     pub enum CommandOutcome {
         Completed,
@@ -365,14 +353,10 @@ pub mod __private {
         const NAME: &'static str;
         type Ref;
 
-        fn create(actor_id: ActorId) -> Self;
-        fn activate<'a>(
-            actor: &'a mut (dyn Any + Send),
-            context: ActorContext<'a, S>,
-        ) -> BoxFuture<'a, Result<(), String>>;
+        fn create(actor_id: ActorId, state: Arc<S>) -> Self;
+        fn activate<'a>(actor: &'a mut (dyn Any + Send)) -> BoxFuture<'a, Result<(), String>>;
         fn deactivate<'a>(
             actor: &'a mut (dyn Any + Send),
-            context: ActorContext<'a, S>,
             reason: DeactivationReason,
         ) -> BoxFuture<'a, ()>;
         fn make_ref(inner: ActorRef<S>) -> Self::Ref;
@@ -380,9 +364,9 @@ pub mod __private {
 
     pub struct Registration<S> {
         pub name: &'static str,
-        create: fn(ActorId) -> Box<dyn Any + Send>,
-        activate: Activate<S>,
-        deactivate: Deactivate<S>,
+        create: fn(ActorId, Arc<S>) -> Box<dyn Any + Send>,
+        activate: Activate,
+        deactivate: Deactivate,
         pub mailbox_capacity: Option<usize>,
         pub idle_timeout: Option<Duration>,
         marker: PhantomData<fn(S)>,
@@ -395,7 +379,7 @@ pub mod __private {
         {
             Self {
                 name: A::NAME,
-                create: |actor_id| Box::new(A::create(actor_id)),
+                create: |actor_id, state| Box::new(A::create(actor_id, state)),
                 activate: A::activate,
                 deactivate: A::deactivate,
                 mailbox_capacity: None,
@@ -564,7 +548,7 @@ pub mod __private {
         let idle_timeout = registration
             .idle_timeout
             .expect("idle timeout was not configured");
-        let mut actor = create(address.actor_id().clone());
+        let mut actor = create(address.actor_id().clone(), runtime.state.clone());
         let (sender, mut receiver) = mpsc::channel::<Command<S>>(mailbox_capacity);
         let task_sender = sender.clone();
         let (shutdown, mut shutdown_receiver) = watch::channel(false);
@@ -576,10 +560,6 @@ pub mod __private {
                 generation,
                 completion: completion_sender,
             };
-            let activation_context = ActorContext {
-                address: &address,
-                state: runtime.state.as_ref(),
-            };
             tracing::debug!(
                 actor_type = address.actor_type(),
                 actor_id = ?address.actor_id(),
@@ -587,7 +567,7 @@ pub mod __private {
                 error_category = "None",
                 "Actor activation started"
             );
-            match std::panic::AssertUnwindSafe(activate(actor.as_mut(), activation_context))
+            match std::panic::AssertUnwindSafe(activate(actor.as_mut()))
                 .catch_unwind()
                 .await
             {
@@ -650,10 +630,6 @@ pub mod __private {
                                     return;
                                 }
                             }
-                            let context = ActorContext {
-                                address: &address,
-                                state: runtime.state.as_ref(),
-                            };
                             tracing::debug!(
                                 actor_type = address.actor_type(),
                                 actor_id = ?address.actor_id(),
@@ -664,7 +640,6 @@ pub mod __private {
                             );
                             match std::panic::AssertUnwindSafe(deactivate(
                                 actor.as_mut(),
-                                context,
                                 DeactivationReason::Shutdown,
                             ))
                             .catch_unwind()
@@ -703,10 +678,6 @@ pub mod __private {
                                 if !begin_deactivation(&runtime, &address, generation, &task_sender) {
                                     continue;
                                 }
-                                let context = ActorContext {
-                                    address: &address,
-                                    state: runtime.state.as_ref(),
-                                };
                                 tracing::debug!(
                                     actor_type = address.actor_type(),
                                     actor_id = ?address.actor_id(),
@@ -719,7 +690,6 @@ pub mod __private {
                                     runtime.deactivation_timeout,
                                     std::panic::AssertUnwindSafe(deactivate(
                                         actor.as_mut(),
-                                        context,
                                         DeactivationReason::Idle,
                                     ))
                                     .catch_unwind(),
@@ -803,9 +773,8 @@ pub mod __private {
     where
         S: Send + Sync + 'static,
     {
-        let context = ActorContext {
-            address,
-            state: runtime.state.as_ref(),
+        let context = CommandContext {
+            address: address.clone(),
         };
         let CommandOutcome::Panicked(fail_current) = command.execute(actor, context).await else {
             return true;

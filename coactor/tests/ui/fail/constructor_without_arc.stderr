@@ -1,13 +1,13 @@
 error: actor constructor App State must use Arc<AppState>
- --> tests/ui/fail/inconsistent_app_state.rs:5:1
+ --> tests/ui/fail/constructor_without_arc.rs:5:1
   |
-5 | #[actor(name = "inconsistent")]
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+5 | #[actor(name = "constructor-without-arc")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: this error originates in the attribute macro `actor` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 warning: unused imports: `ActorId` and `CommandContext`
- --> tests/ui/fail/inconsistent_app_state.rs:1:15
+ --> tests/ui/fail/constructor_without_arc.rs:1:15
   |
 1 | use coactor::{ActorId, CommandContext, actor};
   |               ^^^^^^^  ^^^^^^^^^^^^^^

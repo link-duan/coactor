@@ -61,7 +61,7 @@
 
 - 首个版本不引入状态存储、Actor-scoped KV、journal、snapshot、checkpoint 或 restore。
 - 首个版本不实现 distributed ownership、Ownership Epoch、fencing、故障转移或 migration；这些能力与状态恢复在后续阶段整体推进。
-- Active Actor 的业务状态只存在于当前进程内；passivation、异常退出或进程重启后，同一 Actor 通过 `new(actor_id)` 从空状态重新启动。
+- Active Actor 的业务状态只存在于当前进程内；passivation、异常退出或进程重启后，同一 Actor 通过 `new(actor_id, Arc<AppState>)` 从空状态重新启动。
 - Handler Reply 只表示内存中的 command handling 完成，不具有 durable 含义。
 - 已讨论的 Actor Store、S3 state object、Restore Cut、Persistence Fault 与 `max_dirty_age` 均保留为后续版本候选设计，不属于首版实现或保证。
 - 首版 API 不应提前暴露虚假的 persistence abstraction，也不要求 consumer 实现尚未使用的 restore lifecycle。
@@ -87,17 +87,16 @@
 - Actor Ref 是稳定地址句柄，不是 Active Actor 的强引用。获取、持有或 clone Actor Ref 不启动 Actor，也不阻止 idle passivation；method 调用时才按 Actor Address 查找或懒启动实例。passivation 后旧 Actor Ref 仍有效，下一次调用会创建新的空状态 Active Actor。
 - Actor Ref 只持有 runtime 的弱引用，不延长 runtime 生命周期。runtime 已关闭或最后一个强 handle 已释放后，已有 Ref 的 method 调用返回 `RuntimeStopped`。
 - 首版使用 Rust `tracing` 产生结构化 spans/events，但 library 不安装全局 subscriber。至少记录 Actor Type、Actor ID、lifecycle 阶段与错误类别；不记录 command 参数或返回值。首版不提供 metrics registry、管理端口或自定义 observer trait。
-- Actor Type 不注册自定义 factory；约定提供同步 `new(actor_id)` 构造初始内存状态，runtime 在 lazy activation 时直接调用。需要异步执行的初始化放入 activation lifecycle。
-- `new` 统一接收 runtime 的 `ActorId` 稳定字节包装类型；consumer 自行解析为业务 ID。首版不设计泛型 typed ID、序列化 trait 或 macro 自动转换。
-- runtime 持有 consumer shared state，并向 activation lifecycle、deactivation lifecycle 与 `#[command]` 方法提供 `ActorContext`。context 只访问当前 `ActorId`/`ActorAddress` 与共享应用依赖；它不替代 Actor 自身的可变业务状态。
-- 首版 `ActorContext` 不提供 runtime handle、获取其他 Actor Ref 或跨 Actor 调用能力。Actor 间协调由 consumer 在 Actor runtime 外部完成，后续再单独设计调用环与失败语义。
-- `ActorContext<'a, S>` 首版只借用 `&'a ActorAddress` 与 `&'a S`，公开 `actor_id()`、`actor_address()`、`state()`。不暴露 mailbox、generation、task handle、shutdown token、tracing span 或动态扩展 map；runtime 自行处理观测上下文。
+- Actor Type 不注册自定义 factory；约定提供同步 `new(actor_id, Arc<AppState>)` 构造初始内存状态，runtime 在 lazy activation 时直接调用。需要异步执行的初始化放入 activation lifecycle。
+- `new` 接收 runtime 的 `ActorId` 与共享 App State；consumer 自行解析业务 ID，并选择保存完整 App State 或提取依赖。
+- runtime 为每次 `#[command]` invocation 创建无生命周期、非泛型的 `CommandContext`。首版仅公开当前 `actor_id()` 与 `actor_address()`。
+- `CommandContext` 不实现 `Clone`，也不提供 runtime handle、自身 Actor Ref 或跨 Actor 调用能力。Actor 间协调由 consumer 在 runtime 外部完成。
 - 首版不向 Actor 暴露自身 Actor Ref。非重入 method 若 await 自己的下一条 command 会死锁；Actor 内复用通过普通私有方法完成，延迟调用由外部 consumer 调度。
 - 每个 CoActor runtime 绑定一个 consumer 定义的强类型 `AppState`，由全部 Actor Type 共用。consumer 自行把数据库 client、HTTP client 与配置组合进该类型；首版不使用 `TypeId -> Any` service locator，也不允许缺失依赖在运行时才暴露。
 - `AppState` 必须满足 `Send + Sync + 'static`，因为同一实例会被多个 Active Actor task 并发借用。
-- runtime builder 接收 `AppState` 值，runtime 内部以 `Arc<AppState>` 持有；`ActorContext::state()` 默认只暴露 `&AppState` 借用，不要求 consumer 自行管理外层 Arc，也避免每次 command clone 容器。
-- consumer 的 activation、deactivation 与 `#[command]` 实现显式接收 `&ActorContext<AppState>`；macro 在生成的 Actor Ref method 中隐藏该参数，因此 caller 只传业务参数。context 不永久存入 Actor 实例。
-- Actor macro attribute 不重复声明 AppState 类型。macro 从 command/lifecycle 方法中显式写出的 `ActorContext<AppState>` 参数提取类型，并校验同一 Actor Type 的所有方法使用同一种 AppState；注册到不同 state 类型的 runtime 时编译失败。
+- runtime builder 接收 `AppState` 值并以 `Arc<AppState>` 持有；lazy activation 时 clone 同一 Arc 给 Actor 构造器。
+- lifecycle 不接收 context；`#[command]` 显式接收 `&CommandContext`，macro 在 generated Actor Ref method 中隐藏该参数。
+- Actor macro 从 `new` 的 `Arc<AppState>` 参数推断 App State 类型；注册到不同 state 类型的 runtime 时编译失败。
 - Actor Type 稳定名称必须在 Actor macro attribute 中显式声明，例如 `#[coactor::actor(name = "room")]`；不从 Rust struct 名或 `type_name` 推导，缺失时编译失败。Rust 类型重命名不改变 Actor Address。
 - mailbox capacity 具有 runtime 默认值，Actor Type 注册时可以覆盖；同一 Actor Type 的所有 Actor ID 使用同一容量，首版不支持逐 Actor ID 动态配置。
 - Actor macro 只把显式标记 `#[command]` 的方法加入公共 Actor API；其他同步或异步方法保持 consumer 内部实现。macro 据此区分 constructor、lifecycle、command 与辅助方法。
@@ -116,7 +115,7 @@
 - consumer 侧调用 `runtime.actor_ref::<ActorType>(actor_id)` 时立即验证类型已注册；未注册返回 `ActorTypeNotRegistered`，不会创建延迟失败的 Ref，也不会启动 Actor。
 - lazy activation 期间复用 Active Actor 的同一个 bounded mailbox；触发启动的首条 command 和后续 command 都计入容量，不建立额外等待队列。满载返回 `MailboxFull`；activation 成功后按接纳顺序处理，失败则全部返回 `ActivationFailed`。
 - 首版不提供内置 call/reply timeout 或 per-call options。consumer 使用 `tokio::time::timeout` 控制等待；timeout 只放弃 reply，不取消已经进入 mailbox 的 command。
-- activation 与 deactivation lifecycle 都是可选 hook；未实现时分别视为立即成功和立即完成。简单 Actor 只需提供 `new(actor_id)` 与 `#[command]` methods，runtime 的 lifecycle 顺序语义不变。
+- activation 与 deactivation lifecycle 都是可选 hook；未实现时分别视为立即成功和立即完成。简单 Actor 只需提供 `new(actor_id, Arc<AppState>)` 与 `#[command]` methods，runtime 的 lifecycle 顺序语义不变。
 - lifecycle hook 使用固定可选方法名 `on_activate` 与 `on_deactivate`，不增加 `#[activate]`/`#[deactivate]` attribute。macro 校验 context、reason 与返回类型签名。
 - 首版 `DeactivationReason` 只包含 `Idle` 与 `Shutdown`；不提前加入 migration、ownership loss 或 persistence fault 等尚未实现的原因。
 - 首版不引入通用序列化字节协议。Actor Address 仍是底层稳定、可擦除的运行时身份，为后续网络路由保留边界。

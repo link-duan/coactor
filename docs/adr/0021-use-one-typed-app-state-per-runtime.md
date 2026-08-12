@@ -1,5 +1,7 @@
 # Use one typed App State per runtime
 
+> Superseded by ADR 0023 for App State injection and context API shape. The one-App-State-per-runtime decision remains in effect.
+
 每个 CoActor runtime 绑定一个 consumer 定义的强类型 `AppState`，并通过 `ActorContext` 向所有 Actor Type 提供只读访问。builder 接收 App State 值，runtime 内部以 `Arc<AppState>` 持有，而 `ActorContext::state()` 正常只返回 `&AppState`，使外层共享所有权对 consumer 隐藏并避免每次 command clone 容器。consumer 自行把数据库 client、HTTP client、配置等共享依赖组合进该类型。首版不实现 `TypeId -> Arc<dyn Any>` service locator，因为它会把缺失依赖和类型错误推迟到运行时，也使 Actor 的真实依赖难以从签名与测试中看出。Actor 自身的可变业务状态仍保存在实例内，不放入 App State。
 
 由于同一 App State 会被多个 Active Actor task 并发借用，它必须满足 `Send + Sync + 'static`。

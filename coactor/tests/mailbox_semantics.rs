@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use coactor::{ActorContext, ActorId, ActorTypeConfig, RuntimeBuilder, SendError, actor};
+use coactor::{ActorId, ActorTypeConfig, CommandContext, RuntimeBuilder, SendError, actor};
 use tokio::sync::{Barrier, Notify};
 
 #[derive(Clone)]
@@ -10,25 +10,26 @@ struct AppState {
 }
 
 struct ProbeActor {
+    state: Arc<AppState>,
     value: i64,
 }
 
 #[actor(name = "probe")]
 impl ProbeActor {
-    pub fn new(_actor_id: ActorId) -> Self {
-        Self { value: 0 }
+    pub fn new(_actor_id: ActorId, state: Arc<AppState>) -> Self {
+        Self { state, value: 0 }
     }
 
     #[coactor::command]
-    pub async fn blocked_add(&mut self, context: &ActorContext<'_, AppState>, amount: i64) -> i64 {
-        context.state().entered.notify_one();
-        context.state().release.notified().await;
+    pub async fn blocked_add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
+        self.state.entered.notify_one();
+        self.state.release.notified().await;
         self.value += amount;
         self.value
     }
 
     #[coactor::command]
-    pub async fn add(&mut self, _context: &ActorContext<'_, AppState>, amount: i64) -> i64 {
+    pub async fn add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
         self.value += amount;
         self.value
     }
@@ -36,7 +37,7 @@ impl ProbeActor {
     #[coactor::command]
     pub async fn checked_add(
         &mut self,
-        _context: &ActorContext<'_, AppState>,
+        _context: &CommandContext,
         amount: i64,
     ) -> Result<i64, &'static str> {
         if amount < 0 {

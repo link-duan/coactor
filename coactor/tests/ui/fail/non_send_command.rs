@@ -1,20 +1,19 @@
 use std::rc::Rc;
 
-use coactor::{ActorContext, ActorId, actor};
+use coactor::{ActorId, CommandContext, actor};
 
 struct NonSend;
 
 #[actor(name = "non-send")]
 impl NonSend {
-    pub fn new(_actor_id: ActorId) -> Self {
+    pub fn new(_actor_id: ActorId, _state: std::sync::Arc<()>) -> Self {
         Self
     }
 
     #[coactor::command]
-    pub async fn call(&mut self, _context: &ActorContext<'_, ()>, value: Rc<u8>) -> Rc<u8> {
+    pub async fn call(&mut self, _context: &CommandContext, value: Rc<u8>) -> Rc<u8> {
         value
     }
 }
 
 fn main() {}
-

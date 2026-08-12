@@ -1,11 +1,12 @@
 use std::sync::Arc;
+
 use coactor::{ActorId, CommandContext, actor};
 
-struct MissingName;
+struct InvalidActor;
 
-#[actor]
-impl MissingName {
-    pub fn new(_actor_id: ActorId, _state: Arc<()>) -> Self {
+#[actor(name = "constructor-parameter-order")]
+impl InvalidActor {
+    pub fn new(_state: Arc<()>, _actor_id: ActorId) -> Self {
         Self
     }
 

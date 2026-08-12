@@ -39,18 +39,20 @@ Actor state exists only in memory. After passivation, a process exit, or a crash
 CoActor is embedded in an existing Tokio application. Define an Actor with an explicit stable Actor Type name, mark each caller-visible command, register the Actor Type before runtime startup, then keep and clone its generated typed Actor Ref:
 
 ```rust
-use coactor::{ActorContext, ActorId, RuntimeBuilder, actor};
+use std::sync::Arc;
+
+use coactor::{ActorId, CommandContext, RuntimeBuilder, actor};
 
 struct CounterActor(i64);
 
 #[actor(name = "counter")]
 impl CounterActor {
-    pub fn new(_actor_id: ActorId) -> Self {
+    pub fn new(_actor_id: ActorId, _app_state: Arc<()>) -> Self {
         Self(0)
     }
 
     #[coactor::command]
-    pub async fn add(&mut self, _context: &ActorContext<'_, ()>, amount: i64) -> i64 {
+    pub async fn add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
         self.0 += amount;
         self.0
     }

@@ -1,15 +1,21 @@
 error: on_deactivate must not return a value or error
- --> tests/ui/fail/invalid_deactivation.rs:5:1
+ --> tests/ui/fail/invalid_deactivation.rs:6:1
   |
-5 | #[actor(name = "invalid-deactivation")]
+6 | #[actor(name = "invalid-deactivation")]
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   |
   = note: this error originates in the attribute macro `actor` (in Nightly builds, run with -Z macro-backtrace for more info)
 
-warning: unused imports: `ActorContext`, `ActorId`, and `DeactivationReason`
- --> tests/ui/fail/invalid_deactivation.rs:1:15
+warning: unused import: `std::sync::Arc`
+ --> tests/ui/fail/invalid_deactivation.rs:1:5
   |
-1 | use coactor::{ActorContext, ActorId, DeactivationReason, actor};
-  |               ^^^^^^^^^^^^  ^^^^^^^  ^^^^^^^^^^^^^^^^^^
+1 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
   |
   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ActorId`, `CommandContext`, and `DeactivationReason`
+ --> tests/ui/fail/invalid_deactivation.rs:2:15
+  |
+2 | use coactor::{ActorId, CommandContext, DeactivationReason, actor};
+  |               ^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^

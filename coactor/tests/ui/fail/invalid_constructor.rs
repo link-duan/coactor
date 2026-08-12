@@ -1,4 +1,4 @@
-use coactor::{ActorContext, actor};
+use coactor::{CommandContext, actor};
 
 struct InvalidConstructor;
 
@@ -9,8 +9,7 @@ impl InvalidConstructor {
     }
 
     #[coactor::command]
-    pub async fn call(&mut self, _context: &ActorContext<'_, ()>) {}
+    pub async fn call(&mut self, _context: &CommandContext) {}
 }
 
 fn main() {}
-
