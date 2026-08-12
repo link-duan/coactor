@@ -32,6 +32,10 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
             _ => None,
         })
         .collect();
+    let activation = actor_impl.items.iter().find_map(|item| match item {
+        ImplItem::Fn(method) if method.sig.ident == "on_activate" => Some(method.clone()),
+        _ => None,
+    });
 
     if commands.is_empty() {
         return compile_error("an actor must declare at least one #[command]");
@@ -59,14 +63,44 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
         let invoke = if handler_returns_result {
             quote! {
-                let result = actor.#method_ident(&context, #(self.#argument_names),*).await;
-                let result = result.map_err(::coactor::SendError::HandlerError);
-                let _ = self.reply.send(result);
+                let outcome = ::coactor::__private::FutureExt::catch_unwind(
+                    ::std::panic::AssertUnwindSafe(
+                        actor.#method_ident(&context, #(self.#argument_names),*)
+                    )
+                ).await;
+                match outcome {
+                    ::core::result::Result::Ok(result) => {
+                        let result = result.map_err(::coactor::SendError::HandlerError);
+                        let _ = self.reply.send(result);
+                        ::coactor::__private::CommandOutcome::Completed
+                    }
+                    ::core::result::Result::Err(_) => {
+                        let _ = self.reply.send(::core::result::Result::Err(
+                            ::coactor::SendError::ActorStopped,
+                        ));
+                        ::coactor::__private::CommandOutcome::Panicked
+                    }
+                }
             }
         } else {
             quote! {
-                let result = actor.#method_ident(&context, #(self.#argument_names),*).await;
-                let _ = self.reply.send(::core::result::Result::Ok(result));
+                let outcome = ::coactor::__private::FutureExt::catch_unwind(
+                    ::std::panic::AssertUnwindSafe(
+                        actor.#method_ident(&context, #(self.#argument_names),*)
+                    )
+                ).await;
+                match outcome {
+                    ::core::result::Result::Ok(result) => {
+                        let _ = self.reply.send(::core::result::Result::Ok(result));
+                        ::coactor::__private::CommandOutcome::Completed
+                    }
+                    ::core::result::Result::Err(_) => {
+                        let _ = self.reply.send(::core::result::Result::Err(
+                            ::coactor::SendError::ActorStopped,
+                        ));
+                        ::coactor::__private::CommandOutcome::Panicked
+                    }
+                }
             }
         };
 
@@ -83,7 +117,7 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                     self: ::std::boxed::Box<Self>,
                     actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
                     context: ::coactor::ActorContext<'a, #state_type>,
-                ) -> ::coactor::__private::BoxFuture<'a, ()> {
+                ) -> ::coactor::__private::BoxFuture<'a, ::coactor::__private::CommandOutcome> {
                     ::std::boxed::Box::pin(async move {
                         let actor = actor
                             .downcast_mut::<#actor_type>()
@@ -119,6 +153,31 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         });
     }
 
+    let activate = if activation.is_some() {
+        quote! {
+            fn activate<'a>(
+                actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
+                context: ::coactor::ActorContext<'a, #state_type>,
+            ) -> ::coactor::__private::BoxFuture<'a, ::core::result::Result<(), ::std::string::String>> {
+                ::std::boxed::Box::pin(async move {
+                    let actor = actor
+                        .downcast_mut::<#actor_type>()
+                        .expect("CoActor registered an incompatible Actor Type");
+                    actor.on_activate(&context).await.map_err(|error| ::std::format!("{error:?}"))
+                })
+            }
+        }
+    } else {
+        quote! {
+            fn activate<'a>(
+                _actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
+                _context: ::coactor::ActorContext<'a, #state_type>,
+            ) -> ::coactor::__private::BoxFuture<'a, ::core::result::Result<(), ::std::string::String>> {
+                ::std::boxed::Box::pin(async { ::core::result::Result::Ok(()) })
+            }
+        }
+    };
+
     quote! {
         #actor_impl
 
@@ -140,6 +199,8 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
             fn create(actor_id: ::coactor::ActorId) -> Self {
                 Self::new(actor_id)
             }
+
+            #activate
 
             fn make_ref(inner: ::coactor::__private::ActorRef<#state_type>) -> Self::Ref {
                 #ref_ident { inner }

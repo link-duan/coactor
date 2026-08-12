@@ -126,6 +126,8 @@ pub enum SendError<E = Infallible> {
     HandlerError(E),
     #[error("the Active Actor mailbox is full")]
     MailboxFull,
+    #[error("the Active Actor failed to activate")]
+    ActivationFailed,
     #[error("the Active Actor stopped")]
     ActorStopped,
     #[error("the CoActor runtime stopped")]
@@ -227,6 +229,7 @@ pub mod __private {
     use super::*;
     use std::{future::Future, marker::PhantomData, pin::Pin};
 
+    pub use futures_util::FutureExt;
     pub use tokio;
 
     pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -236,19 +239,30 @@ pub mod __private {
             self: Box<Self>,
             actor: &'a mut (dyn Any + Send),
             context: ActorContext<'a, S>,
-        ) -> BoxFuture<'a, ()>;
+        ) -> BoxFuture<'a, CommandOutcome>;
 
         fn fail(self: Box<Self>, error: RuntimeError);
     }
 
     type Command<S> = Box<dyn ErasedCommand<S>>;
     type CommandSender<S> = mpsc::Sender<Command<S>>;
+    type Activate<S> = for<'a> fn(
+        &'a mut (dyn Any + Send),
+        ActorContext<'a, S>,
+    ) -> BoxFuture<'a, Result<(), String>>;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CommandOutcome {
+        Completed,
+        Panicked,
+    }
 
     #[derive(Clone, Copy)]
     pub enum RuntimeError {
         ActorStopped,
         RuntimeStopped,
         MailboxFull,
+        ActivationFailed,
     }
 
     impl<E> From<RuntimeError> for SendError<E> {
@@ -257,6 +271,7 @@ pub mod __private {
                 RuntimeError::ActorStopped => Self::ActorStopped,
                 RuntimeError::RuntimeStopped => Self::RuntimeStopped,
                 RuntimeError::MailboxFull => Self::MailboxFull,
+                RuntimeError::ActivationFailed => Self::ActivationFailed,
             }
         }
     }
@@ -266,12 +281,17 @@ pub mod __private {
         type Ref;
 
         fn create(actor_id: ActorId) -> Self;
+        fn activate<'a>(
+            actor: &'a mut (dyn Any + Send),
+            context: ActorContext<'a, S>,
+        ) -> BoxFuture<'a, Result<(), String>>;
         fn make_ref(inner: ActorRef<S>) -> Self::Ref;
     }
 
     pub struct Registration<S> {
         pub name: &'static str,
         create: fn(ActorId) -> Box<dyn Any + Send>,
+        activate: Activate<S>,
         pub mailbox_capacity: Option<usize>,
         marker: PhantomData<fn(S)>,
     }
@@ -284,6 +304,7 @@ pub mod __private {
             Self {
                 name: A::NAME,
                 create: |actor_id| Box::new(A::create(actor_id)),
+                activate: A::activate,
                 mailbox_capacity: None,
                 marker: PhantomData,
             }
@@ -352,17 +373,70 @@ pub mod __private {
         let mailbox_capacity = registration
             .mailbox_capacity
             .expect("mailbox capacity was not configured");
-        let mut actor = (registration.create)(address.actor_id().clone());
+        let create = registration.create;
+        let activate = registration.activate;
+        let mut actor = create(address.actor_id().clone());
         let (sender, mut receiver) = mpsc::channel::<Command<S>>(mailbox_capacity);
+        let task_sender = sender.clone();
         tokio::spawn(async move {
+            let activation_context = ActorContext {
+                address: &address,
+                state: runtime.state.as_ref(),
+            };
+            if let Err(error) = activate(actor.as_mut(), activation_context).await {
+                tracing::error!(
+                    actor_type = address.actor_type(),
+                    actor_id = ?address.actor_id(),
+                    lifecycle = "activation",
+                    error_category = "ActivationFailed",
+                    error = %error,
+                    "Actor activation failed"
+                );
+                receiver.close();
+                while let Ok(command) = receiver.try_recv() {
+                    command.fail(RuntimeError::ActivationFailed);
+                }
+                remove_route(&runtime, &address, &task_sender);
+                return;
+            }
             while let Some(command) = receiver.recv().await {
                 let context = ActorContext {
                     address: &address,
                     state: runtime.state.as_ref(),
                 };
-                command.execute(actor.as_mut(), context).await;
+                let outcome = command.execute(actor.as_mut(), context).await;
+                if outcome == CommandOutcome::Panicked {
+                    tracing::error!(
+                        actor_type = address.actor_type(),
+                        actor_id = ?address.actor_id(),
+                        lifecycle = "command",
+                        error_category = "ActorStopped",
+                        "Actor command handler panicked"
+                    );
+                    receiver.close();
+                    while let Ok(command) = receiver.try_recv() {
+                        command.fail(RuntimeError::ActorStopped);
+                    }
+                    remove_route(&runtime, &address, &task_sender);
+                    return;
+                }
             }
+            remove_route(&runtime, &address, &task_sender);
         });
         sender
+    }
+
+    fn remove_route<S>(
+        runtime: &RuntimeInner<S>,
+        address: &ActorAddress,
+        sender: &CommandSender<S>,
+    ) {
+        let mut actors = runtime.actors.lock();
+        if actors
+            .get(address)
+            .is_some_and(|current| current.same_channel(sender))
+        {
+            actors.remove(address);
+        }
     }
 }
