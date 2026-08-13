@@ -88,9 +88,9 @@ _Avoid_: Recovery, restart
 由 runtime 在确定生命周期阶段调用并等待、由 consumer 异步实现的 Actor 方法；consumer 可在其中执行 restore 或持久化。
 _Avoid_: Command handler, arbitrary callback
 
-**Actor Context**:
-runtime 在 lifecycle 与 command 执行时提供的最小只读运行环境，只借用当前 Actor Address 与 consumer 定义的强类型 App State，并公开 `actor_id()`、`actor_address()`、`state()`；它不是 Actor 的业务状态，也不提供跨 Actor 调用。
-_Avoid_: Actor state, global variable
+**Command Context**:
+runtime 为一次 Command invocation 提供的最小只读运行环境；它只标识当前 Actor，不是 Actor 的业务状态，也不提供跨 Actor 调用。
+_Avoid_: Actor Context, Actor state, global variable
 
 **App State**:
 一个 CoActor runtime 内由所有 Actor Type 共享的 consumer 强类型依赖容器，例如数据库 client、HTTP client 和配置。
@@ -123,6 +123,34 @@ _Avoid_: Empty state, first activation
 **Ownership Provider**:
 负责竞争、续持和释放 ownership，并产生单调 Ownership Epoch 的可替换实现。
 _Avoid_: Actor registry, service discovery
+
+**Node**:
+嵌入 CoActor runtime 并通过网络接收或转发 Command 的 consumer 进程运行位置；一个 Node 的长期运维身份与单次运行会话必须区分。
+_Avoid_: Actor Owner, Runtime handle, Pod
+
+**Node ID**:
+用于日志、运维和部署定位的 Node 稳定标签；它本身不证明当前进程拥有服务权。
+_Avoid_: Node Session ID, Owner
+
+**Node Session ID**:
+一次 runtime 启动的唯一身份，是 Node Lease 与 Actor Owner Record 中判断实际 Owner 进程的依据。
+_Avoid_: Node ID, hostname, Pod name
+
+**Node Lease**:
+共享 ownership authority 中证明某个 Node Session 在有界时间内仍具备运行资格的记录；失去该资格会触发整个 runtime self-fence。
+_Avoid_: Actor Owner Record, heartbeat alone
+
+**Actor Owner Record**:
+共享 ownership authority 中把一个 Actor Address 绑定到 Node Session 与 Ownership Epoch 的记录；它决定路由和 takeover，不表示 Active Actor 当前一定驻留内存。
+_Avoid_: Node Lease, local route, service discovery entry
+
+**Availability Failover**:
+旧 Owner 失效后，由新 Owner 以更高 Ownership Epoch 从空 CoActor 状态重新提供服务；consumer 可自行重建外部状态，但 CoActor 不保证状态恢复。
+_Avoid_: Recovery, Migration, restart
+
+**Ownership Fault**:
+runtime 无法取得、确认或继续持有服务权时产生的分布式 lifecycle failure；它不得被当作普通业务错误或持久化故障。
+_Avoid_: Handler Error, Persistence Fault, mailbox overload
 
 **Consumer**:
 通过 CoActor Rust library 注册 Actor Type、接收命令并提供 Actor 业务逻辑的宿主应用。

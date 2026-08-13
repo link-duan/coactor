@@ -15,6 +15,13 @@
 - 跨节点 ownership、故障恢复和迁移是 CoActor 的长期核心能力。
 - 这些能力按单机生命周期、durable recovery、双节点 ownership/fencing、迁移逐步验证，不要求首个切片同时完成。
 - 单机 Active Actor registry、进程存活和 handler reply 不得表述为全局 ownership、durable delivery 或 durable ACK。
+- 下一 distributed slice 采用纯嵌入式 Node，不要求独立 CoActor control-plane、service 或 binary。
+- 生产方向以位置透明的跨节点 Actor Ref 为入口；Node 间使用 gRPC 与 Protobuf command payload，consumer 负责其业务 schema 兼容。
+- distributed ownership 采用 Node Lease 与 Actor Owner Record 两层模型：Node Lease 证明 Node Session 资格，Actor Owner Record 通过 CAS 绑定 Actor Address、Node Session 与 Ownership Epoch。
+- 下一 distributed slice 不提供 CoActor 状态持久化或 Recovery；Owner 失效后由新 Owner 从空状态启动，该能力称为 Availability Failover。
+- Node self-fence 是 runtime-wide fail-stop，但 CoActor 作为 library 不退出宿主进程；consumer 通过 runtime supervision 结果决定进程处置。
+- 外部数据库写、HTTP 调用等 consumer side effect 不在 CoActor fencing 保证内。
+- production runtime 必须显式配置 distributed dependencies；本地执行保留为明确的测试能力，不允许生产配置缺失时静默退化。
 
 ## Post-MVP candidate design
 
@@ -56,6 +63,19 @@
 - 新 Owner 恢复后不需要先把完整 Actor Store 上传为新 epoch baseline，即可开始处理消息。
 - 本地 KV 引擎负责 KV 索引、事务与 batch 原子性；对象存储层不再把每个 KV mutation 表示为独立 commit object。
 - CoActor 不把 Active Actor 内存当作唯一状态真源，也不强制所有负载采用同一种业务状态模型。
+
+## Next distributed slice
+
+- AWS S3 conditional write/CAS 是 Node Lease 与 Actor Owner Record 的目标 authority；实现前先以 deterministic fake、AWS SDK HTTP contract tests 与 LocalStack 验证协议和 adapter。
+- 在真实 AWS qualification suite 通过前，项目只表述为“面向 AWS S3 语义设计”，不宣称已通过真实 AWS S3 验证；qualification 是首次生产发布条件，不是日常 CI 阻塞项。
+- lease 时序采用 celld 的务实基线：默认 TTL 10 秒、约每 TTL/3 续租、ownership 单操作 15 秒、peer connect 3 秒；部署要求正常 NTP，不宣称容忍任意时钟偏差。
+- Node ID 是运维标签；每次 runtime 启动必须产生唯一 Node Session ID，ownership authority 以 session 身份区分重叠运行的新旧进程。
+- bind address 与 advertised address 分离；Kubernetes 可通过 Downward API 注入，裸机可显式配置，library 不自动猜测网卡、NAT 或 DNS。
+- 同一 Actor Address 的并发冷调用合并为一次 owner resolution。CAS rejected 重新读取；ambiguous mutation 必须 read-back 精确 session/epoch，并有界协调。
+- 只有能证明请求未被 handler 接纳的远程失败才自动重试；请求可能已上 wire 后的失败返回 outcome unknown，不自动重放。
+- capacity sample 随 Node Lease 发布，只作 placement hint；目标 Node 必须重新做本地 admission，拒绝后最多改选一次。
+- idle passivation 完成 Actor 停止后将 Actor Owner Record CAS 为 unowned 并保留 epoch；graceful shutdown drain 后释放 Node Lease，保留 Actor Owner Record 供更高 epoch takeover。
+- Handler Reply 只证明 handler 本地完成且 Node 仍通过本地 authority check；它不是 Durable ACK，也不经过每次 reply 的 S3 owner reread。
 
 ## First version scope
 
@@ -122,12 +142,9 @@
 
 ## Open
 
-- 后续是否提供独立部署的 platform、service 或 binary。
-- 如果提供独立进程，哪些职责留在 consumer，哪些职责由独立进程承载。
-- library 与未来独立组件之间采用进程内调用、网络协议还是两种模式并存。
+- 更后续是否提供独立部署的 platform、service 或 binary；它不属于下一 distributed slice。
 - 不同负载如何提供 mailbox 满载、durability 和 ACK 策略，而不污染共同核心。
 - 本地 KV 引擎需要满足的单文件、事务、checkpoint 与 crash-consistency 能力。
 - checkpoint 期间是否允许继续 mutation，以及该能力如何受本地 KV 引擎约束。
 - `max_dirty_age` 的默认值。
-- node lease/self-fence 的 TTL、续租时序和故障状态机。
 - 未来是否提供 Durable ACK、dedupe 与外部副作用协调能力。

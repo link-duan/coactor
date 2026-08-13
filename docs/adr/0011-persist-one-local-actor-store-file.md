@@ -1,3 +1,0 @@
-# Persist one local Actor Store file
-
-Actor-scoped KV 由 Active Actor 所在节点上的嵌入式 KV 引擎承载，并组织为一个本地单文件 Actor Store；consumer 和 Actor 只操作本地 KV API。runtime 把该文件作为 `actors/<address>/epochs/<epoch>/state` 持久化到对象存储，并允许在同一 epoch 内覆盖该 object，而不是把每个 KV key 或 commit batch 映射为独立 S3 object。state object 的 runtime metadata 仅包含 `format_version`、`revision` 与 `checksum`；Actor Address 和 Ownership Epoch 已由 object key 表达，不在文件中重复保存。revision 在每次成功提交的本地 KV 写事务后递增，一个事务可以包含多个 put/delete，失败、回滚和只读事务不递增；它不对应 Actor command。同一 Active Actor 的上传严格串行，但 state PUT 仅使用普通重试，不使用 ETag CAS。该选择把索引、事务和 batch 原子性交给成熟本地 KV 引擎，显著简化对象布局与恢复；代价是整文件上传、checkpoint 一致性，以及同一 epoch 迟到重试可能造成远端 revision 回退。epoch namespace 隔离 stale Owner，确定版本的 Restore Cut 则保证一次恢复过程中不追逐变化中的旧 object。

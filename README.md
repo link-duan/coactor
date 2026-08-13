@@ -102,5 +102,5 @@ In-process actor uniqueness is scoped to a single CoActor runtime instance and m
 
 - [Design brief](docs/design-brief.md)
 - [First-version runtime semantics](docs/runtime-semantics.md)
-- [Architecture decision records](docs/adr/)
+- [Proposed distributed runtime semantics](docs/distributed-runtime-semantics.md)
 - [Product direction](docs/product-direction.md)
