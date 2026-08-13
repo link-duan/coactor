@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io,
     net::{Ipv4Addr, SocketAddr},
     sync::{
         Arc, Mutex,
@@ -16,6 +17,37 @@ use coactor::{
     VersionedActorOwnerRecord, VersionedNodeLease, actor,
 };
 use prost::Message;
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for CapturedWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Captured {
+    type Writer = CapturedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedWriter(self.0.clone())
+    }
+}
+
+impl Captured {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
 
 #[derive(Clone, PartialEq, Message)]
 struct AddRequest {
@@ -32,6 +64,36 @@ struct AddResponse {
 #[derive(Default)]
 struct CounterActor {
     value: i64,
+}
+
+#[derive(Clone, Default)]
+struct RebuildingState {
+    activations: Arc<AtomicUsize>,
+    external_seed: i64,
+}
+
+struct RebuildingActor {
+    state: Arc<RebuildingState>,
+    value: i64,
+}
+
+#[actor(name = "rebuilding-counter")]
+impl RebuildingActor {
+    pub fn new(_actor_id: ActorId, state: Arc<RebuildingState>) -> Self {
+        Self { state, value: 0 }
+    }
+
+    pub async fn on_activate(&mut self) -> Result<(), String> {
+        self.state.activations.fetch_add(1, Ordering::Relaxed);
+        self.value = self.state.external_seed;
+        Ok(())
+    }
+
+    #[coactor::command(remote)]
+    pub async fn add(&mut self, _context: &CommandContext, request: AddRequest) -> AddResponse {
+        self.value += request.amount;
+        AddResponse { value: self.value }
+    }
 }
 
 #[actor(name = "owned-counter")]
@@ -62,6 +124,7 @@ struct OwnershipFake {
     ambiguous_next_claim: Mutex<bool>,
     lose_next_claim_response_without_applying: Mutex<bool>,
     reject_next_claim_for_node: Mutex<Option<String>>,
+    fail_lease_reads: Mutex<bool>,
 }
 
 impl OwnershipFake {
@@ -72,6 +135,25 @@ impl OwnershipFake {
 
     fn owner(&self, address: &ActorAddress) -> VersionedActorOwnerRecord {
         self.state.lock().unwrap().owners[address].clone()
+    }
+
+    fn remove_lease(&self, session_id: &NodeSessionId) {
+        self.state
+            .lock()
+            .unwrap()
+            .leases
+            .remove(session_id.as_str());
+    }
+
+    fn redirect_lease(&self, session_id: &NodeSessionId, address: SocketAddr) {
+        self.state
+            .lock()
+            .unwrap()
+            .leases
+            .get_mut(session_id.as_str())
+            .unwrap()
+            .lease
+            .advertised_address = address;
     }
 }
 
@@ -97,6 +179,9 @@ impl NodeLeaseStorage for OwnershipFake {
         &self,
         session_id: &NodeSessionId,
     ) -> Result<Option<VersionedNodeLease>, OwnershipStorageError> {
+        if *self.fail_lease_reads.lock().unwrap() {
+            return Err(OwnershipStorageError::Unavailable);
+        }
         Ok(self
             .state
             .lock()
@@ -415,6 +500,177 @@ async fn unreconciled_ambiguous_claim_is_bounded_and_never_replayed() {
     assert_eq!(storage.owner_claims.load(Ordering::Relaxed), 1);
     assert_eq!(storage.owner_reads.load(Ordering::Relaxed), 4);
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn absent_owner_lease_allows_higher_epoch_empty_state_failover() {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(captured.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let storage = Arc::new(OwnershipFake::default());
+    let first_address = free_address().await;
+    let second_address = free_address().await;
+    let first_state = RebuildingState {
+        external_seed: 0,
+        ..RebuildingState::default()
+    };
+    let second_state = RebuildingState {
+        external_seed: 40,
+        ..RebuildingState::default()
+    };
+    let first = RuntimeBuilder::new(first_state.clone())
+        .register::<RebuildingActor>()
+        .distributed(config("node-a", first_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let second = RuntimeBuilder::new(second_state.clone())
+        .register::<RebuildingActor>()
+        .distributed(config("node-b", second_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let actor_id = ActorId::from("failed-over");
+    let first_ref = first
+        .actor_ref::<RebuildingActor>(actor_id.clone())
+        .unwrap();
+    let second_ref = second
+        .actor_ref::<RebuildingActor>(actor_id.clone())
+        .unwrap();
+
+    assert_eq!(
+        first_ref.add(AddRequest { amount: 5 }).await.unwrap().value,
+        5
+    );
+    let address = ActorAddress::new("rebuilding-counter", actor_id);
+    let prior = storage.owner(&address);
+    storage.remove_lease(&prior.record.owner.as_ref().unwrap().session_id);
+
+    assert_eq!(
+        second_ref
+            .add(AddRequest { amount: 1 })
+            .await
+            .unwrap()
+            .value,
+        41,
+        "replacement uses consumer activation input, not prior CoActor memory"
+    );
+    assert_eq!(storage.owner(&address).record.ownership_epoch, 2);
+    assert_eq!(first_state.activations.load(Ordering::Relaxed), 1);
+    assert_eq!(second_state.activations.load(Ordering::Relaxed), 1);
+    let trace = captured.text();
+    assert!(trace.contains("lifecycle=\"availability_failover\""));
+    assert!(!trace.contains("Recovery"));
+    assert!(!trace.contains("Migration"));
+
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn lease_read_failure_never_permits_takeover() {
+    let storage = Arc::new(OwnershipFake::default());
+    let first_address = free_address().await;
+    let second_address = free_address().await;
+    let first = RuntimeBuilder::new(())
+        .register::<CounterActor>()
+        .distributed(config("node-a", first_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let second = RuntimeBuilder::new(())
+        .register::<CounterActor>()
+        .distributed(config("node-b", second_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let actor_id = ActorId::from("lease-read-failed");
+    first
+        .actor_ref::<CounterActor>(actor_id.clone())
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+    let owner = storage.owner(&ActorAddress::new("owned-counter", actor_id.clone()));
+    *storage.fail_lease_reads.lock().unwrap() = true;
+
+    assert_eq!(
+        second
+            .actor_ref::<CounterActor>(actor_id)
+            .unwrap()
+            .add(AddRequest { amount: 1 })
+            .await,
+        Err(coactor::SendError::RemoteUnavailable)
+    );
+    assert_eq!(storage.owner_claims.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        storage
+            .owner(&ActorAddress::new(
+                "owned-counter",
+                ActorId::from("lease-read-failed")
+            ))
+            .record,
+        owner.record
+    );
+    *storage.fail_lease_reads.lock().unwrap() = false;
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn unreachable_owner_endpoint_never_permits_takeover() {
+    let storage = Arc::new(OwnershipFake::default());
+    let first_address = free_address().await;
+    let second_address = free_address().await;
+    let unreachable = free_address().await;
+    let first = RuntimeBuilder::new(())
+        .register::<CounterActor>()
+        .distributed(config("node-a", first_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let second = RuntimeBuilder::new(())
+        .register::<CounterActor>()
+        .distributed(config("node-b", second_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let actor_id = ActorId::from("endpoint-unreachable");
+    first
+        .actor_ref::<CounterActor>(actor_id.clone())
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+    let address = ActorAddress::new("owned-counter", actor_id.clone());
+    let owner = storage.owner(&address);
+    storage.redirect_lease(
+        &owner.record.owner.as_ref().unwrap().session_id,
+        unreachable,
+    );
+
+    assert_eq!(
+        second
+            .actor_ref::<CounterActor>(actor_id)
+            .unwrap()
+            .add(AddRequest { amount: 1 })
+            .await,
+        Err(coactor::SendError::RemoteUnavailable)
+    );
+    assert_eq!(storage.owner_claims.load(Ordering::Relaxed), 1);
+    assert_eq!(storage.owner(&address).record, owner.record);
+    first.shutdown().await;
+    second.shutdown().await;
 }
 
 #[tokio::test]

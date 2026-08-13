@@ -951,21 +951,31 @@ pub mod __private {
                         )
                         .await
                         .map_err(|_| RuntimeError::RemoteUnavailable)?
-                        .map_err(|_| RuntimeError::RemoteUnavailable)?
-                        .ok_or(RuntimeError::RemoteUnavailable)?;
-                        let endpoint = format!("http://{}", lease.lease.advertised_address);
-                        let protocol_version = lease.lease.protocol_version;
-                        self.resolved.lock().await.insert(
-                            address.clone(),
-                            CachedOwner::Remote {
-                                endpoint: endpoint.clone(),
-                                protocol_version,
-                            },
+                        .map_err(|_| RuntimeError::RemoteUnavailable)?;
+                        if let Some(lease) = lease {
+                            if lease.lease.expires_at_unix_ms > wall_time_millis() {
+                                let endpoint = format!("http://{}", lease.lease.advertised_address);
+                                let protocol_version = lease.lease.protocol_version;
+                                self.resolved.lock().await.insert(
+                                    address.clone(),
+                                    CachedOwner::Remote {
+                                        endpoint: endpoint.clone(),
+                                        protocol_version,
+                                    },
+                                );
+                                return Ok(ResolvedOwner::Remote {
+                                    endpoint,
+                                    protocol_version,
+                                });
+                            }
+                        }
+                        tracing::info!(
+                            actor_type = address.actor_type(),
+                            actor_id = ?address.actor_id(),
+                            prior_epoch = current.record.ownership_epoch,
+                            lifecycle = "availability_failover",
+                            "Actor Owner Node Lease is absent or expired; attempting empty-state takeover"
                         );
-                        return Ok(ResolvedOwner::Remote {
-                            endpoint,
-                            protocol_version,
-                        });
                     }
                 }
 
