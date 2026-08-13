@@ -277,9 +277,9 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     #request_name: #request_type,
                 ) -> ::core::result::Result<#reply_type, ::coactor::SendError<#error_type>> {
-                    if self.inner.is_remote() {
-                        let payload = ::coactor::__private::prost::Message::encode_to_vec(&#request_name);
-                        return match self.inner.invoke_remote(stringify!(#method_ident), payload).await? {
+                    let payload = ::coactor::__private::prost::Message::encode_to_vec(&#request_name);
+                    let (reservation, resolution) = match self.inner.route_remote_command(stringify!(#method_ident), payload).await {
+                        ::core::result::Result::Ok(::coactor::__private::RouteDecision::Remote(remote)) => return match remote {
                             ::coactor::__private::RemotePayload::Success(bytes) => {
                                 ::coactor::__private::prost::Message::decode(bytes.as_slice())
                                     .map_err(|_| ::coactor::SendError::RemoteProtocol(
@@ -289,14 +289,17 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                             ::coactor::__private::RemotePayload::HandlerError(bytes) => {
                                 #remote_handler_error
                             }
-                        };
-                    }
+                        },
+                        ::core::result::Result::Ok(::coactor::__private::RouteDecision::Local { reservation, resolution }) => (reservation, resolution),
+                        ::core::result::Result::Err(error) => return ::core::result::Result::Err(error.into()),
+                    };
                     let (reply, receive) = ::coactor::__private::tokio::sync::oneshot::channel();
-                    self.inner.send(::std::boxed::Box::new(#message_ident {
+                    self.inner.send_with_reservation(::std::boxed::Box::new(#message_ident {
                         #request_name,
                         reply: ::core::option::Option::Some(reply),
                         remote_reply: ::core::option::Option::None,
-                    }))?;
+                    }), reservation)?;
+                    ::core::mem::drop(resolution);
                     let result = receive.await.unwrap_or_else(|_| ::core::result::Result::Err(
                         self.inner.reply_channel_closed_error(),
                     ));

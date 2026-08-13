@@ -7,9 +7,10 @@ use std::{
 
 use async_trait::async_trait;
 use coactor::{
-    ActorId, AmbiguousMutation, CommandContext, DistributedRuntimeConfig, LeaseMutation,
-    LeaseTiming, NodeLease, NodeLeaseStorage, NodeSessionId, OwnershipStorageError, RuntimeBuilder,
-    RuntimeStartError, RuntimeTerminationReason, SendError, VersionedNodeLease, actor,
+    ActorId, ActorOwnerStorage, AmbiguousMutation, CommandContext, DistributedRuntimeConfig,
+    LeaseMutation, LeaseTiming, NodeLease, NodeLeaseStorage, NodeSessionId, OwnershipStorageError,
+    RuntimeBuilder, RuntimeStartError, RuntimeTerminationReason, SendError, VersionedNodeLease,
+    actor,
 };
 use tokio::sync::Notify;
 
@@ -26,6 +27,25 @@ struct FakeLeaseStorage {
     acquire_block: Mutex<Option<Arc<Notify>>>,
     reads: Mutex<usize>,
     released: Mutex<Vec<(NodeSessionId, String)>>,
+}
+
+#[async_trait]
+impl ActorOwnerStorage for FakeLeaseStorage {
+    async fn read_actor_owner(
+        &self,
+        _address: &coactor::ActorAddress,
+    ) -> Result<Option<coactor::VersionedActorOwnerRecord>, OwnershipStorageError> {
+        Err(OwnershipStorageError::Failed)
+    }
+
+    async fn claim_actor_owner(
+        &self,
+        _address: &coactor::ActorAddress,
+        _record: coactor::ActorOwnerRecord,
+        _etag: Option<&str>,
+    ) -> Result<LeaseMutation, OwnershipStorageError> {
+        Err(OwnershipStorageError::Failed)
+    }
 }
 
 #[async_trait]

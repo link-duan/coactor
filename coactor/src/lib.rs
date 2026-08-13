@@ -20,10 +20,10 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
 pub use node_authority::{
-    AmbiguousMutation, DistributedRuntimeBuilder, DistributedRuntimeConfig, LeaseMutation,
-    LeaseTiming, NodeLease, NodeLeaseStorage, NodeSessionId, OwnershipStorageError,
-    RuntimeStartError, RuntimeSupervision, RuntimeTermination, RuntimeTerminationReason,
-    VersionedNodeLease,
+    ActorOwner, ActorOwnerRecord, ActorOwnerStorage, AmbiguousMutation, DistributedRuntimeBuilder,
+    DistributedRuntimeConfig, LeaseMutation, LeaseTiming, NodeLease, NodeLeaseStorage,
+    NodeSessionId, OwnershipStorage, OwnershipStorageError, RuntimeStartError, RuntimeSupervision,
+    RuntimeTermination, RuntimeTerminationReason, VersionedActorOwnerRecord, VersionedNodeLease,
 };
 pub use s3_node_lease::{S3NodeLeaseConfig, S3NodeLeaseStorage};
 
@@ -275,7 +275,7 @@ where
     pub fn distributed(
         self,
         config: DistributedRuntimeConfig,
-        storage: Arc<dyn NodeLeaseStorage>,
+        storage: Arc<dyn OwnershipStorage>,
     ) -> Result<DistributedRuntimeBuilder<S>, RuntimeStartError> {
         config.validate()?;
         Ok(DistributedRuntimeBuilder {
@@ -286,7 +286,7 @@ where
     }
 
     pub fn build(self) -> Result<Runtime<S>, BuildError> {
-        self.build_with_authority(None)
+        self.build_with_authority(None, None)
     }
 
     pub(crate) fn validate(&self) -> Result<(), BuildError> {
@@ -311,6 +311,7 @@ where
     fn build_with_authority(
         self,
         authority: Option<Arc<__private::NodeAuthority>>,
+        distributed: Option<Arc<__private::DistributedContext>>,
     ) -> Result<Runtime<S>, BuildError> {
         self.validate()?;
         let mut registrations = HashMap::new();
@@ -337,6 +338,7 @@ where
                 shutdown_timeout: self.shutdown_timeout,
                 peer_protocol_version: self.peer_protocol_version,
                 authority,
+                distributed,
             }),
             distributed: None,
         })
@@ -531,7 +533,7 @@ pub mod __private {
     }
 
     struct RenewalExit {
-        storage: Arc<dyn NodeLeaseStorage>,
+        storage: Arc<dyn OwnershipStorage>,
         session_id: NodeSessionId,
         etag: String,
         release: bool,
@@ -582,7 +584,7 @@ pub mod __private {
     pub fn spawn_lease_renewal<S>(
         runtime: Arc<RuntimeInner<S>>,
         authority: Arc<NodeAuthority>,
-        storage: Arc<dyn NodeLeaseStorage>,
+        storage: Arc<dyn OwnershipStorage>,
         mut lease: NodeLease,
         mut etag: String,
         timing: LeaseTiming,
@@ -848,6 +850,230 @@ pub mod __private {
         pub shutdown_timeout: Duration,
         pub peer_protocol_version: u32,
         pub authority: Option<Arc<NodeAuthority>>,
+        pub distributed: Option<Arc<DistributedContext>>,
+    }
+
+    pub struct DistributedContext {
+        storage: Arc<dyn OwnershipStorage>,
+        node_id: String,
+        session_id: NodeSessionId,
+        operation_timeout: Duration,
+        resolutions: tokio::sync::Mutex<HashMap<ActorAddress, Arc<tokio::sync::Mutex<()>>>>,
+        resolved: tokio::sync::Mutex<HashMap<ActorAddress, CachedOwner>>,
+    }
+
+    impl DistributedContext {
+        pub fn new(
+            storage: Arc<dyn OwnershipStorage>,
+            node_id: String,
+            session_id: NodeSessionId,
+            operation_timeout: Duration,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                storage,
+                node_id,
+                session_id,
+                operation_timeout,
+                resolutions: tokio::sync::Mutex::new(HashMap::new()),
+                resolved: tokio::sync::Mutex::new(HashMap::new()),
+            })
+        }
+
+        async fn resolution_lock(&self, address: &ActorAddress) -> Arc<tokio::sync::Mutex<()>> {
+            let mut resolutions = self.resolutions.lock().await;
+            resolutions
+                .entry(address.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        }
+
+        fn is_local_owner(&self, record: &ActorOwnerRecord) -> bool {
+            record.owner.as_ref().is_some_and(|owner| {
+                owner.node_id == self.node_id && owner.session_id == self.session_id
+            })
+        }
+
+        fn local_claim(&self, epoch: u64) -> ActorOwnerRecord {
+            ActorOwnerRecord {
+                owner: Some(ActorOwner {
+                    node_id: self.node_id.clone(),
+                    session_id: self.session_id.clone(),
+                }),
+                ownership_epoch: epoch,
+            }
+        }
+
+        async fn resolve(
+            &self,
+            address: &ActorAddress,
+            capacity: &Arc<Semaphore>,
+        ) -> Result<ResolvedOwner, RuntimeError> {
+            let lock = self.resolution_lock(address).await;
+            let guard = lock.lock_owned().await;
+            if let Some(cached) = self.resolved.lock().await.get(address).cloned() {
+                return Ok(match cached {
+                    CachedOwner::Local => ResolvedOwner::Local {
+                        reservation: None,
+                        guard,
+                    },
+                    CachedOwner::Remote {
+                        endpoint,
+                        protocol_version,
+                    } => ResolvedOwner::Remote {
+                        endpoint,
+                        protocol_version,
+                    },
+                });
+            }
+            for _ in 0..3 {
+                let current = tokio::time::timeout(
+                    self.operation_timeout,
+                    self.storage.read_actor_owner(address),
+                )
+                .await
+                .map_err(|_| RuntimeError::RemoteUnavailable)?
+                .map_err(|_| RuntimeError::RemoteUnavailable)?;
+                if let Some(current) = current.as_ref() {
+                    if self.is_local_owner(&current.record) {
+                        self.resolved
+                            .lock()
+                            .await
+                            .insert(address.clone(), CachedOwner::Local);
+                        return Ok(ResolvedOwner::Local {
+                            reservation: None,
+                            guard,
+                        });
+                    }
+                    if let Some(owner) = &current.record.owner {
+                        let lease = tokio::time::timeout(
+                            self.operation_timeout,
+                            self.storage.read_node_lease(&owner.session_id),
+                        )
+                        .await
+                        .map_err(|_| RuntimeError::RemoteUnavailable)?
+                        .map_err(|_| RuntimeError::RemoteUnavailable)?
+                        .ok_or(RuntimeError::RemoteUnavailable)?;
+                        let endpoint = format!("http://{}", lease.lease.advertised_address);
+                        let protocol_version = lease.lease.protocol_version;
+                        self.resolved.lock().await.insert(
+                            address.clone(),
+                            CachedOwner::Remote {
+                                endpoint: endpoint.clone(),
+                                protocol_version,
+                            },
+                        );
+                        return Ok(ResolvedOwner::Remote {
+                            endpoint,
+                            protocol_version,
+                        });
+                    }
+                }
+
+                let epoch = current.as_ref().map_or(1, |current| {
+                    current.record.ownership_epoch.saturating_add(1)
+                });
+                let expected = self.local_claim(epoch);
+                let etag = current.as_ref().map(|current| current.etag.as_str());
+                let reservation = capacity
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| RuntimeError::RuntimeAtCapacity)?;
+                let mutation = tokio::time::timeout(
+                    self.operation_timeout,
+                    self.storage
+                        .claim_actor_owner(address, expected.clone(), etag),
+                )
+                .await
+                .map_err(|_| RuntimeError::RemoteUnavailable)?
+                .map_err(|_| RuntimeError::RemoteUnavailable)?;
+                match mutation {
+                    LeaseMutation::Applied { .. } => {
+                        self.resolved
+                            .lock()
+                            .await
+                            .insert(address.clone(), CachedOwner::Local);
+                        return Ok(ResolvedOwner::Local {
+                            reservation: Some(reservation),
+                            guard,
+                        });
+                    }
+                    LeaseMutation::ConditionalRejected => {
+                        drop(reservation);
+                        continue;
+                    }
+                    LeaseMutation::Ambiguous(_) => {
+                        let mut should_reresolve = false;
+                        for _ in 0..3 {
+                            let confirmed = tokio::time::timeout(
+                                self.operation_timeout,
+                                self.storage.read_actor_owner(address),
+                            )
+                            .await;
+                            if let Ok(Ok(Some(confirmed))) = confirmed {
+                                if confirmed.record == expected {
+                                    self.resolved
+                                        .lock()
+                                        .await
+                                        .insert(address.clone(), CachedOwner::Local);
+                                    return Ok(ResolvedOwner::Local {
+                                        reservation: Some(reservation),
+                                        guard,
+                                    });
+                                }
+                                if confirmed.record.owner.is_some() {
+                                    should_reresolve = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if should_reresolve {
+                            continue;
+                        }
+                        return Err(RuntimeError::RemoteUnavailable);
+                    }
+                }
+            }
+            Err(RuntimeError::RemoteUnavailable)
+        }
+
+        async fn resolve_local(
+            &self,
+            address: &ActorAddress,
+            capacity: &Arc<Semaphore>,
+        ) -> Result<LocalResolution, RuntimeError> {
+            match self.resolve(address, capacity).await? {
+                ResolvedOwner::Local { reservation, guard } => Ok(LocalResolution {
+                    reservation,
+                    guard: Some(guard),
+                }),
+                ResolvedOwner::Remote { .. } => Err(RuntimeError::RemoteUnavailable),
+            }
+        }
+    }
+
+    enum ResolvedOwner {
+        Local {
+            reservation: Option<OwnedSemaphorePermit>,
+            guard: tokio::sync::OwnedMutexGuard<()>,
+        },
+        Remote {
+            endpoint: String,
+            protocol_version: u32,
+        },
+    }
+
+    struct LocalResolution {
+        reservation: Option<OwnedSemaphorePermit>,
+        guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    }
+
+    #[derive(Clone)]
+    enum CachedOwner {
+        Local,
+        Remote {
+            endpoint: String,
+            protocol_version: u32,
+        },
     }
 
     pub struct Route<S> {
@@ -899,7 +1125,15 @@ pub mod __private {
     where
         S: Send + Sync + 'static,
     {
-        pub fn send(&self, mut command: Command<S>) -> Result<(), RuntimeError> {
+        pub fn send(&self, command: Command<S>) -> Result<(), RuntimeError> {
+            self.send_with_reservation(command, None)
+        }
+
+        pub fn send_with_reservation(
+            &self,
+            mut command: Command<S>,
+            reservation: Option<OwnedSemaphorePermit>,
+        ) -> Result<(), RuntimeError> {
             let ActorRefTarget::Local(runtime) = &self.target else {
                 command.fail(RuntimeError::RemoteUnavailable);
                 return Err(RuntimeError::RemoteUnavailable);
@@ -962,12 +1196,15 @@ pub mod __private {
                 }
             }
 
-            let permit = match runtime.capacity.clone().try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    command.fail(RuntimeError::RuntimeAtCapacity);
-                    return Err(RuntimeError::RuntimeAtCapacity);
-                }
+            let permit = match reservation {
+                Some(permit) => permit,
+                None => match runtime.capacity.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        command.fail(RuntimeError::RuntimeAtCapacity);
+                        return Err(RuntimeError::RuntimeAtCapacity);
+                    }
+                },
             };
             let generation = runtime.next_generation.fetch_add(1, Ordering::Relaxed);
             let spawned = spawn_actor(runtime.clone(), self.address.clone(), generation);
@@ -984,10 +1221,6 @@ pub mod __private {
                 },
             );
             result
-        }
-
-        pub fn is_remote(&self) -> bool {
-            matches!(self.target, ActorRefTarget::Remote { .. })
         }
 
         pub fn reply_channel_closed_error<E>(&self) -> SendError<E> {
@@ -1057,6 +1290,58 @@ pub mod __private {
                 None => Err(RuntimeError::RemoteProtocol),
             }
         }
+
+        pub async fn route_remote_command(
+            &self,
+            command: &'static str,
+            payload: Vec<u8>,
+        ) -> Result<RouteDecision, RuntimeError> {
+            match &self.target {
+                ActorRefTarget::Remote { .. } => self
+                    .invoke_remote(command, payload)
+                    .await
+                    .map(RouteDecision::Remote),
+                ActorRefTarget::Local(runtime) => {
+                    let runtime = runtime.upgrade().ok_or(RuntimeError::RuntimeStopped)?;
+                    let Some(distributed) = &runtime.distributed else {
+                        return Ok(RouteDecision::Local {
+                            reservation: None,
+                            resolution: None,
+                        });
+                    };
+                    match distributed
+                        .resolve(&self.address, &runtime.capacity)
+                        .await?
+                    {
+                        ResolvedOwner::Local { reservation, guard } => Ok(RouteDecision::Local {
+                            reservation,
+                            resolution: Some(guard),
+                        }),
+                        ResolvedOwner::Remote {
+                            endpoint,
+                            protocol_version,
+                        } => ActorRef::<S> {
+                            target: ActorRefTarget::Remote {
+                                endpoint,
+                                protocol_version,
+                            },
+                            address: self.address.clone(),
+                        }
+                        .invoke_remote(command, payload)
+                        .await
+                        .map(RouteDecision::Remote),
+                    }
+                }
+            }
+        }
+    }
+
+    pub enum RouteDecision {
+        Local {
+            reservation: Option<OwnedSemaphorePermit>,
+            resolution: Option<tokio::sync::OwnedMutexGuard<()>>,
+        },
+        Remote(RemotePayload),
     }
 
     pub enum RemotePayload {
@@ -1105,9 +1390,32 @@ pub mod __private {
                                     ActorId::new(request.actor_id),
                                 ),
                             };
-                            if let Err(error) = actor_ref.send(invocation.command) {
+                            let local_resolution =
+                                if let Some(distributed) = &self.runtime.distributed {
+                                    distributed
+                                        .resolve_local(&actor_ref.address, &self.runtime.capacity)
+                                        .await
+                                } else {
+                                    Ok(LocalResolution {
+                                        reservation: None,
+                                        guard: None,
+                                    })
+                                };
+                            let local_resolution = match local_resolution {
+                                Ok(resolution) => resolution,
+                                Err(error) => {
+                                    return Ok(Response::new(peer_protocol::InvokeResponse {
+                                        outcome: runtime_failure(error),
+                                    }));
+                                }
+                            };
+                            if let Err(error) = actor_ref.send_with_reservation(
+                                invocation.command,
+                                local_resolution.reservation,
+                            ) {
                                 runtime_failure(error)
                             } else {
+                                drop(local_resolution.guard);
                                 use peer_protocol::invoke_response::Outcome;
                                 let reply = invocation.reply.await;
                                 if !self.runtime.has_authority() {
