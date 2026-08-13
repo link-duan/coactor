@@ -12,11 +12,12 @@ use std::{
 use async_trait::async_trait;
 use coactor::{
     ActorAddress, ActorId, ActorOwner, ActorOwnerRecord, ActorOwnerStorage, AmbiguousMutation,
-    CommandContext, DistributedRuntimeConfig, LeaseMutation, LeaseTiming, NodeLease,
-    NodeLeaseStorage, NodeSessionId, OwnershipStorageError, RuntimeBuilder,
+    CommandContext, DeactivationReason, DistributedRuntimeConfig, LeaseMutation, LeaseTiming,
+    NodeLease, NodeLeaseStorage, NodeSessionId, OwnershipStorageError, RuntimeBuilder,
     VersionedActorOwnerRecord, VersionedNodeLease, actor,
 };
 use prost::Message;
+use tokio::sync::Notify;
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone, Default)]
@@ -77,6 +78,72 @@ struct RebuildingActor {
     value: i64,
 }
 
+#[derive(Clone, Default)]
+struct IdleReleaseState {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+    shutdown_deactivations: Arc<AtomicUsize>,
+}
+
+#[derive(Default)]
+struct IdleReleaseActor {
+    state: Arc<IdleReleaseState>,
+    value: i64,
+}
+
+#[actor(name = "idle-release-counter")]
+impl IdleReleaseActor {
+    pub fn new(_actor_id: ActorId, state: Arc<IdleReleaseState>) -> Self {
+        Self { state, value: 0 }
+    }
+
+    pub async fn on_deactivate(&mut self, reason: DeactivationReason) {
+        if reason == DeactivationReason::Idle {
+            self.state.entered.notify_one();
+            self.state.release.notified().await;
+        } else {
+            self.state
+                .shutdown_deactivations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[coactor::command(remote)]
+    pub async fn add(&mut self, _context: &CommandContext, request: AddRequest) -> AddResponse {
+        self.value += request.amount;
+        AddResponse { value: self.value }
+    }
+}
+
+async fn idle_release_runtime(
+    node: &str,
+    address: SocketAddr,
+    state: IdleReleaseState,
+    storage: Arc<OwnershipFake>,
+    idle_timeout: Duration,
+) -> coactor::Runtime<IdleReleaseState> {
+    RuntimeBuilder::new(state)
+        .idle_timeout(idle_timeout)
+        .register::<IdleReleaseActor>()
+        .distributed(config(node, address), storage)
+        .unwrap()
+        .start()
+        .await
+        .unwrap()
+}
+
+async fn activate_idle_release_actor(
+    runtime: &coactor::Runtime<IdleReleaseState>,
+    actor_id: &ActorId,
+) {
+    runtime
+        .actor_ref::<IdleReleaseActor>(actor_id.clone())
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+}
+
 #[actor(name = "rebuilding-counter")]
 impl RebuildingActor {
     pub fn new(_actor_id: ActorId, state: Arc<RebuildingState>) -> Self {
@@ -126,6 +193,9 @@ struct OwnershipFake {
     lose_next_claim_response_without_applying: Mutex<bool>,
     reject_next_claim_for_node: Mutex<Option<String>>,
     fail_lease_reads: Mutex<bool>,
+    ambiguous_next_release: Mutex<bool>,
+    lose_next_release_response_without_applying: Mutex<bool>,
+    reject_next_release_as_unowned: Mutex<bool>,
 }
 
 impl OwnershipFake {
@@ -362,6 +432,45 @@ impl ActorOwnerStorage for OwnershipFake {
             Ok(LeaseMutation::Ambiguous(AmbiguousMutation::ResponseLost))
         } else {
             Ok(LeaseMutation::Applied { etag: next_etag })
+        }
+    }
+
+    async fn release_actor_owner(
+        &self,
+        address: &ActorAddress,
+        current: &VersionedActorOwnerRecord,
+    ) -> Result<LeaseMutation, OwnershipStorageError> {
+        if std::mem::take(
+            &mut *self
+                .lose_next_release_response_without_applying
+                .lock()
+                .unwrap(),
+        ) {
+            return Ok(LeaseMutation::Ambiguous(AmbiguousMutation::ResponseLost));
+        }
+        let mut state = self.state.lock().unwrap();
+        if !state
+            .owners
+            .get(address)
+            .is_some_and(|owner| owner.etag == current.etag)
+        {
+            return Ok(LeaseMutation::ConditionalRejected);
+        }
+        let etag = Self::next_etag(&mut state);
+        state.owners.insert(
+            address.clone(),
+            VersionedActorOwnerRecord {
+                record: ActorOwnerRecord::unowned(current.record.ownership_epoch),
+                etag: etag.clone(),
+            },
+        );
+        if std::mem::take(&mut *self.reject_next_release_as_unowned.lock().unwrap()) {
+            return Ok(LeaseMutation::ConditionalRejected);
+        }
+        if std::mem::take(&mut *self.ambiguous_next_release.lock().unwrap()) {
+            Ok(LeaseMutation::Ambiguous(AmbiguousMutation::ResponseLost))
+        } else {
+            Ok(LeaseMutation::Applied { etag })
         }
     }
 }
@@ -1016,6 +1125,255 @@ async fn releasing_an_owner_preserves_the_record_and_epoch() {
     let released = storage.read_actor_owner(&address).await.unwrap().unwrap();
     assert_eq!(released.record.owner, None);
     assert_eq!(released.record.ownership_epoch, 7);
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_passivation_releases_owner_only_after_deactivation_finishes() {
+    let storage = Arc::new(OwnershipFake::default());
+    let first_address = free_address().await;
+    let second_address = free_address().await;
+    let state = IdleReleaseState::default();
+    let first = idle_release_runtime(
+        "node-a",
+        first_address,
+        state.clone(),
+        storage.clone(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let second = idle_release_runtime(
+        "node-b",
+        second_address,
+        IdleReleaseState::default(),
+        storage.clone(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let actor_id = ActorId::from("idle-release");
+    let address = ActorAddress::new("idle-release-counter", actor_id.clone());
+    activate_idle_release_actor(&first, &actor_id).await;
+    let owned = storage.owner(&address);
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    state.entered.notified().await;
+    assert_eq!(storage.owner(&address), owned);
+
+    state.release.notify_one();
+    tokio::task::yield_now().await;
+    let released = storage.owner(&address);
+    assert_eq!(released.record.owner, None);
+    assert_eq!(released.record.ownership_epoch, 1);
+
+    assert_eq!(
+        second
+            .actor_ref::<IdleReleaseActor>(actor_id)
+            .unwrap()
+            .add(AddRequest { amount: 2 })
+            .await
+            .unwrap()
+            .value,
+        2
+    );
+    assert_eq!(storage.owner(&address).record.ownership_epoch, 2);
+
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn ambiguous_idle_release_is_confirmed_by_exact_unowned_read_back() {
+    let storage = Arc::new(OwnershipFake::default());
+    *storage.ambiguous_next_release.lock().unwrap() = true;
+    let first_address = free_address().await;
+    let second_address = free_address().await;
+    let state = IdleReleaseState::default();
+    let first = idle_release_runtime(
+        "node-a",
+        first_address,
+        state.clone(),
+        storage.clone(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let second = idle_release_runtime(
+        "node-b",
+        second_address,
+        IdleReleaseState::default(),
+        storage.clone(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let actor_id = ActorId::from("ambiguous-idle-release");
+    let address = ActorAddress::new("idle-release-counter", actor_id.clone());
+    activate_idle_release_actor(&first, &actor_id).await;
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    state.entered.notified().await;
+    state.release.notify_one();
+    tokio::task::yield_now().await;
+
+    assert_eq!(storage.owner(&address).record.owner, None);
+    second
+        .actor_ref::<IdleReleaseActor>(actor_id)
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+    assert_eq!(storage.owner(&address).record.ownership_epoch, 2);
+
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn conditional_idle_release_rejection_is_reconciled_by_read_back() {
+    let storage = Arc::new(OwnershipFake::default());
+    *storage.reject_next_release_as_unowned.lock().unwrap() = true;
+    let first_address = free_address().await;
+    let second_address = free_address().await;
+    let state = IdleReleaseState::default();
+    let first = idle_release_runtime(
+        "node-a",
+        first_address,
+        state.clone(),
+        storage.clone(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let second = idle_release_runtime(
+        "node-b",
+        second_address,
+        IdleReleaseState::default(),
+        storage.clone(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let actor_id = ActorId::from("conditional-idle-release");
+    let address = ActorAddress::new("idle-release-counter", actor_id.clone());
+    activate_idle_release_actor(&first, &actor_id).await;
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    state.entered.notified().await;
+    state.release.notify_one();
+    tokio::task::yield_now().await;
+
+    assert_eq!(storage.owner(&address).record.owner, None);
+    second
+        .actor_ref::<IdleReleaseActor>(actor_id)
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+    assert_eq!(storage.owner(&address).record.ownership_epoch, 2);
+
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn unresolved_idle_release_blocks_reactivation_and_takeover() {
+    let storage = Arc::new(OwnershipFake::default());
+    *storage
+        .lose_next_release_response_without_applying
+        .lock()
+        .unwrap() = true;
+    let first_address = free_address().await;
+    let second_address = free_address().await;
+    let state = IdleReleaseState::default();
+    let first = idle_release_runtime(
+        "node-a",
+        first_address,
+        state.clone(),
+        storage.clone(),
+        Duration::from_millis(20),
+    )
+    .await;
+    let second = idle_release_runtime(
+        "node-b",
+        second_address,
+        IdleReleaseState::default(),
+        storage.clone(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let actor_id = ActorId::from("unresolved-idle-release");
+    let address = ActorAddress::new("idle-release-counter", actor_id.clone());
+    activate_idle_release_actor(&first, &actor_id).await;
+    let owner = storage.owner(&address);
+
+    state.entered.notified().await;
+    state.release.notify_one();
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        first
+            .actor_ref::<IdleReleaseActor>(actor_id.clone())
+            .unwrap()
+            .add(AddRequest { amount: 1 })
+            .await,
+        Err(coactor::SendError::OwnershipUnavailable)
+    );
+    assert_eq!(
+        second
+            .actor_ref::<IdleReleaseActor>(actor_id)
+            .unwrap()
+            .add(AddRequest { amount: 1 })
+            .await,
+        Err(coactor::SendError::OwnershipUnavailable)
+    );
+    assert_eq!(storage.owner(&address).record, owner.record);
+
+    first.shutdown().await;
+    second.shutdown().await;
+}
+
+#[tokio::test]
+async fn graceful_shutdown_keeps_owner_records_for_higher_epoch_takeover() {
+    let storage = Arc::new(OwnershipFake::default());
+    let first_address = free_address().await;
+    let second_address = free_address().await;
+    let state = IdleReleaseState::default();
+    let first = idle_release_runtime(
+        "node-a",
+        first_address,
+        state.clone(),
+        storage.clone(),
+        Duration::from_secs(60),
+    )
+    .await;
+    let actor_id = ActorId::from("shutdown-owner-record");
+    let address = ActorAddress::new("idle-release-counter", actor_id.clone());
+    activate_idle_release_actor(&first, &actor_id).await;
+    let owner = storage.owner(&address);
+
+    first.shutdown().await;
+    assert_eq!(state.shutdown_deactivations.load(Ordering::Relaxed), 1);
+    assert_eq!(storage.owner(&address).record, owner.record);
+    assert!(
+        storage
+            .read_node_lease(&owner.record.owner.as_ref().unwrap().session_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let second = idle_release_runtime(
+        "node-b",
+        second_address,
+        IdleReleaseState::default(),
+        storage.clone(),
+        Duration::from_secs(60),
+    )
+    .await;
+    second
+        .actor_ref::<IdleReleaseActor>(actor_id)
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+    assert_eq!(storage.owner(&address).record.ownership_epoch, 2);
+
+    second.shutdown().await;
 }
 
 #[test]

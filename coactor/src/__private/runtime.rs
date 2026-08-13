@@ -251,6 +251,9 @@ impl DistributedContext {
                     endpoint,
                     protocol_version,
                 },
+                CachedOwner::ReleasePending => {
+                    return Err(RuntimeError::OwnershipUnavailable);
+                }
             });
         }
         for _ in 0..3 {
@@ -392,6 +395,62 @@ impl DistributedContext {
         self.resolved.lock().await.remove(address);
     }
 
+    async fn release_local_owner(&self, address: &ActorAddress) -> Result<(), RuntimeError> {
+        let lock = self.resolution_lock(address).await;
+        let _guard = lock.lock_owned().await;
+        self.resolved
+            .lock()
+            .await
+            .insert(address.clone(), CachedOwner::ReleasePending);
+        let current = tokio::time::timeout(
+            self.operation_timeout,
+            self.storage.read_actor_owner(address),
+        )
+        .await
+        .map_err(|_| RuntimeError::OwnershipUnavailable)?
+        .map_err(|_| RuntimeError::OwnershipUnavailable)?
+        .ok_or(RuntimeError::OwnershipUnavailable)?;
+        if !self.is_local_owner(&current.record) {
+            return Err(RuntimeError::OwnershipUnavailable);
+        }
+        let released = tokio::time::timeout(
+            self.operation_timeout,
+            self.storage.release_actor_owner(address, &current),
+        )
+        .await
+        .map_err(|_| RuntimeError::OwnershipUnavailable)?
+        .map_err(|_| RuntimeError::OwnershipUnavailable)?;
+        let confirmed = match released {
+            LeaseMutation::Applied { .. } => true,
+            LeaseMutation::ConditionalRejected | LeaseMutation::Ambiguous(_) => {
+                let expected = ActorOwnerRecord::unowned(current.record.ownership_epoch);
+                let mut confirmed = false;
+                for _ in 0..3 {
+                    let read = tokio::time::timeout(
+                        self.operation_timeout,
+                        self.storage.read_actor_owner(address),
+                    )
+                    .await;
+                    if let Ok(Ok(Some(read))) = read {
+                        if read.record == expected {
+                            confirmed = true;
+                            break;
+                        }
+                        if read.record != current.record {
+                            break;
+                        }
+                    }
+                }
+                confirmed
+            }
+        };
+        if !confirmed {
+            return Err(RuntimeError::OwnershipUnavailable);
+        }
+        self.resolved.lock().await.remove(address);
+        Ok(())
+    }
+
     async fn placement_candidates(
         &self,
         protocol_version: u32,
@@ -451,6 +510,7 @@ struct LocalResolution {
 #[derive(Clone)]
 enum CachedOwner {
     Local,
+    ReleasePending,
     Remote {
         endpoint: String,
         protocol_version: u32,
@@ -1099,6 +1159,18 @@ where
                                     reason = "Idle",
                                     "Actor idle deactivation panicked"
                                 ),
+                            }
+                            drop(actor);
+                            if let Some(distributed) = &runtime.distributed {
+                                if distributed.release_local_owner(&address).await.is_err() {
+                                    tracing::warn!(
+                                        actor_type = address.actor_type(),
+                                        actor_id = ?address.actor_id(),
+                                        lifecycle = "ownership_release",
+                                        error_category = "OwnershipUnavailable",
+                                        "Actor Owner release could not be confirmed"
+                                    );
+                                }
                             }
                             remove_route(&runtime, &address, generation);
                             return;
