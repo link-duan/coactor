@@ -121,6 +121,7 @@ struct OwnershipFake {
     state: Mutex<OwnershipState>,
     owner_reads: AtomicUsize,
     owner_claims: AtomicUsize,
+    redirect_owner_after_read: Mutex<HashMap<ActorAddress, String>>,
     ambiguous_next_claim: Mutex<bool>,
     lose_next_claim_response_without_applying: Mutex<bool>,
     reject_next_claim_for_node: Mutex<Option<String>>,
@@ -154,6 +155,38 @@ impl OwnershipFake {
             .unwrap()
             .lease
             .advertised_address = address;
+    }
+
+    fn assign_owner(&self, address: &ActorAddress, node_id: &str, ownership_epoch: u64) {
+        let mut state = self.state.lock().unwrap();
+        let owner = state
+            .leases
+            .values()
+            .find(|lease| lease.lease.node_id == node_id)
+            .unwrap()
+            .lease
+            .clone();
+        let etag = Self::next_etag(&mut state);
+        state.owners.insert(
+            address.clone(),
+            VersionedActorOwnerRecord {
+                record: ActorOwnerRecord {
+                    owner: Some(ActorOwner {
+                        node_id: owner.node_id,
+                        session_id: owner.session_id,
+                    }),
+                    ownership_epoch,
+                },
+                etag,
+            },
+        );
+    }
+
+    fn redirect_owner_after_read(&self, address: &ActorAddress, node_id: &str) {
+        self.redirect_owner_after_read
+            .lock()
+            .unwrap()
+            .insert(address.clone(), node_id.to_owned());
     }
 }
 
@@ -222,7 +255,40 @@ impl ActorOwnerStorage for OwnershipFake {
         address: &ActorAddress,
     ) -> Result<Option<VersionedActorOwnerRecord>, OwnershipStorageError> {
         self.owner_reads.fetch_add(1, Ordering::Relaxed);
-        Ok(self.state.lock().unwrap().owners.get(address).cloned())
+        let redirect = self
+            .redirect_owner_after_read
+            .lock()
+            .unwrap()
+            .remove(address);
+        let mut state = self.state.lock().unwrap();
+        let current = state.owners.get(address).cloned();
+        if let Some(node_id) = redirect {
+            let owner = state
+                .leases
+                .values()
+                .find(|lease| lease.lease.node_id == node_id)
+                .unwrap()
+                .lease
+                .clone();
+            let etag = Self::next_etag(&mut state);
+            let ownership_epoch = current.as_ref().map_or(1, |current| {
+                current.record.ownership_epoch.saturating_add(1)
+            });
+            state.owners.insert(
+                address.clone(),
+                VersionedActorOwnerRecord {
+                    record: ActorOwnerRecord {
+                        owner: Some(ActorOwner {
+                            node_id: owner.node_id,
+                            session_id: owner.session_id,
+                        }),
+                        ownership_epoch,
+                    },
+                    etag,
+                },
+            );
+        }
+        Ok(current)
     }
 
     async fn claim_actor_owner(
@@ -386,6 +452,86 @@ async fn a_losing_node_resolves_the_winner_and_forwards_the_typed_call() {
 }
 
 #[tokio::test]
+async fn a_never_connected_route_refreshes_once_before_dispatch() {
+    let storage = Arc::new(OwnershipFake::default());
+    let stale_address = free_address().await;
+    let winner_address = free_address().await;
+    let unreachable = free_address().await;
+    let stale = RuntimeBuilder::new(())
+        .register::<CounterActor>()
+        .distributed(config("node-stale", stale_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let winner = RuntimeBuilder::new(())
+        .register::<CounterActor>()
+        .distributed(config("node-winner", winner_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let actor_id = ActorId::from("refresh-before-dispatch");
+    let address = ActorAddress::new("owned-counter", actor_id.clone());
+    storage.assign_owner(&address, "node-stale", 1);
+    let stale_owner = storage.owner(&address);
+    storage.redirect_lease(
+        &stale_owner.record.owner.as_ref().unwrap().session_id,
+        unreachable,
+    );
+    storage.redirect_owner_after_read(&address, "node-winner");
+
+    let counter = winner.actor_ref::<CounterActor>(actor_id).unwrap();
+    assert_eq!(
+        counter.add(AddRequest { amount: 4 }).await.unwrap().value,
+        4
+    );
+    assert_eq!(storage.owner_reads.load(Ordering::Relaxed), 2);
+
+    stale.shutdown().await;
+    winner.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_explicit_not_owner_response_refreshes_once() {
+    let storage = Arc::new(OwnershipFake::default());
+    let stale_address = free_address().await;
+    let winner_address = free_address().await;
+    let stale = RuntimeBuilder::new(())
+        .register::<CounterActor>()
+        .distributed(config("node-stale", stale_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let winner = RuntimeBuilder::new(())
+        .register::<CounterActor>()
+        .distributed(config("node-winner", winner_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let actor_id = ActorId::from("refresh-after-not-owner");
+    let address = ActorAddress::new("owned-counter", actor_id.clone());
+    storage.assign_owner(&address, "node-stale", 1);
+    storage.redirect_owner_after_read(&address, "node-winner");
+
+    let counter = winner.actor_ref::<CounterActor>(actor_id).unwrap();
+    assert_eq!(
+        counter.add(AddRequest { amount: 4 }).await.unwrap().value,
+        4
+    );
+    assert_eq!(
+        counter.add(AddRequest { amount: 1 }).await.unwrap().value,
+        5
+    );
+    assert_eq!(storage.owner_reads.load(Ordering::Relaxed), 3);
+
+    stale.shutdown().await;
+    winner.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_conditional_claim_rejection_is_reresolved_to_the_winner() {
     let storage = Arc::new(OwnershipFake::default());
     let first_address = free_address().await;
@@ -495,7 +641,7 @@ async fn unreconciled_ambiguous_claim_is_bounded_and_never_replayed() {
 
     assert_eq!(
         counter.add(AddRequest { amount: 1 }).await,
-        Err(coactor::SendError::RemoteUnavailable)
+        Err(coactor::SendError::OwnershipUnavailable)
     );
     assert_eq!(storage.owner_claims.load(Ordering::Relaxed), 1);
     assert_eq!(storage.owner_reads.load(Ordering::Relaxed), 4);
@@ -608,7 +754,7 @@ async fn lease_read_failure_never_permits_takeover() {
             .unwrap()
             .add(AddRequest { amount: 1 })
             .await,
-        Err(coactor::SendError::RemoteUnavailable)
+        Err(coactor::SendError::OwnershipUnavailable)
     );
     assert_eq!(storage.owner_claims.load(Ordering::Relaxed), 1);
     assert_eq!(

@@ -347,6 +347,7 @@ where
             self.config.node_id.clone(),
             session_id,
             self.config.lease_timing.operation_timeout,
+            self.config.lease_timing.peer_connect_timeout,
         );
         let runtime = self
             .builder

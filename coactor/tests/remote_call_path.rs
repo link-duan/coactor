@@ -1,8 +1,49 @@
-use std::{sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use coactor::{ActorId, CommandContext, RemoteProtocolError, RuntimeBuilder, SendError, actor};
+use coactor::{
+    ActorId, CommandContext, RemoteProtocolError, RuntimeBuilder, SendError, actor, testing,
+};
 use prost::Message;
 use tokio::sync::Notify;
+
+struct ReplyDroppingProxy {
+    endpoint: String,
+    drop_connection: Arc<Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ReplyDroppingProxy {
+    async fn start(upstream: SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let drop_connection = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let drop_connection = drop_connection.clone();
+            async move {
+                let (mut downstream, _) = listener.accept().await.unwrap();
+                let mut upstream = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {}
+                    _ = drop_connection.notified() => {}
+                }
+            }
+        });
+        Self {
+            endpoint,
+            drop_connection,
+            task,
+        }
+    }
+
+    fn endpoint(&self) -> String {
+        self.endpoint.clone()
+    }
+
+    async fn drop_connection(self) {
+        self.drop_connection.notify_one();
+        self.task.await.unwrap();
+    }
+}
 
 #[derive(Clone, PartialEq, Message)]
 struct AddRequest {
@@ -139,8 +180,7 @@ async fn a_typed_actor_ref_calls_an_actor_on_another_runtime() {
         .register::<CounterActor>()
         .build()
         .expect("server runtime should build");
-    let peer = server_runtime
-        .serve_test_peer("127.0.0.1:0".parse().unwrap())
+    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
         .await
         .expect("peer server should bind");
 
@@ -148,9 +188,12 @@ async fn a_typed_actor_ref_calls_an_actor_on_another_runtime() {
         .register::<CounterActor>()
         .build()
         .expect("client runtime should build");
-    let counter = client_runtime
-        .test_remote_actor_ref::<CounterActor>(ActorId::from("counter-1"), peer.endpoint())
-        .expect("remote Actor Type should be registered");
+    let counter = testing::remote_actor_ref::<_, CounterActor>(
+        &client_runtime,
+        ActorId::from("counter-1"),
+        peer.endpoint(),
+    )
+    .expect("remote Actor Type should be registered");
 
     assert_eq!(
         counter.add(AddRequest { amount: 2 }).await.unwrap(),
@@ -198,17 +241,19 @@ async fn remote_calls_preserve_business_errors_and_mailbox_overload() {
         .register::<CounterActor>()
         .build()
         .unwrap();
-    let peer = server_runtime
-        .serve_test_peer("127.0.0.1:0".parse().unwrap())
+    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let client_runtime = RuntimeBuilder::new(AppState::default())
         .register::<CounterActor>()
         .build()
         .unwrap();
-    let counter = client_runtime
-        .test_remote_actor_ref::<CounterActor>(ActorId::from("overload"), peer.endpoint())
-        .unwrap();
+    let counter = testing::remote_actor_ref::<_, CounterActor>(
+        &client_runtime,
+        ActorId::from("overload"),
+        peer.endpoint(),
+    )
+    .unwrap();
 
     assert_eq!(
         counter.checked_add(CheckedAddRequest { amount: -1 }).await,
@@ -251,17 +296,19 @@ async fn remote_handler_failure_preserves_the_local_error_category() {
         .register::<CounterActor>()
         .build()
         .unwrap();
-    let peer = server_runtime
-        .serve_test_peer("127.0.0.1:0".parse().unwrap())
+    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let client_runtime = RuntimeBuilder::new(AppState::default())
         .register::<CounterActor>()
         .build()
         .unwrap();
-    let counter = client_runtime
-        .test_remote_actor_ref::<CounterActor>(ActorId::from("panic"), peer.endpoint())
-        .unwrap();
+    let counter = testing::remote_actor_ref::<_, CounterActor>(
+        &client_runtime,
+        ActorId::from("panic"),
+        peer.endpoint(),
+    )
+    .unwrap();
 
     assert_eq!(
         counter.panic(PanicRequest {}).await,
@@ -276,17 +323,19 @@ async fn remote_handler_failure_preserves_the_local_error_category() {
 #[tokio::test]
 async fn remote_protocol_failures_are_structured() {
     let empty_server = RuntimeBuilder::new(AppState::default()).build().unwrap();
-    let empty_peer = empty_server
-        .serve_test_peer("127.0.0.1:0".parse().unwrap())
+    let empty_peer = testing::serve_peer(&empty_server, "127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let client_runtime = RuntimeBuilder::new(AppState::default())
         .register::<ClientOnlyActor>()
         .build()
         .unwrap();
-    let missing_actor = client_runtime
-        .test_remote_actor_ref::<ClientOnlyActor>(ActorId::from("missing"), empty_peer.endpoint())
-        .unwrap();
+    let missing_actor = testing::remote_actor_ref::<_, ClientOnlyActor>(
+        &client_runtime,
+        ActorId::from("missing"),
+        empty_peer.endpoint(),
+    )
+    .unwrap();
     assert_eq!(
         missing_actor.add(AddRequest { amount: 1 }).await,
         Err(SendError::RemoteProtocol(
@@ -300,17 +349,19 @@ async fn remote_protocol_failures_are_structured() {
         .register::<MismatchedCommandActor>()
         .build()
         .unwrap();
-    let mismatched_peer = mismatched_server
-        .serve_test_peer("127.0.0.1:0".parse().unwrap())
+    let mismatched_peer = testing::serve_peer(&mismatched_server, "127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let command_client = RuntimeBuilder::new(AppState::default())
         .register::<CounterActor>()
         .build()
         .unwrap();
-    let missing_command = command_client
-        .test_remote_actor_ref::<CounterActor>(ActorId::from("missing"), mismatched_peer.endpoint())
-        .unwrap();
+    let missing_command = testing::remote_actor_ref::<_, CounterActor>(
+        &command_client,
+        ActorId::from("missing"),
+        mismatched_peer.endpoint(),
+    )
+    .unwrap();
     assert_eq!(
         missing_command.add(AddRequest { amount: 1 }).await,
         Err(SendError::RemoteProtocol(
@@ -325,28 +376,128 @@ async fn remote_protocol_failures_are_structured() {
 
 #[tokio::test]
 async fn incompatible_runtime_protocols_are_rejected() {
-    let server_runtime = RuntimeBuilder::new(AppState::default())
-        .peer_protocol_version(2)
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let peer = server_runtime
-        .serve_test_peer("127.0.0.1:0".parse().unwrap())
+    let server_runtime =
+        testing::with_peer_protocol_version(RuntimeBuilder::new(AppState::default()), 2)
+            .register::<CounterActor>()
+            .build()
+            .unwrap();
+    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
         .await
         .unwrap();
     let client_runtime = RuntimeBuilder::new(AppState::default())
         .register::<CounterActor>()
         .build()
         .unwrap();
-    let counter = client_runtime
-        .test_remote_actor_ref::<CounterActor>(ActorId::from("version"), peer.endpoint())
-        .unwrap();
+    let counter = testing::remote_actor_ref::<_, CounterActor>(
+        &client_runtime,
+        ActorId::from("version"),
+        peer.endpoint(),
+    )
+    .unwrap();
 
     assert_eq!(
         counter.add(AddRequest { amount: 1 }).await,
         Err(SendError::RemoteProtocol(
             RemoteProtocolError::VersionMismatch
         ))
+    );
+
+    peer.shutdown().await;
+    server_runtime.shutdown().await;
+    client_runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_lost_reply_reports_unknown_outcome_without_replaying_the_command() {
+    let state = AppState::default();
+    let server_runtime = RuntimeBuilder::new(state.clone())
+        .register::<CounterActor>()
+        .build()
+        .unwrap();
+    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let upstream = peer
+        .endpoint()
+        .strip_prefix("http://")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let proxy = ReplyDroppingProxy::start(upstream).await;
+    let client_runtime = RuntimeBuilder::new(AppState::default())
+        .register::<CounterActor>()
+        .build()
+        .unwrap();
+    let counter = testing::remote_actor_ref::<_, CounterActor>(
+        &client_runtime,
+        ActorId::from("lost-reply"),
+        proxy.endpoint(),
+    )
+    .unwrap();
+
+    let call = tokio::spawn({
+        let counter = counter.clone();
+        async move { counter.blocked_add(BlockRequest { amount: 1 }).await }
+    });
+    state.entered.notified().await;
+    proxy.drop_connection().await;
+    assert_eq!(call.await.unwrap(), Err(SendError::OutcomeUnknown));
+    state.release.notify_one();
+
+    let observer = testing::remote_actor_ref::<_, CounterActor>(
+        &client_runtime,
+        ActorId::from("lost-reply"),
+        peer.endpoint(),
+    )
+    .unwrap();
+    assert_eq!(
+        observer.add(AddRequest { amount: 1 }).await.unwrap(),
+        AddResponse { value: 2 }
+    );
+
+    peer.shutdown().await;
+    server_runtime.shutdown().await;
+    client_runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn caller_timeout_does_not_retract_an_accepted_remote_command() {
+    let state = AppState::default();
+    let server_runtime = RuntimeBuilder::new(state.clone())
+        .register::<CounterActor>()
+        .build()
+        .unwrap();
+    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let client_runtime = RuntimeBuilder::new(AppState::default())
+        .register::<CounterActor>()
+        .build()
+        .unwrap();
+    let counter = testing::remote_actor_ref::<_, CounterActor>(
+        &client_runtime,
+        ActorId::from("caller-timeout"),
+        peer.endpoint(),
+    )
+    .unwrap();
+
+    let timed_out = tokio::spawn({
+        let counter = counter.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                counter.blocked_add(BlockRequest { amount: 2 }),
+            )
+            .await
+        }
+    });
+    state.entered.notified().await;
+    assert!(timed_out.await.unwrap().is_err());
+    state.release.notify_one();
+
+    assert_eq!(
+        counter.add(AddRequest { amount: 3 }).await.unwrap(),
+        AddResponse { value: 5 }
     );
 
     peer.shutdown().await;
