@@ -95,6 +95,10 @@ impl NodeLeaseStorage for FakeLeaseStorage {
         Ok(None)
     }
 
+    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipStorageError> {
+        Ok(Vec::new())
+    }
+
     async fn renew_node_lease(
         &self,
         lease: NodeLease,
@@ -268,6 +272,44 @@ async fn startup_acquires_a_unique_node_session_before_returning_a_runtime() {
 
     first.shutdown().await;
     second.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn node_lease_renewal_publishes_current_capacity_sample() {
+    let storage = Arc::new(FakeLeaseStorage::default());
+    let state = BlockingState::default();
+    let runtime = RuntimeBuilder::new(state.clone())
+        .max_active_actors(1)
+        .register::<BlockingActor>()
+        .distributed(config().lease_timing(fast_timing()), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let initial = storage.acquired.lock().unwrap()[0].clone();
+    assert_eq!(initial.active_actor_count, 0);
+    assert_eq!(initial.max_actor_count, 1);
+    assert!(!initial.pressured);
+    assert!(!initial.draining);
+
+    let actor = runtime
+        .actor_ref::<BlockingActor>(ActorId::from("capacity-sample"))
+        .unwrap();
+    let call = tokio::spawn(async move { actor.block().await });
+    state.entered.notified().await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    tokio::task::yield_now().await;
+
+    let renewed = storage.renewed.lock().unwrap()[0].0.clone();
+    assert!(renewed.sampled_at_unix_ms >= initial.sampled_at_unix_ms);
+    assert_eq!(renewed.active_actor_count, 1);
+    assert_eq!(renewed.max_actor_count, 1);
+    assert!(renewed.pressured);
+    assert!(!renewed.draining);
+
+    state.release.notify_one();
+    assert_eq!(call.await.unwrap(), Ok(7));
+    runtime.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

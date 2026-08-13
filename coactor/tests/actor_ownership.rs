@@ -224,6 +224,17 @@ impl NodeLeaseStorage for OwnershipFake {
             .cloned())
     }
 
+    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipStorageError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .leases
+            .values()
+            .cloned()
+            .collect())
+    }
+
     async fn renew_node_lease(
         &self,
         lease: NodeLease,
@@ -592,6 +603,167 @@ async fn local_capacity_is_reserved_before_an_owner_claim() {
     assert_eq!(storage.owner_claims.load(Ordering::Relaxed), 1);
 
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_full_ingress_places_one_cold_actor_on_an_available_node() {
+    let storage = Arc::new(OwnershipFake::default());
+    let ingress_address = free_address().await;
+    let target_address = free_address().await;
+    let ingress = RuntimeBuilder::new(())
+        .max_active_actors(1)
+        .register::<CounterActor>()
+        .distributed(config("node-a", ingress_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let target = RuntimeBuilder::new(())
+        .max_active_actors(1)
+        .register::<CounterActor>()
+        .distributed(config("node-b", target_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    ingress
+        .actor_ref::<CounterActor>(ActorId::from("occupies-ingress"))
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+    let actor_id = ActorId::from("placed-remotely");
+
+    assert_eq!(
+        ingress
+            .actor_ref::<CounterActor>(actor_id.clone())
+            .unwrap()
+            .add(AddRequest { amount: 4 })
+            .await
+            .unwrap()
+            .value,
+        4
+    );
+    let owner = storage.owner(&ActorAddress::new("owned-counter", actor_id));
+    assert_eq!(owner.record.owner.unwrap().node_id, "node-b");
+
+    ingress.shutdown().await;
+    target.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_stale_capacity_rejection_selects_one_alternative() {
+    let storage = Arc::new(OwnershipFake::default());
+    let ingress_address = free_address().await;
+    let stale_address = free_address().await;
+    let alternative_address = free_address().await;
+    let ingress = RuntimeBuilder::new(())
+        .max_active_actors(1)
+        .register::<CounterActor>()
+        .distributed(config("node-a", ingress_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let stale = RuntimeBuilder::new(())
+        .max_active_actors(1)
+        .register::<CounterActor>()
+        .distributed(config("node-b", stale_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let alternative = RuntimeBuilder::new(())
+        .max_active_actors(1)
+        .register::<CounterActor>()
+        .distributed(config("node-c", alternative_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    ingress
+        .actor_ref::<CounterActor>(ActorId::from("occupies-ingress"))
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+    stale
+        .actor_ref::<CounterActor>(ActorId::from("occupies-stale-target"))
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+    let claims_before = storage.owner_claims.load(Ordering::Relaxed);
+    let actor_id = ActorId::from("placed-on-alternative");
+
+    assert_eq!(
+        ingress
+            .actor_ref::<CounterActor>(actor_id.clone())
+            .unwrap()
+            .add(AddRequest { amount: 4 })
+            .await
+            .unwrap()
+            .value,
+        4
+    );
+    let owner = storage.owner(&ActorAddress::new("owned-counter", actor_id));
+    assert_eq!(owner.record.owner.unwrap().node_id, "node-c");
+    assert_eq!(
+        storage.owner_claims.load(Ordering::Relaxed),
+        claims_before + 1,
+        "the full target rejects before ownership CAS"
+    );
+
+    ingress.shutdown().await;
+    stale.shutdown().await;
+    alternative.shutdown().await;
+}
+
+#[tokio::test]
+async fn exhausted_placement_returns_runtime_capacity() {
+    let storage = Arc::new(OwnershipFake::default());
+    let ingress_address = free_address().await;
+    let full_target_address = free_address().await;
+    let ingress = RuntimeBuilder::new(())
+        .max_active_actors(1)
+        .register::<CounterActor>()
+        .distributed(config("node-a", ingress_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    let full_target = RuntimeBuilder::new(())
+        .max_active_actors(1)
+        .register::<CounterActor>()
+        .distributed(config("node-b", full_target_address), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    ingress
+        .actor_ref::<CounterActor>(ActorId::from("occupies-ingress"))
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+    full_target
+        .actor_ref::<CounterActor>(ActorId::from("occupies-target"))
+        .unwrap()
+        .add(AddRequest { amount: 1 })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ingress
+            .actor_ref::<CounterActor>(ActorId::from("cannot-place"))
+            .unwrap()
+            .add(AddRequest { amount: 1 })
+            .await,
+        Err(coactor::SendError::RuntimeAtCapacity)
+    );
+
+    ingress.shutdown().await;
+    full_target.shutdown().await;
 }
 
 #[tokio::test]

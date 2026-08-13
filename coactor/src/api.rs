@@ -271,6 +271,10 @@ where
         Ok(())
     }
 
+    pub(crate) fn active_actor_limit(&self) -> usize {
+        self.max_active_actors
+    }
+
     pub(crate) fn build_with_authority(
         self,
         authority: Option<Arc<__private::NodeAuthority>>,
@@ -295,6 +299,7 @@ where
                 registrations,
                 actors: Mutex::new(HashMap::new()),
                 capacity: Arc::new(Semaphore::new(self.max_active_actors)),
+                max_active_actors: self.max_active_actors,
                 deactivation_timeout: self.deactivation_timeout,
                 next_generation: std::sync::atomic::AtomicU64::new(1),
                 status: std::sync::atomic::AtomicU8::new(__private::RUNNING),

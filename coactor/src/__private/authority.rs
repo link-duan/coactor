@@ -140,6 +140,7 @@ where
                 };
             }
             let operation_started = tokio::time::Instant::now();
+            runtime.update_capacity_sample(&mut lease);
             lease.expires_at_unix_ms =
                 wall_time_millis().saturating_add(timing.ttl.as_millis() as u64);
             let Some(remaining) = authority.remaining() else {

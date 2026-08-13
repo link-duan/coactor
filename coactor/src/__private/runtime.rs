@@ -168,6 +168,7 @@ pub struct RuntimeInner<S> {
     pub registrations: HashMap<&'static str, Registration<S>>,
     pub actors: Mutex<HashMap<ActorAddress, Route<S>>>,
     pub capacity: Arc<Semaphore>,
+    pub max_active_actors: usize,
     pub deactivation_timeout: Duration,
     pub next_generation: AtomicU64,
     pub status: AtomicU8,
@@ -389,6 +390,45 @@ impl DistributedContext {
 
     async fn invalidate(&self, address: &ActorAddress) {
         self.resolved.lock().await.remove(address);
+    }
+
+    async fn placement_candidates(
+        &self,
+        protocol_version: u32,
+    ) -> Result<Vec<(String, u32)>, RuntimeError> {
+        let leases = tokio::time::timeout(self.operation_timeout, self.storage.list_node_leases())
+            .await
+            .map_err(|_| RuntimeError::OwnershipUnavailable)?
+            .map_err(|_| RuntimeError::OwnershipUnavailable)?;
+        let now = wall_time_millis();
+        let mut candidates: Vec<_> = leases
+            .into_iter()
+            .map(|versioned| versioned.lease)
+            .filter(|lease| {
+                lease.session_id != self.session_id
+                    && lease.expires_at_unix_ms > now
+                    && lease.protocol_version == protocol_version
+                    && !lease.pressured
+                    && !lease.draining
+                    && lease.active_actor_count < lease.max_actor_count
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            left.active_actor_count
+                .cmp(&right.active_actor_count)
+                .then_with(|| left.node_id.cmp(&right.node_id))
+                .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
+        });
+        Ok(candidates
+            .into_iter()
+            .take(2)
+            .map(|lease| {
+                (
+                    format!("http://{}", lease.advertised_address),
+                    lease.protocol_version,
+                )
+            })
+            .collect())
     }
 }
 
@@ -668,36 +708,61 @@ where
                     });
                 };
                 for attempt in 0..=1 {
-                    match distributed
-                        .resolve(&self.address, &runtime.capacity)
-                        .await?
-                    {
-                        ResolvedOwner::Local { reservation, guard } => {
-                            return Ok(RouteDecision::Local {
-                                reservation,
-                                resolution: Some(guard),
-                            });
+                    match distributed.resolve(&self.address, &runtime.capacity).await {
+                        Err(RuntimeError::RuntimeAtCapacity) => {
+                            let candidates = distributed
+                                .placement_candidates(runtime.peer_protocol_version)
+                                .await?;
+                            for (candidate_index, (endpoint, protocol_version)) in
+                                candidates.into_iter().enumerate()
+                            {
+                                match self
+                                    .invoke_endpoint(
+                                        endpoint,
+                                        protocol_version,
+                                        command,
+                                        payload.clone(),
+                                        Some(distributed.peer_connect_timeout),
+                                    )
+                                    .await
+                                {
+                                    Ok(remote) => return Ok(RouteDecision::Remote(remote)),
+                                    Err(RuntimeError::RuntimeAtCapacity)
+                                        if candidate_index == 0 => {}
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            return Err(RuntimeError::RuntimeAtCapacity);
                         }
-                        ResolvedOwner::Remote {
-                            endpoint,
-                            protocol_version,
-                        } => match self
-                            .invoke_endpoint(
+                        Err(error) => return Err(error),
+                        Ok(resolved) => match resolved {
+                            ResolvedOwner::Local { reservation, guard } => {
+                                return Ok(RouteDecision::Local {
+                                    reservation,
+                                    resolution: Some(guard),
+                                });
+                            }
+                            ResolvedOwner::Remote {
                                 endpoint,
                                 protocol_version,
-                                command,
-                                payload.clone(),
-                                Some(distributed.peer_connect_timeout),
-                            )
-                            .await
-                        {
-                            Ok(remote) => return Ok(RouteDecision::Remote(remote)),
-                            Err(RuntimeError::RemoteUnavailable | RuntimeError::NotOwner)
-                                if attempt == 0 =>
+                            } => match self
+                                .invoke_endpoint(
+                                    endpoint,
+                                    protocol_version,
+                                    command,
+                                    payload.clone(),
+                                    Some(distributed.peer_connect_timeout),
+                                )
+                                .await
                             {
-                                distributed.invalidate(&self.address).await;
-                            }
-                            Err(error) => return Err(error),
+                                Ok(remote) => return Ok(RouteDecision::Remote(remote)),
+                                Err(RuntimeError::RemoteUnavailable | RuntimeError::NotOwner)
+                                    if attempt == 0 =>
+                                {
+                                    distributed.invalidate(&self.address).await;
+                                }
+                                Err(error) => return Err(error),
+                            },
                         },
                     }
                 }
@@ -1160,6 +1225,15 @@ where
                 .authority
                 .as_ref()
                 .is_none_or(|authority| authority.is_valid())
+    }
+
+    pub(crate) fn update_capacity_sample(&self, lease: &mut NodeLease) {
+        let available = self.capacity.available_permits();
+        lease.sampled_at_unix_ms = wall_time_millis();
+        lease.active_actor_count = self.max_active_actors.saturating_sub(available);
+        lease.max_actor_count = self.max_active_actors;
+        lease.pressured = available == 0;
+        lease.draining = self.status.load(Ordering::Acquire) != RUNNING;
     }
 
     pub async fn shutdown(self: &Arc<Self>) {

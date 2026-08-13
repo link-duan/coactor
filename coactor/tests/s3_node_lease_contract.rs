@@ -211,6 +211,10 @@ impl NodeLeaseStorage for MemoryLeaseStorage {
             .cloned())
     }
 
+    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipStorageError> {
+        Ok(self.entries.lock().unwrap().values().cloned().collect())
+    }
+
     async fn renew_node_lease(
         &self,
         lease: NodeLease,
@@ -322,6 +326,41 @@ async fn aws_adapter_runs_the_node_lease_contract_with_conditional_requests() {
     assert_eq!(requests[2].headers["if-match"], "\"etag-1\"");
     assert_eq!(requests[3].method, Method::DELETE);
     assert_eq!(requests[3].headers["if-match"], "\"etag-2\"");
+    drop(requests);
+    task.abort();
+}
+
+#[tokio::test]
+async fn aws_adapter_lists_node_capacity_samples_under_the_node_prefix() {
+    let current = lease();
+    let listed = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>contract-prefix/nodes/session-a.json</Key></Contents></ListBucketResult>".to_owned();
+    let (endpoint, server, task) = contract_server([
+        response(StatusCode::OK, None, listed),
+        response(
+            StatusCode::OK,
+            Some("\"etag-1\""),
+            serde_json::to_string(&current).unwrap(),
+        ),
+    ])
+    .await;
+    let storage = storage(endpoint);
+
+    assert_eq!(
+        storage.list_node_leases().await.unwrap(),
+        vec![VersionedNodeLease {
+            lease: current,
+            etag: "\"etag-1\"".to_owned(),
+        }]
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, Method::GET);
+    assert_eq!(requests[0].path, "/lease-bucket/");
+    assert_eq!(requests[1].method, Method::GET);
+    assert_eq!(
+        requests[1].path,
+        "/lease-bucket/contract-prefix/nodes/session-a.json"
+    );
     drop(requests);
     task.abort();
 }

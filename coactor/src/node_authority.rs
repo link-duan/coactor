@@ -106,6 +106,16 @@ pub struct NodeLease {
     pub advertised_address: SocketAddr,
     pub protocol_version: u32,
     pub expires_at_unix_ms: u64,
+    #[serde(default)]
+    pub sampled_at_unix_ms: u64,
+    #[serde(default)]
+    pub active_actor_count: usize,
+    #[serde(default)]
+    pub max_actor_count: usize,
+    #[serde(default)]
+    pub pressured: bool,
+    #[serde(default)]
+    pub draining: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,6 +184,8 @@ pub trait NodeLeaseStorage: Send + Sync + 'static {
         &self,
         session_id: &NodeSessionId,
     ) -> Result<Option<VersionedNodeLease>, OwnershipStorageError>;
+
+    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipStorageError>;
 
     async fn renew_node_lease(
         &self,
@@ -303,6 +315,11 @@ where
             protocol_version: crate::PEER_PROTOCOL_VERSION,
             expires_at_unix_ms: wall_time_millis()
                 .saturating_add(self.config.lease_timing.ttl.as_millis() as u64),
+            sampled_at_unix_ms: wall_time_millis(),
+            active_actor_count: 0,
+            max_actor_count: self.builder.active_actor_limit(),
+            pressured: false,
+            draining: false,
         };
         let authority_started = tokio::time::Instant::now();
         let acquired = tokio::time::timeout(
