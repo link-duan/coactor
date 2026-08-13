@@ -1,5 +1,7 @@
 extern crate self as coactor;
 
+mod node_authority;
+
 use std::{
     any::Any,
     collections::HashMap,
@@ -15,6 +17,12 @@ use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
+
+pub use node_authority::{
+    DistributedRuntimeBuilder, DistributedRuntimeConfig, LeaseMutation, LeaseTiming, NodeLease,
+    NodeLeaseStorage, NodeSessionId, OwnershipStorageError, RuntimeStartError, RuntimeSupervision,
+    RuntimeTermination, RuntimeTerminationReason, VersionedNodeLease,
+};
 
 pub use coactor_macros::{actor, command};
 
@@ -95,7 +103,7 @@ impl CommandContext {
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum BuildError {
     #[error("Actor Type `{0}` was registered more than once")]
     DuplicateActorType(&'static str),
@@ -157,6 +165,8 @@ pub enum SendError<E = Infallible> {
     ActorStopped,
     #[error("the CoActor runtime stopped")]
     RuntimeStopped,
+    #[error("the CoActor runtime lost Node authority")]
+    NodeFenced,
     #[error("the remote runtime is unavailable")]
     RemoteUnavailable,
     #[error("the remote runtime rejected the protocol: {0}")]
@@ -259,18 +269,49 @@ where
         self
     }
 
+    pub fn distributed(
+        self,
+        config: DistributedRuntimeConfig,
+        storage: Arc<dyn NodeLeaseStorage>,
+    ) -> Result<DistributedRuntimeBuilder<S>, RuntimeStartError> {
+        config.validate()?;
+        Ok(DistributedRuntimeBuilder {
+            builder: self,
+            config,
+            storage,
+        })
+    }
+
     pub fn build(self) -> Result<Runtime<S>, BuildError> {
+        self.build_with_authority(None)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), BuildError> {
         if self.mailbox_capacity == 0 {
             return Err(BuildError::InvalidMailboxCapacity);
         }
         if self.max_active_actors == 0 {
             return Err(BuildError::InvalidMaxActiveActors);
         }
-        let mut registrations = HashMap::new();
-        for mut registration in self.registrations {
+        let mut names = std::collections::HashSet::new();
+        for registration in &self.registrations {
             if registration.mailbox_capacity == Some(0) {
                 return Err(BuildError::InvalidMailboxCapacity);
             }
+            if !names.insert(registration.name) {
+                return Err(BuildError::DuplicateActorType(registration.name));
+            }
+        }
+        Ok(())
+    }
+
+    fn build_with_authority(
+        self,
+        authority: Option<Arc<__private::NodeAuthority>>,
+    ) -> Result<Runtime<S>, BuildError> {
+        self.validate()?;
+        let mut registrations = HashMap::new();
+        for mut registration in self.registrations {
             if registration.mailbox_capacity.is_none() {
                 registration.mailbox_capacity = Some(self.mailbox_capacity);
             }
@@ -278,9 +319,8 @@ where
                 registration.idle_timeout = Some(self.idle_timeout);
             }
             let name = registration.name;
-            if registrations.insert(name, registration).is_some() {
-                return Err(BuildError::DuplicateActorType(name));
-            }
+            let previous = registrations.insert(name, registration);
+            debug_assert!(previous.is_none(), "registrations were validated");
         }
         Ok(Runtime {
             inner: Arc::new(__private::RuntimeInner {
@@ -293,13 +333,16 @@ where
                 status: std::sync::atomic::AtomicU8::new(__private::RUNNING),
                 shutdown_timeout: self.shutdown_timeout,
                 peer_protocol_version: self.peer_protocol_version,
+                authority,
             }),
+            distributed: None,
         })
     }
 }
 
 pub struct Runtime<S> {
-    inner: Arc<__private::RuntimeInner<S>>,
+    pub(crate) inner: Arc<__private::RuntimeInner<S>>,
+    distributed: Option<__private::DistributedTasks>,
 }
 
 impl<S> Runtime<S>
@@ -344,27 +387,43 @@ where
     pub async fn serve_test_peer(&self, address: SocketAddr) -> std::io::Result<TestPeerServer> {
         let listener = tokio::net::TcpListener::bind(address).await?;
         let endpoint = format!("http://{}", listener.local_addr()?);
-        let (shutdown, shutdown_receiver) = oneshot::channel();
-        let service = __private::PeerService {
-            runtime: self.inner.clone(),
-        };
-        let task = tokio::spawn(async move {
-            let _ = tonic::transport::Server::builder()
-                .add_service(peer_protocol::peer_server::PeerServer::new(service))
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                    let _ = shutdown_receiver.await;
-                })
-                .await;
-        });
+        let peer = self.spawn_peer(listener);
         Ok(TestPeerServer {
             endpoint,
-            shutdown: Some(shutdown),
-            task,
+            shutdown: Some(peer.shutdown),
+            task: peer.task,
         })
     }
 
-    pub async fn shutdown(self) {
+    fn spawn_peer(&self, listener: tokio::net::TcpListener) -> __private::PeerTask {
+        __private::spawn_peer(self.inner.clone(), listener)
+    }
+
+    fn with_distributed_tasks(
+        mut self,
+        peer: __private::PeerTask,
+        renewal: __private::RenewalTask,
+        termination: watch::Receiver<Option<RuntimeTermination>>,
+    ) -> Self {
+        self.distributed = Some(__private::DistributedTasks {
+            peer,
+            renewal,
+            termination,
+        });
+        self
+    }
+
+    pub fn supervision(&self) -> Option<RuntimeSupervision> {
+        self.distributed.as_ref().map(|tasks| RuntimeSupervision {
+            receiver: tasks.termination.clone(),
+        })
+    }
+
+    pub async fn shutdown(mut self) {
         self.inner.shutdown().await;
+        if let Some(tasks) = self.distributed.take() {
+            tasks.shutdown().await;
+        }
     }
 }
 
@@ -391,11 +450,12 @@ impl TestPeerServer {
 #[doc(hidden)]
 pub mod __private {
     use super::*;
+    use crate::node_authority::{confirm_node_lease, wall_time_millis};
     use std::{
         future::Future,
         marker::PhantomData,
         pin::Pin,
-        sync::atomic::{AtomicU8, AtomicU64, Ordering},
+        sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     };
     use tokio::sync::OwnedSemaphorePermit;
 
@@ -406,6 +466,177 @@ pub mod __private {
     pub const RUNNING: u8 = 0;
     const SHUTTING_DOWN: u8 = 1;
     const STOPPED: u8 = 2;
+    const FENCED: u8 = 3;
+
+    pub struct NodeAuthority {
+        valid: AtomicBool,
+        deadline: Mutex<tokio::time::Instant>,
+        ttl: Duration,
+        termination: watch::Sender<Option<RuntimeTermination>>,
+    }
+
+    impl NodeAuthority {
+        pub fn new(
+            operation_started: tokio::time::Instant,
+            ttl: Duration,
+            termination: watch::Sender<Option<RuntimeTermination>>,
+        ) -> Self {
+            Self {
+                valid: AtomicBool::new(true),
+                deadline: Mutex::new(operation_started + ttl),
+                ttl,
+                termination,
+            }
+        }
+
+        pub fn is_valid(&self) -> bool {
+            self.valid.load(Ordering::Acquire)
+                && tokio::time::Instant::now() < *self.deadline.lock()
+        }
+
+        fn renew(&self, operation_started: tokio::time::Instant) {
+            *self.deadline.lock() = operation_started + self.ttl;
+        }
+
+        fn remaining(&self) -> Option<Duration> {
+            self.deadline
+                .lock()
+                .checked_duration_since(tokio::time::Instant::now())
+        }
+
+        fn deadline(&self) -> tokio::time::Instant {
+            *self.deadline.lock()
+        }
+
+        fn fence(&self) {
+            if self.valid.swap(false, Ordering::AcqRel) {
+                let _ = self.termination.send(Some(RuntimeTermination {
+                    reason: RuntimeTerminationReason::Fenced,
+                }));
+            }
+        }
+    }
+
+    pub struct PeerTask {
+        pub shutdown: oneshot::Sender<()>,
+        pub task: tokio::task::JoinHandle<()>,
+    }
+
+    pub struct RenewalTask {
+        shutdown: oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    pub struct DistributedTasks {
+        pub peer: PeerTask,
+        pub renewal: RenewalTask,
+        pub termination: watch::Receiver<Option<RuntimeTermination>>,
+    }
+
+    impl DistributedTasks {
+        pub async fn shutdown(self) {
+            let _ = self.renewal.shutdown.send(());
+            let _ = self.peer.shutdown.send(());
+            let _ = self.renewal.task.await;
+            let _ = self.peer.task.await;
+        }
+    }
+
+    pub fn spawn_peer<S>(
+        runtime: Arc<RuntimeInner<S>>,
+        listener: tokio::net::TcpListener,
+    ) -> PeerTask
+    where
+        S: Send + Sync + 'static,
+    {
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let service = PeerService { runtime };
+        let task = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(peer_protocol::peer_server::PeerServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_receiver.await;
+                })
+                .await;
+        });
+        PeerTask { shutdown, task }
+    }
+
+    pub fn spawn_lease_renewal<S>(
+        runtime: Arc<RuntimeInner<S>>,
+        authority: Arc<NodeAuthority>,
+        storage: Arc<dyn NodeLeaseStorage>,
+        mut lease: NodeLease,
+        mut etag: String,
+        timing: LeaseTiming,
+    ) -> RenewalTask
+    where
+        S: Send + Sync + 'static,
+    {
+        let (shutdown, mut shutdown_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let renewal_due = tokio::time::Instant::now() + timing.renewal_interval;
+                let wake_at = renewal_due.min(authority.deadline());
+                tokio::select! {
+                    _ = tokio::time::sleep_until(wake_at) => {}
+                    _ = &mut shutdown_receiver => return,
+                }
+                if !authority.is_valid() {
+                    authority.fence();
+                    runtime.fence().await;
+                    return;
+                }
+                let operation_started = tokio::time::Instant::now();
+                lease.expires_at_unix_ms =
+                    wall_time_millis().saturating_add(timing.ttl.as_millis() as u64);
+                let Some(remaining) = authority.remaining() else {
+                    authority.fence();
+                    runtime.fence().await;
+                    return;
+                };
+                let outcome = tokio::time::timeout(
+                    timing.operation_timeout.min(remaining),
+                    storage.renew_node_lease(lease.clone(), &etag),
+                )
+                .await;
+                match outcome {
+                    Ok(Ok(LeaseMutation::Applied { etag: next })) => {
+                        etag = next;
+                        authority.renew(operation_started);
+                    }
+                    Ok(Ok(LeaseMutation::Ambiguous)) => {
+                        let Some(next) = confirm_node_lease(
+                            storage.as_ref(),
+                            &lease,
+                            authority.deadline(),
+                            timing.operation_timeout,
+                        )
+                        .await
+                        else {
+                            authority.fence();
+                            runtime.fence().await;
+                            return;
+                        };
+                        etag = next;
+                        authority.renew(operation_started);
+                    }
+                    Ok(Ok(LeaseMutation::ConditionalRejected)) => {
+                        authority.fence();
+                        runtime.fence().await;
+                        return;
+                    }
+                    _ if !authority.is_valid() => {
+                        authority.fence();
+                        runtime.fence().await;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        RenewalTask { shutdown, task }
+    }
 
     pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -433,6 +664,7 @@ pub mod __private {
     pub enum RuntimeError {
         ActorStopped,
         RuntimeStopped,
+        NodeFenced,
         MailboxFull,
         ActivationFailed,
         ActorDeactivating,
@@ -456,6 +688,7 @@ pub mod __private {
                 Self::RuntimeShuttingDown => RuntimeFailure::RuntimeShuttingDown,
                 Self::ActorStopped => RuntimeFailure::ActorStopped,
                 Self::RuntimeStopped => RuntimeFailure::RuntimeStopped,
+                Self::NodeFenced => RuntimeFailure::NodeFenced,
                 Self::RemoteProtocol => RuntimeFailure::ProtocolMismatch,
                 Self::ActorTypeNotRegistered => RuntimeFailure::ActorTypeNotRegistered,
                 Self::CommandNotRegistered => RuntimeFailure::CommandNotRegistered,
@@ -474,6 +707,7 @@ pub mod __private {
                 RuntimeFailure::RuntimeShuttingDown => Self::RuntimeShuttingDown,
                 RuntimeFailure::ActorStopped => Self::ActorStopped,
                 RuntimeFailure::RuntimeStopped => Self::RuntimeStopped,
+                RuntimeFailure::NodeFenced => Self::NodeFenced,
                 RuntimeFailure::ActorTypeNotRegistered => Self::ActorTypeNotRegistered,
                 RuntimeFailure::CommandNotRegistered => Self::CommandNotRegistered,
                 RuntimeFailure::MalformedPayload => Self::MalformedPayload,
@@ -490,6 +724,7 @@ pub mod __private {
             match value {
                 RuntimeError::ActorStopped => Self::ActorStopped,
                 RuntimeError::RuntimeStopped => Self::RuntimeStopped,
+                RuntimeError::NodeFenced => Self::NodeFenced,
                 RuntimeError::MailboxFull => Self::MailboxFull,
                 RuntimeError::ActivationFailed => Self::ActivationFailed,
                 RuntimeError::ActorDeactivating => Self::ActorDeactivating,
@@ -565,6 +800,7 @@ pub mod __private {
         pub status: AtomicU8,
         pub shutdown_timeout: Duration,
         pub peer_protocol_version: u32,
+        pub authority: Option<Arc<NodeAuthority>>,
     }
 
     pub struct Route<S> {
@@ -627,11 +863,23 @@ pub mod __private {
             };
 
             let mut actors = runtime.actors.lock();
+            if runtime
+                .authority
+                .as_ref()
+                .is_some_and(|authority| !authority.is_valid())
+            {
+                command.fail(RuntimeError::NodeFenced);
+                return Err(RuntimeError::NodeFenced);
+            }
             match runtime.status.load(Ordering::Acquire) {
                 RUNNING => {}
                 SHUTTING_DOWN => {
                     command.fail(RuntimeError::RuntimeShuttingDown);
                     return Err(RuntimeError::RuntimeShuttingDown);
+                }
+                FENCED => {
+                    command.fail(RuntimeError::NodeFenced);
+                    return Err(RuntimeError::NodeFenced);
                 }
                 _ => {
                     command.fail(RuntimeError::RuntimeStopped);
@@ -693,6 +941,39 @@ pub mod __private {
 
         pub fn is_remote(&self) -> bool {
             matches!(self.target, ActorRefTarget::Remote { .. })
+        }
+
+        pub fn reply_channel_closed_error<E>(&self) -> SendError<E> {
+            let ActorRefTarget::Local(runtime) = &self.target else {
+                return SendError::ActorStopped;
+            };
+            if runtime
+                .upgrade()
+                .is_some_and(|runtime| runtime.status.load(Ordering::Acquire) == FENCED)
+            {
+                SendError::NodeFenced
+            } else {
+                SendError::ActorStopped
+            }
+        }
+
+        pub fn ensure_reply_authority<E>(&self) -> Result<(), SendError<E>> {
+            let ActorRefTarget::Local(runtime) = &self.target else {
+                return Ok(());
+            };
+            let Some(runtime) = runtime.upgrade() else {
+                return Err(SendError::RuntimeStopped);
+            };
+            if runtime.status.load(Ordering::Acquire) == FENCED
+                || runtime
+                    .authority
+                    .as_ref()
+                    .is_some_and(|authority| !authority.is_valid())
+            {
+                Err(SendError::NodeFenced)
+            } else {
+                Ok(())
+            }
         }
 
         pub async fn invoke_remote(
@@ -781,12 +1062,19 @@ pub mod __private {
                                 runtime_failure(error)
                             } else {
                                 use peer_protocol::invoke_response::Outcome;
-                                match invocation.reply.await {
-                                    Ok(bytes) => Some(Outcome::Success(bytes)),
-                                    Err(RemoteReplyError::Handler(bytes)) => {
-                                        Some(Outcome::HandlerError(bytes))
+                                let reply = invocation.reply.await;
+                                if !self.runtime.has_authority() {
+                                    runtime_failure(RuntimeError::NodeFenced)
+                                } else {
+                                    match reply {
+                                        Ok(bytes) => Some(Outcome::Success(bytes)),
+                                        Err(RemoteReplyError::Handler(bytes)) => {
+                                            Some(Outcome::HandlerError(bytes))
+                                        }
+                                        Err(RemoteReplyError::Runtime(error)) => {
+                                            runtime_failure(error)
+                                        }
                                     }
-                                    Err(RemoteReplyError::Runtime(error)) => runtime_failure(error),
                                 }
                             }
                         }
@@ -1081,6 +1369,18 @@ pub mod __private {
             address: address.clone(),
         };
         let CommandOutcome::Panicked(fail_current) = command.execute(actor, context).await else {
+            if runtime
+                .authority
+                .as_ref()
+                .is_some_and(|authority| !authority.is_valid())
+            {
+                receiver.close();
+                remove_route(runtime, address, generation);
+                while let Ok(command) = receiver.try_recv() {
+                    command.fail(RuntimeError::NodeFenced);
+                }
+                return false;
+            }
             return true;
         };
 
@@ -1131,6 +1431,14 @@ pub mod __private {
     where
         S: Send + Sync + 'static,
     {
+        fn has_authority(&self) -> bool {
+            self.status.load(Ordering::Acquire) != FENCED
+                && self
+                    .authority
+                    .as_ref()
+                    .is_none_or(|authority| authority.is_valid())
+        }
+
         pub async fn shutdown(self: &Arc<Self>) {
             tracing::debug!(
                 lifecycle = "shutdown",
@@ -1185,6 +1493,31 @@ pub mod __private {
                 error_category = "None",
                 "CoActor runtime shutdown completed"
             );
+        }
+
+        pub async fn fence(self: &Arc<Self>) {
+            let (completions, aborts) = {
+                let actors = self.actors.lock();
+                self.status.store(FENCED, Ordering::Release);
+                let mut completions = Vec::with_capacity(actors.len());
+                let mut aborts = Vec::with_capacity(actors.len());
+                for route in actors.values() {
+                    route.abort.abort();
+                    completions.push(route.completed.clone());
+                    aborts.push(route.abort.clone());
+                }
+                (completions, aborts)
+            };
+            for abort in aborts {
+                abort.abort();
+            }
+            tokio::task::yield_now().await;
+            for mut completion in completions {
+                if !*completion.borrow() {
+                    let _ = completion.wait_for(|completed| *completed).await;
+                }
+            }
+            self.actors.lock().clear();
         }
     }
 }

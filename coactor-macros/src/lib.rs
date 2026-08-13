@@ -297,9 +297,11 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                         reply: ::core::option::Option::Some(reply),
                         remote_reply: ::core::option::Option::None,
                     }))?;
-                    receive.await.unwrap_or(::core::result::Result::Err(
-                        ::coactor::SendError::ActorStopped,
-                    ))
+                    let result = receive.await.unwrap_or_else(|_| ::core::result::Result::Err(
+                        self.inner.reply_channel_closed_error(),
+                    ));
+                    self.inner.ensure_reply_authority()?;
+                    result
                 }
             }
         } else {
@@ -320,9 +322,11 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                         reply: ::core::option::Option::Some(reply),
                         remote_reply: ::core::option::Option::None,
                     }))?;
-                receive.await.unwrap_or(::core::result::Result::Err(
-                    ::coactor::SendError::ActorStopped,
-                ))
+                let result = receive.await.unwrap_or_else(|_| ::core::result::Result::Err(
+                    self.inner.reply_channel_closed_error(),
+                ));
+                self.inner.ensure_reply_authority()?;
+                result
             }
             }
         };
