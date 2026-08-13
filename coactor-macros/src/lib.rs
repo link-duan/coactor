@@ -65,15 +65,15 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         Ok(state) => state,
         Err(message) => return compile_error(message),
     };
-    if let Some(activation) = &activation
-        && let Err(message) = validate_activation(activation)
-    {
-        return compile_error(message);
+    if let Some(activation) = &activation {
+        if let Err(message) = validate_activation(activation) {
+            return compile_error(message);
+        }
     }
-    if let Some(deactivation) = &deactivation
-        && let Err(message) = validate_deactivation(deactivation)
-    {
-        return compile_error(message);
+    if let Some(deactivation) = &deactivation {
+        if let Err(message) = validate_deactivation(deactivation) {
+            return compile_error(message);
+        }
     }
 
     let mut generated_messages = Vec::new();
@@ -655,21 +655,23 @@ fn return_types(output: &ReturnType) -> (Type, Type, bool) {
         ReturnType::Default => syn::parse_quote!(()),
         ReturnType::Type(_, ty) => ty.as_ref().clone(),
     };
-    if let Type::Path(path) = &output_type
-        && let Some(segment) = path.path.segments.last()
-        && segment.ident == "Result"
-        && let PathArguments::AngleBracketed(arguments) = &segment.arguments
-    {
-        let types: Vec<_> = arguments
-            .args
-            .iter()
-            .filter_map(|argument| match argument {
-                GenericArgument::Type(ty) => Some(ty.clone()),
-                _ => None,
-            })
-            .collect();
-        if types.len() == 2 {
-            return (types[0].clone(), types[1].clone(), true);
+    if let Type::Path(path) = &output_type {
+        if let Some(segment) = path.path.segments.last() {
+            if segment.ident == "Result" {
+                if let PathArguments::AngleBracketed(arguments) = &segment.arguments {
+                    let types: Vec<_> = arguments
+                        .args
+                        .iter()
+                        .filter_map(|argument| match argument {
+                            GenericArgument::Type(ty) => Some(ty.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if types.len() == 2 {
+                        return (types[0].clone(), types[1].clone(), true);
+                    }
+                }
+            }
         }
     }
     (
