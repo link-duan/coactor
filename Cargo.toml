@@ -11,10 +11,13 @@ rust-version = "1.85"
 [workspace.dependencies]
 futures-util = "0.3.31"
 parking_lot = "0.12.4"
+prost = "0.13.5"
+tonic = "0.12.3"
+tonic-build = "0.12.3"
 proc-macro2 = "1.0.95"
 quote = "1.0.40"
 syn = { version = "2.0.104", features = ["full"] }
 thiserror = "2.0.12"
-tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+tokio = { version = "1.45.1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "test-util"] }
+tokio-stream = { version = "0.1.17", features = ["net"] }
 tracing = "0.1.41"
-

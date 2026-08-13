@@ -5,15 +5,24 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     fmt,
+    net::SocketAddr,
     sync::{Arc, Weak},
     time::Duration,
 };
 
 use parking_lot::Mutex;
 use thiserror::Error;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{Request, Response, Status};
 
 pub use coactor_macros::{actor, command};
+
+const PEER_PROTOCOL_VERSION: u32 = 1;
+
+mod peer_protocol {
+    tonic::include_proto!("coactor.peer.v1");
+}
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ActorId(Arc<[u8]>);
@@ -148,6 +157,28 @@ pub enum SendError<E = Infallible> {
     ActorStopped,
     #[error("the CoActor runtime stopped")]
     RuntimeStopped,
+    #[error("the remote runtime is unavailable")]
+    RemoteUnavailable,
+    #[error("the remote runtime rejected the protocol: {0}")]
+    RemoteProtocol(RemoteProtocolError),
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum RemoteProtocolError {
+    #[error("runtime protocol mismatch")]
+    VersionMismatch,
+    #[error("Actor Type is not registered")]
+    ActorTypeNotRegistered,
+    #[error("command is not registered")]
+    CommandNotRegistered,
+    #[error("malformed request payload")]
+    MalformedRequest,
+    #[error("malformed success payload")]
+    MalformedSuccess,
+    #[error("malformed handler error payload")]
+    MalformedHandlerError,
+    #[error("unexpected handler error payload")]
+    UnexpectedHandlerError,
 }
 
 pub struct RuntimeBuilder<S> {
@@ -158,6 +189,7 @@ pub struct RuntimeBuilder<S> {
     idle_timeout: Duration,
     deactivation_timeout: Duration,
     shutdown_timeout: Duration,
+    peer_protocol_version: u32,
 }
 
 impl<S> RuntimeBuilder<S>
@@ -173,6 +205,7 @@ where
             idle_timeout: Duration::from_secs(60),
             deactivation_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(30),
+            peer_protocol_version: PEER_PROTOCOL_VERSION,
         }
     }
 
@@ -198,6 +231,12 @@ where
 
     pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn peer_protocol_version(mut self, version: u32) -> Self {
+        self.peer_protocol_version = version;
         self
     }
 
@@ -253,6 +292,7 @@ where
                 next_generation: std::sync::atomic::AtomicU64::new(1),
                 status: std::sync::atomic::AtomicU8::new(__private::RUNNING),
                 shutdown_timeout: self.shutdown_timeout,
+                peer_protocol_version: self.peer_protocol_version,
             }),
         })
     }
@@ -274,13 +314,77 @@ where
             return Err(ActorRefError::ActorTypeNotRegistered(A::NAME));
         }
         Ok(A::make_ref(__private::ActorRef {
-            runtime: Arc::downgrade(&self.inner),
+            target: __private::ActorRefTarget::Local(Arc::downgrade(&self.inner)),
             address: ActorAddress::new(A::NAME, actor_id),
         }))
     }
 
+    #[doc(hidden)]
+    pub fn test_remote_actor_ref<A>(
+        &self,
+        actor_id: ActorId,
+        endpoint: impl Into<String>,
+    ) -> Result<A::Ref, ActorRefError>
+    where
+        A: __private::ActorType<S>,
+    {
+        if !self.inner.registrations.contains_key(A::NAME) {
+            return Err(ActorRefError::ActorTypeNotRegistered(A::NAME));
+        }
+        Ok(A::make_ref(__private::ActorRef {
+            target: __private::ActorRefTarget::Remote {
+                endpoint: endpoint.into(),
+                protocol_version: self.inner.peer_protocol_version,
+            },
+            address: ActorAddress::new(A::NAME, actor_id),
+        }))
+    }
+
+    #[doc(hidden)]
+    pub async fn serve_test_peer(&self, address: SocketAddr) -> std::io::Result<TestPeerServer> {
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let service = __private::PeerService {
+            runtime: self.inner.clone(),
+        };
+        let task = tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(peer_protocol::peer_server::PeerServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_receiver.await;
+                })
+                .await;
+        });
+        Ok(TestPeerServer {
+            endpoint,
+            shutdown: Some(shutdown),
+            task,
+        })
+    }
+
     pub async fn shutdown(self) {
         self.inner.shutdown().await;
+    }
+}
+
+#[doc(hidden)]
+pub struct TestPeerServer {
+    endpoint: String,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestPeerServer {
+    pub fn endpoint(&self) -> String {
+        self.endpoint.clone()
+    }
+
+    pub async fn shutdown(mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let _ = self.task.await;
     }
 }
 
@@ -296,6 +400,7 @@ pub mod __private {
     use tokio::sync::OwnedSemaphorePermit;
 
     pub use futures_util::FutureExt;
+    pub use prost;
     pub use tokio;
 
     pub const RUNNING: u8 = 0;
@@ -333,6 +438,51 @@ pub mod __private {
         ActorDeactivating,
         RuntimeAtCapacity,
         RuntimeShuttingDown,
+        RemoteUnavailable,
+        RemoteProtocol,
+        ActorTypeNotRegistered,
+        CommandNotRegistered,
+        MalformedPayload,
+    }
+
+    impl RuntimeError {
+        fn to_wire(self) -> i32 {
+            use peer_protocol::RuntimeFailure;
+            (match self {
+                Self::MailboxFull => RuntimeFailure::MailboxFull,
+                Self::ActivationFailed => RuntimeFailure::ActivationFailed,
+                Self::ActorDeactivating => RuntimeFailure::ActorDeactivating,
+                Self::RuntimeAtCapacity => RuntimeFailure::RuntimeAtCapacity,
+                Self::RuntimeShuttingDown => RuntimeFailure::RuntimeShuttingDown,
+                Self::ActorStopped => RuntimeFailure::ActorStopped,
+                Self::RuntimeStopped => RuntimeFailure::RuntimeStopped,
+                Self::RemoteProtocol => RuntimeFailure::ProtocolMismatch,
+                Self::ActorTypeNotRegistered => RuntimeFailure::ActorTypeNotRegistered,
+                Self::CommandNotRegistered => RuntimeFailure::CommandNotRegistered,
+                Self::MalformedPayload => RuntimeFailure::MalformedPayload,
+                Self::RemoteUnavailable => RuntimeFailure::RemoteUnavailable,
+            }) as i32
+        }
+
+        fn from_wire(value: i32) -> Self {
+            use peer_protocol::RuntimeFailure;
+            match RuntimeFailure::try_from(value).unwrap_or(RuntimeFailure::Unspecified) {
+                RuntimeFailure::MailboxFull => Self::MailboxFull,
+                RuntimeFailure::ActivationFailed => Self::ActivationFailed,
+                RuntimeFailure::ActorDeactivating => Self::ActorDeactivating,
+                RuntimeFailure::RuntimeAtCapacity => Self::RuntimeAtCapacity,
+                RuntimeFailure::RuntimeShuttingDown => Self::RuntimeShuttingDown,
+                RuntimeFailure::ActorStopped => Self::ActorStopped,
+                RuntimeFailure::RuntimeStopped => Self::RuntimeStopped,
+                RuntimeFailure::ActorTypeNotRegistered => Self::ActorTypeNotRegistered,
+                RuntimeFailure::CommandNotRegistered => Self::CommandNotRegistered,
+                RuntimeFailure::MalformedPayload => Self::MalformedPayload,
+                RuntimeFailure::RemoteUnavailable => Self::RemoteUnavailable,
+                RuntimeFailure::ProtocolMismatch | RuntimeFailure::Unspecified => {
+                    Self::RemoteProtocol
+                }
+            }
+        }
     }
 
     impl<E> From<RuntimeError> for SendError<E> {
@@ -345,6 +495,19 @@ pub mod __private {
                 RuntimeError::ActorDeactivating => Self::ActorDeactivating,
                 RuntimeError::RuntimeAtCapacity => Self::RuntimeAtCapacity,
                 RuntimeError::RuntimeShuttingDown => Self::RuntimeShuttingDown,
+                RuntimeError::RemoteUnavailable => Self::RemoteUnavailable,
+                RuntimeError::RemoteProtocol => {
+                    Self::RemoteProtocol(RemoteProtocolError::VersionMismatch)
+                }
+                RuntimeError::ActorTypeNotRegistered => {
+                    Self::RemoteProtocol(RemoteProtocolError::ActorTypeNotRegistered)
+                }
+                RuntimeError::CommandNotRegistered => {
+                    Self::RemoteProtocol(RemoteProtocolError::CommandNotRegistered)
+                }
+                RuntimeError::MalformedPayload => {
+                    Self::RemoteProtocol(RemoteProtocolError::MalformedRequest)
+                }
             }
         }
     }
@@ -360,6 +523,7 @@ pub mod __private {
             reason: DeactivationReason,
         ) -> BoxFuture<'a, ()>;
         fn make_ref(inner: ActorRef<S>) -> Self::Ref;
+        fn remote_commands() -> HashMap<&'static str, RemoteCommandFactory<S>>;
     }
 
     pub struct Registration<S> {
@@ -367,6 +531,7 @@ pub mod __private {
         create: fn(ActorId, Arc<S>) -> Box<dyn Any + Send>,
         activate: Activate,
         deactivate: Deactivate,
+        pub remote_commands: HashMap<&'static str, RemoteCommandFactory<S>>,
         pub mailbox_capacity: Option<usize>,
         pub idle_timeout: Option<Duration>,
         marker: PhantomData<fn(S)>,
@@ -382,6 +547,7 @@ pub mod __private {
                 create: |actor_id, state| Box::new(A::create(actor_id, state)),
                 activate: A::activate,
                 deactivate: A::deactivate,
+                remote_commands: A::remote_commands(),
                 mailbox_capacity: None,
                 idle_timeout: None,
                 marker: PhantomData,
@@ -398,6 +564,7 @@ pub mod __private {
         pub next_generation: AtomicU64,
         pub status: AtomicU8,
         pub shutdown_timeout: Duration,
+        pub peer_protocol_version: u32,
     }
 
     pub struct Route<S> {
@@ -415,14 +582,31 @@ pub mod __private {
     }
 
     pub struct ActorRef<S> {
-        pub runtime: Weak<RuntimeInner<S>>,
+        pub target: ActorRefTarget<S>,
         pub address: ActorAddress,
+    }
+
+    pub enum ActorRefTarget<S> {
+        Local(Weak<RuntimeInner<S>>),
+        Remote {
+            endpoint: String,
+            protocol_version: u32,
+        },
     }
 
     impl<S> Clone for ActorRef<S> {
         fn clone(&self) -> Self {
             Self {
-                runtime: self.runtime.clone(),
+                target: match &self.target {
+                    ActorRefTarget::Local(runtime) => ActorRefTarget::Local(runtime.clone()),
+                    ActorRefTarget::Remote {
+                        endpoint,
+                        protocol_version,
+                    } => ActorRefTarget::Remote {
+                        endpoint: endpoint.clone(),
+                        protocol_version: *protocol_version,
+                    },
+                },
                 address: self.address.clone(),
             }
         }
@@ -433,7 +617,11 @@ pub mod __private {
         S: Send + Sync + 'static,
     {
         pub fn send(&self, mut command: Command<S>) -> Result<(), RuntimeError> {
-            let Some(runtime) = self.runtime.upgrade() else {
+            let ActorRefTarget::Local(runtime) = &self.target else {
+                command.fail(RuntimeError::RemoteUnavailable);
+                return Err(RuntimeError::RemoteUnavailable);
+            };
+            let Some(runtime) = runtime.upgrade() else {
                 command.fail(RuntimeError::RuntimeStopped);
                 return Err(RuntimeError::RuntimeStopped);
             };
@@ -502,6 +690,122 @@ pub mod __private {
             );
             result
         }
+
+        pub fn is_remote(&self) -> bool {
+            matches!(self.target, ActorRefTarget::Remote { .. })
+        }
+
+        pub async fn invoke_remote(
+            &self,
+            command: &'static str,
+            payload: Vec<u8>,
+        ) -> Result<RemotePayload, RuntimeError> {
+            let ActorRefTarget::Remote {
+                endpoint,
+                protocol_version,
+            } = &self.target
+            else {
+                return Err(RuntimeError::RemoteUnavailable);
+            };
+            let mut client = peer_protocol::peer_client::PeerClient::connect(endpoint.clone())
+                .await
+                .map_err(|_| RuntimeError::RemoteUnavailable)?;
+            let response = client
+                .invoke(peer_protocol::InvokeRequest {
+                    protocol_version: *protocol_version,
+                    actor_type: self.address.actor_type().to_owned(),
+                    actor_id: self.address.actor_id().as_bytes().to_vec(),
+                    command: command.to_owned(),
+                    payload,
+                })
+                .await
+                .map_err(|_| RuntimeError::RemoteUnavailable)?
+                .into_inner();
+            use peer_protocol::invoke_response::Outcome;
+            match response.outcome {
+                Some(Outcome::Success(bytes)) => Ok(RemotePayload::Success(bytes)),
+                Some(Outcome::HandlerError(bytes)) => Ok(RemotePayload::HandlerError(bytes)),
+                Some(Outcome::RuntimeFailure(failure)) => Err(RuntimeError::from_wire(failure)),
+                None => Err(RuntimeError::RemoteProtocol),
+            }
+        }
+    }
+
+    pub enum RemotePayload {
+        Success(Vec<u8>),
+        HandlerError(Vec<u8>),
+    }
+
+    pub enum RemoteReplyError {
+        Handler(Vec<u8>),
+        Runtime(RuntimeError),
+    }
+
+    pub struct RemoteInvocation<S> {
+        pub command: Command<S>,
+        pub reply: BoxFuture<'static, Result<Vec<u8>, RemoteReplyError>>,
+    }
+
+    pub type RemoteCommandFactory<S> = fn(Vec<u8>) -> Result<RemoteInvocation<S>, RuntimeError>;
+
+    pub struct PeerService<S> {
+        pub runtime: Arc<RuntimeInner<S>>,
+    }
+
+    #[tonic::async_trait]
+    impl<S> peer_protocol::peer_server::Peer for PeerService<S>
+    where
+        S: Send + Sync + 'static,
+    {
+        async fn invoke(
+            &self,
+            request: Request<peer_protocol::InvokeRequest>,
+        ) -> Result<Response<peer_protocol::InvokeResponse>, Status> {
+            let request = request.into_inner();
+            let outcome = if request.protocol_version != self.runtime.peer_protocol_version {
+                runtime_failure(RuntimeError::RemoteProtocol)
+            } else if let Some(registration) =
+                self.runtime.registrations.get(request.actor_type.as_str())
+            {
+                if let Some(factory) = registration.remote_commands.get(request.command.as_str()) {
+                    match factory(request.payload) {
+                        Ok(invocation) => {
+                            let actor_ref = ActorRef {
+                                target: ActorRefTarget::Local(Arc::downgrade(&self.runtime)),
+                                address: ActorAddress::new(
+                                    registration.name,
+                                    ActorId::new(request.actor_id),
+                                ),
+                            };
+                            if let Err(error) = actor_ref.send(invocation.command) {
+                                runtime_failure(error)
+                            } else {
+                                use peer_protocol::invoke_response::Outcome;
+                                match invocation.reply.await {
+                                    Ok(bytes) => Some(Outcome::Success(bytes)),
+                                    Err(RemoteReplyError::Handler(bytes)) => {
+                                        Some(Outcome::HandlerError(bytes))
+                                    }
+                                    Err(RemoteReplyError::Runtime(error)) => runtime_failure(error),
+                                }
+                            }
+                        }
+                        Err(error) => runtime_failure(error),
+                    }
+                } else {
+                    runtime_failure(RuntimeError::CommandNotRegistered)
+                }
+            } else {
+                runtime_failure(RuntimeError::ActorTypeNotRegistered)
+            };
+            Ok(Response::new(peer_protocol::InvokeResponse { outcome }))
+        }
+    }
+
+    fn runtime_failure(error: RuntimeError) -> Option<peer_protocol::invoke_response::Outcome> {
+        Some(peer_protocol::invoke_response::Outcome::RuntimeFailure(
+            error.to_wire(),
+        ))
     }
 
     struct Spawned<S> {

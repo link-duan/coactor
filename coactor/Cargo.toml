@@ -10,9 +10,15 @@ rust-version.workspace = true
 coactor-macros = { path = "../coactor-macros" }
 futures-util.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 tracing.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

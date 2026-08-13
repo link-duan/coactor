@@ -31,12 +31,12 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         _ => None,
     });
 
-    let commands: Vec<ImplItemFn> = actor_impl
+    let commands: Vec<(ImplItemFn, bool)> = actor_impl
         .items
         .iter_mut()
         .filter_map(|item| match item {
             ImplItem::Fn(method) => {
-                take_command_attribute(&mut method.attrs).then(|| method.clone())
+                take_command_attribute(&mut method.attrs).map(|remote| (method.clone(), remote))
             }
             _ => None,
         })
@@ -78,9 +78,10 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut generated_messages = Vec::new();
     let mut generated_ref_methods = Vec::new();
+    let mut generated_remote_factories = Vec::new();
 
-    for command in &commands {
-        if let Err(message) = validate_command(command) {
+    for (command, remote) in &commands {
+        if let Err(message) = validate_command(command, *remote) {
             return compile_error(message);
         }
 
@@ -91,25 +92,90 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
         let argument_types: Vec<_> = arguments.iter().map(|(_, ty)| ty).collect();
         let (reply_type, error_type, handler_returns_result) = return_types(&command.sig.output);
 
+        let send_success = if *remote {
+            quote! {
+                if let ::core::option::Option::Some(reply) = reply {
+                    let _ = reply.send(::core::result::Result::Ok(result));
+                } else if let ::core::option::Option::Some(remote_reply) = remote_reply {
+                    let encoded = ::coactor::__private::prost::Message::encode_to_vec(&result);
+                    let _ = remote_reply.send(::core::result::Result::Ok(encoded));
+                }
+            }
+        } else {
+            quote! {
+                if let ::core::option::Option::Some(reply) = reply {
+                    let _ = reply.send(::core::result::Result::Ok(result));
+                }
+            }
+        };
+        let send_handler_result = if *remote {
+            quote! {
+                if let ::core::option::Option::Some(reply) = reply {
+                    let result = result.map_err(::coactor::SendError::HandlerError);
+                    let _ = reply.send(result);
+                } else if let ::core::option::Option::Some(remote_reply) = remote_reply {
+                    match result {
+                        ::core::result::Result::Ok(result) => {
+                            let encoded = ::coactor::__private::prost::Message::encode_to_vec(&result);
+                            let _ = remote_reply.send(::core::result::Result::Ok(encoded));
+                        }
+                        ::core::result::Result::Err(error) => {
+                            let encoded = ::coactor::__private::prost::Message::encode_to_vec(&error);
+                            let _ = remote_reply.send(::core::result::Result::Err(
+                                ::coactor::__private::RemoteReplyError::Handler(encoded),
+                            ));
+                        }
+                    }
+                }
+            }
+        } else {
+            quote! {
+                let result = result.map_err(::coactor::SendError::HandlerError);
+                if let ::core::option::Option::Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+            }
+        };
+        let panic_reply = if *remote {
+            quote! {
+                if let ::core::option::Option::Some(reply) = reply {
+                    let _ = reply.send(::core::result::Result::Err(
+                        ::coactor::SendError::ActorStopped,
+                    ));
+                } else if let ::core::option::Option::Some(remote_reply) = remote_reply {
+                    let _ = remote_reply.send(::core::result::Result::Err(
+                        ::coactor::__private::RemoteReplyError::Runtime(
+                            ::coactor::__private::RuntimeError::ActorStopped,
+                        ),
+                    ));
+                }
+            }
+        } else {
+            quote! {
+                if let ::core::option::Option::Some(reply) = reply {
+                    let _ = reply.send(::core::result::Result::Err(
+                        ::coactor::SendError::ActorStopped,
+                    ));
+                }
+            }
+        };
         let invoke = if handler_returns_result {
             quote! {
+                let #message_ident { #(#argument_names,)* reply, remote_reply } = *self;
                 let outcome = ::coactor::__private::FutureExt::catch_unwind(
                     ::std::panic::AssertUnwindSafe(
-                        actor.#method_ident(&context, #(self.#argument_names),*)
+                        actor.#method_ident(&context, #(#argument_names),*)
                     )
                 ).await;
                 match outcome {
                     ::core::result::Result::Ok(result) => {
-                        let result = result.map_err(::coactor::SendError::HandlerError);
-                        let _ = self.reply.send(result);
+                        #send_handler_result
                         ::coactor::__private::CommandOutcome::Completed
                     }
                     ::core::result::Result::Err(_) => {
                         ::coactor::__private::CommandOutcome::Panicked(
                             ::std::boxed::Box::new(move || {
-                                let _ = self.reply.send(::core::result::Result::Err(
-                                    ::coactor::SendError::ActorStopped,
-                                ));
+                                #panic_reply
                             })
                         )
                     }
@@ -117,22 +183,21 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
             }
         } else {
             quote! {
+                let #message_ident { #(#argument_names,)* reply, remote_reply } = *self;
                 let outcome = ::coactor::__private::FutureExt::catch_unwind(
                     ::std::panic::AssertUnwindSafe(
-                        actor.#method_ident(&context, #(self.#argument_names),*)
+                        actor.#method_ident(&context, #(#argument_names),*)
                     )
                 ).await;
                 match outcome {
                     ::core::result::Result::Ok(result) => {
-                        let _ = self.reply.send(::core::result::Result::Ok(result));
+                        #send_success
                         ::coactor::__private::CommandOutcome::Completed
                     }
                     ::core::result::Result::Err(_) => {
                         ::coactor::__private::CommandOutcome::Panicked(
                             ::std::boxed::Box::new(move || {
-                                let _ = self.reply.send(::core::result::Result::Err(
-                                    ::coactor::SendError::ActorStopped,
-                                ));
+                                #panic_reply
                             })
                         )
                     }
@@ -140,12 +205,22 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
+        let reply_fields = quote! {
+            reply: ::core::option::Option<::coactor::__private::tokio::sync::oneshot::Sender<
+                ::core::result::Result<#reply_type, ::coactor::SendError<#error_type>>
+            >>,
+            remote_reply: ::core::option::Option<::coactor::__private::tokio::sync::oneshot::Sender<
+                ::core::result::Result<
+                    ::std::vec::Vec<u8>,
+                    ::coactor::__private::RemoteReplyError,
+                >
+            >>,
+        };
+
         generated_messages.push(quote! {
             struct #message_ident {
                 #(#argument_names: #argument_types,)*
-                reply: ::coactor::__private::tokio::sync::oneshot::Sender<
-                    ::core::result::Result<#reply_type, ::coactor::SendError<#error_type>>
-                >,
+                #reply_fields
             }
 
             impl ::coactor::__private::ErasedCommand<#state_type> for #message_ident {
@@ -166,12 +241,69 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                     self: ::std::boxed::Box<Self>,
                     error: ::coactor::__private::RuntimeError,
                 ) {
-                    let _ = self.reply.send(::core::result::Result::Err(error.into()));
+                    if let ::core::option::Option::Some(reply) = self.reply {
+                        let _ = reply.send(::core::result::Result::Err(error.into()));
+                    }
+                    if let ::core::option::Option::Some(reply) = self.remote_reply {
+                        let _ = reply.send(::core::result::Result::Err(
+                            ::coactor::__private::RemoteReplyError::Runtime(error),
+                        ));
+                    }
                 }
             }
         });
 
-        generated_ref_methods.push(quote! {
+        let remote_handler_error = if handler_returns_result {
+            quote! {
+                let error = ::coactor::__private::prost::Message::decode(bytes.as_slice())
+                    .map_err(|_| ::coactor::SendError::RemoteProtocol(
+                        ::coactor::RemoteProtocolError::MalformedHandlerError,
+                    ))?;
+                ::core::result::Result::Err(::coactor::SendError::HandlerError(error))
+            }
+        } else {
+            quote! {
+                let _ = bytes;
+                ::core::result::Result::Err(::coactor::SendError::RemoteProtocol(
+                    ::coactor::RemoteProtocolError::UnexpectedHandlerError,
+                ))
+            }
+        };
+        let ref_method = if *remote {
+            let request_type = argument_types.first().expect("remote command request");
+            let request_name = argument_names.first().expect("remote command request");
+            quote! {
+                pub async fn #method_ident(
+                    &self,
+                    #request_name: #request_type,
+                ) -> ::core::result::Result<#reply_type, ::coactor::SendError<#error_type>> {
+                    if self.inner.is_remote() {
+                        let payload = ::coactor::__private::prost::Message::encode_to_vec(&#request_name);
+                        return match self.inner.invoke_remote(stringify!(#method_ident), payload).await? {
+                            ::coactor::__private::RemotePayload::Success(bytes) => {
+                                ::coactor::__private::prost::Message::decode(bytes.as_slice())
+                                    .map_err(|_| ::coactor::SendError::RemoteProtocol(
+                                        ::coactor::RemoteProtocolError::MalformedSuccess,
+                                    ))
+                            }
+                            ::coactor::__private::RemotePayload::HandlerError(bytes) => {
+                                #remote_handler_error
+                            }
+                        };
+                    }
+                    let (reply, receive) = ::coactor::__private::tokio::sync::oneshot::channel();
+                    self.inner.send(::std::boxed::Box::new(#message_ident {
+                        #request_name,
+                        reply: ::core::option::Option::Some(reply),
+                        remote_reply: ::core::option::Option::None,
+                    }))?;
+                    receive.await.unwrap_or(::core::result::Result::Err(
+                        ::coactor::SendError::ActorStopped,
+                    ))
+                }
+            }
+        } else {
+            quote! {
             pub async fn #method_ident(
                 &self,
                 #(#argument_names: #argument_types),*
@@ -185,13 +317,45 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
                 self.inner
                     .send(::std::boxed::Box::new(#message_ident {
                         #(#argument_names,)*
-                        reply,
+                        reply: ::core::option::Option::Some(reply),
+                        remote_reply: ::core::option::Option::None,
                     }))?;
                 receive.await.unwrap_or(::core::result::Result::Err(
                     ::coactor::SendError::ActorStopped,
                 ))
             }
-        });
+            }
+        };
+        generated_ref_methods.push(ref_method);
+
+        if *remote {
+            let request_type = argument_types.first().expect("remote command request");
+            let request_name = argument_names.first().expect("remote command request");
+            generated_remote_factories.push(quote! {
+                commands.insert(
+                    stringify!(#method_ident),
+                    (|payload: ::std::vec::Vec<u8>| {
+                    let #request_name: #request_type = ::coactor::__private::prost::Message::decode(payload.as_slice())
+                        .map_err(|_| ::coactor::__private::RuntimeError::MalformedPayload)?;
+                    let (remote_reply, receive) = ::coactor::__private::tokio::sync::oneshot::channel();
+                    Ok(::coactor::__private::RemoteInvocation {
+                        command: ::std::boxed::Box::new(#message_ident {
+                            #request_name,
+                            reply: ::core::option::Option::None,
+                            remote_reply: ::core::option::Option::Some(remote_reply),
+                        }),
+                        reply: ::std::boxed::Box::pin(async move {
+                            receive.await.unwrap_or(::core::result::Result::Err(
+                                ::coactor::__private::RemoteReplyError::Runtime(
+                                    ::coactor::__private::RuntimeError::ActorStopped,
+                                ),
+                            ))
+                        }),
+                    })
+                    }) as ::coactor::__private::RemoteCommandFactory<#state_type>,
+                );
+            });
+        }
     }
 
     let activate = if activation.is_some() {
@@ -272,6 +436,15 @@ pub fn actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
             fn make_ref(inner: ::coactor::__private::ActorRef<#state_type>) -> Self::Ref {
                 #ref_ident { inner }
             }
+
+            fn remote_commands() -> ::std::collections::HashMap<
+                &'static str,
+                ::coactor::__private::RemoteCommandFactory<#state_type>,
+            > {
+                let mut commands = ::std::collections::HashMap::new();
+                #(#generated_remote_factories)*
+                commands
+            }
         }
     }
     .into()
@@ -296,13 +469,14 @@ impl syn::parse::Parse for ActorAttribute {
     }
 }
 
-fn take_command_attribute(attributes: &mut Vec<Attribute>) -> bool {
-    let found = attributes.iter().any(|attribute| {
+fn take_command_attribute(attributes: &mut Vec<Attribute>) -> Option<bool> {
+    let found = attributes.iter().find_map(|attribute| {
         attribute
             .path()
             .segments
             .last()
             .is_some_and(|segment| segment.ident == "command")
+            .then_some(!matches!(&attribute.meta, syn::Meta::Path(_)))
     });
     attributes.retain(|attribute| {
         !attribute
@@ -314,7 +488,7 @@ fn take_command_attribute(attributes: &mut Vec<Attribute>) -> bool {
     found
 }
 
-fn validate_command(command: &ImplItemFn) -> Result<(), &'static str> {
+fn validate_command(command: &ImplItemFn, remote: bool) -> Result<(), &'static str> {
     if !matches!(command.vis, syn::Visibility::Public(_)) {
         return Err("#[command] methods must be public");
     }
@@ -323,6 +497,11 @@ fn validate_command(command: &ImplItemFn) -> Result<(), &'static str> {
     }
     if !has_command_context(command) {
         return Err("#[command] must take &CommandContext after &mut self");
+    }
+    if remote && command.sig.inputs.len() != 3 {
+        return Err(
+            "#[command(remote)] must take exactly one Protobuf request after &CommandContext",
+        );
     }
     Ok(())
 }

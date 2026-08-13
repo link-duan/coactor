@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package coactor.peer.v1;
+
+service Peer {
+  rpc Invoke(InvokeRequest) returns (InvokeResponse);
+}
+
+message InvokeRequest {
+  uint32 protocol_version = 1;
+  string actor_type = 2;
+  bytes actor_id = 3;
+  string command = 4;
+  bytes payload = 5;
+}
+
+message InvokeResponse {
+  oneof outcome {
+    bytes success = 1;
+    bytes handler_error = 2;
+    RuntimeFailure runtime_failure = 3;
+  }
+}
+
+enum RuntimeFailure {
+  RUNTIME_FAILURE_UNSPECIFIED = 0;
+  MAILBOX_FULL = 1;
+  ACTIVATION_FAILED = 2;
+  ACTOR_DEACTIVATING = 3;
+  RUNTIME_AT_CAPACITY = 4;
+  RUNTIME_SHUTTING_DOWN = 5;
+  ACTOR_STOPPED = 6;
+  RUNTIME_STOPPED = 7;
+  PROTOCOL_MISMATCH = 8;
+  ACTOR_TYPE_NOT_REGISTERED = 9;
+  COMMAND_NOT_REGISTERED = 10;
+  MALFORMED_PAYLOAD = 11;
+  REMOTE_UNAVAILABLE = 12;
+}
