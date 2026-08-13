@@ -6,12 +6,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
 
 use crate::{__private, BuildError, Runtime, RuntimeBuilder};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct NodeSessionId(Arc<str>);
 
 impl NodeSessionId {
@@ -97,7 +99,7 @@ impl DistributedRuntimeConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeLease {
     pub node_id: String,
     pub session_id: NodeSessionId,
@@ -116,7 +118,14 @@ pub struct VersionedNodeLease {
 pub enum LeaseMutation {
     Applied { etag: String },
     ConditionalRejected,
-    Ambiguous,
+    Ambiguous(AmbiguousMutation),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AmbiguousMutation {
+    Timeout,
+    ResponseLost,
+    DispatchUnknown,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -142,6 +151,12 @@ pub trait NodeLeaseStorage: Send + Sync + 'static {
     async fn renew_node_lease(
         &self,
         lease: NodeLease,
+        etag: &str,
+    ) -> Result<LeaseMutation, OwnershipStorageError>;
+
+    async fn release_node_lease(
+        &self,
+        session_id: &NodeSessionId,
         etag: &str,
     ) -> Result<LeaseMutation, OwnershipStorageError>;
 }
@@ -244,7 +259,7 @@ where
         let etag = match acquired {
             LeaseMutation::Applied { etag } => etag,
             LeaseMutation::ConditionalRejected => return Err(RuntimeStartError::LeaseConflict),
-            LeaseMutation::Ambiguous => {
+            LeaseMutation::Ambiguous(_) => {
                 let Some(etag) = confirm_node_lease(
                     self.storage.as_ref(),
                     &lease,
@@ -295,10 +310,10 @@ pub(crate) async fn confirm_node_lease(
             storage.read_node_lease(&expected.session_id),
         )
         .await;
-        if let Ok(Ok(Some(versioned))) = read_back
-            && versioned.lease == *expected
-        {
-            return Some(versioned.etag);
+        if let Ok(Ok(Some(versioned))) = read_back {
+            if versioned.lease == *expected {
+                return Some(versioned.etag);
+            }
         }
     }
     None

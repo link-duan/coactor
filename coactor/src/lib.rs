@@ -1,6 +1,7 @@
 extern crate self as coactor;
 
 mod node_authority;
+mod s3_node_lease;
 
 use std::{
     any::Any,
@@ -19,10 +20,12 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
 pub use node_authority::{
-    DistributedRuntimeBuilder, DistributedRuntimeConfig, LeaseMutation, LeaseTiming, NodeLease,
-    NodeLeaseStorage, NodeSessionId, OwnershipStorageError, RuntimeStartError, RuntimeSupervision,
-    RuntimeTermination, RuntimeTerminationReason, VersionedNodeLease,
+    AmbiguousMutation, DistributedRuntimeBuilder, DistributedRuntimeConfig, LeaseMutation,
+    LeaseTiming, NodeLease, NodeLeaseStorage, NodeSessionId, OwnershipStorageError,
+    RuntimeStartError, RuntimeSupervision, RuntimeTermination, RuntimeTerminationReason,
+    VersionedNodeLease,
 };
+pub use s3_node_lease::{S3NodeLeaseConfig, S3NodeLeaseStorage};
 
 pub use coactor_macros::{actor, command};
 
@@ -524,7 +527,14 @@ pub mod __private {
 
     pub struct RenewalTask {
         shutdown: oneshot::Sender<()>,
-        task: tokio::task::JoinHandle<()>,
+        task: tokio::task::JoinHandle<RenewalExit>,
+    }
+
+    struct RenewalExit {
+        storage: Arc<dyn NodeLeaseStorage>,
+        session_id: NodeSessionId,
+        etag: String,
+        release: bool,
     }
 
     pub struct DistributedTasks {
@@ -537,7 +547,14 @@ pub mod __private {
         pub async fn shutdown(self) {
             let _ = self.renewal.shutdown.send(());
             let _ = self.peer.shutdown.send(());
-            let _ = self.renewal.task.await;
+            if let Ok(exit) = self.renewal.task.await {
+                if exit.release {
+                    let _ = exit
+                        .storage
+                        .release_node_lease(&exit.session_id, &exit.etag)
+                        .await;
+                }
+            }
             let _ = self.peer.task.await;
         }
     }
@@ -580,12 +597,22 @@ pub mod __private {
                 let wake_at = renewal_due.min(authority.deadline());
                 tokio::select! {
                     _ = tokio::time::sleep_until(wake_at) => {}
-                    _ = &mut shutdown_receiver => return,
+                    _ = &mut shutdown_receiver => return RenewalExit {
+                        storage,
+                        session_id: lease.session_id,
+                        etag,
+                        release: true,
+                    },
                 }
                 if !authority.is_valid() {
                     authority.fence();
                     runtime.fence().await;
-                    return;
+                    return RenewalExit {
+                        storage,
+                        session_id: lease.session_id,
+                        etag,
+                        release: false,
+                    };
                 }
                 let operation_started = tokio::time::Instant::now();
                 lease.expires_at_unix_ms =
@@ -593,7 +620,12 @@ pub mod __private {
                 let Some(remaining) = authority.remaining() else {
                     authority.fence();
                     runtime.fence().await;
-                    return;
+                    return RenewalExit {
+                        storage,
+                        session_id: lease.session_id,
+                        etag,
+                        release: false,
+                    };
                 };
                 let outcome = tokio::time::timeout(
                     timing.operation_timeout.min(remaining),
@@ -605,7 +637,7 @@ pub mod __private {
                         etag = next;
                         authority.renew(operation_started);
                     }
-                    Ok(Ok(LeaseMutation::Ambiguous)) => {
+                    Ok(Ok(LeaseMutation::Ambiguous(_))) => {
                         let Some(next) = confirm_node_lease(
                             storage.as_ref(),
                             &lease,
@@ -616,7 +648,12 @@ pub mod __private {
                         else {
                             authority.fence();
                             runtime.fence().await;
-                            return;
+                            return RenewalExit {
+                                storage,
+                                session_id: lease.session_id,
+                                etag,
+                                release: false,
+                            };
                         };
                         etag = next;
                         authority.renew(operation_started);
@@ -624,12 +661,22 @@ pub mod __private {
                     Ok(Ok(LeaseMutation::ConditionalRejected)) => {
                         authority.fence();
                         runtime.fence().await;
-                        return;
+                        return RenewalExit {
+                            storage,
+                            session_id: lease.session_id,
+                            etag,
+                            release: false,
+                        };
                     }
                     _ if !authority.is_valid() => {
                         authority.fence();
                         runtime.fence().await;
-                        return;
+                        return RenewalExit {
+                            storage,
+                            session_id: lease.session_id,
+                            etag,
+                            release: false,
+                        };
                     }
                     _ => {}
                 }

@@ -7,9 +7,9 @@ use std::{
 
 use async_trait::async_trait;
 use coactor::{
-    ActorId, CommandContext, DistributedRuntimeConfig, LeaseMutation, LeaseTiming, NodeLease,
-    NodeLeaseStorage, NodeSessionId, OwnershipStorageError, RuntimeBuilder, RuntimeStartError,
-    RuntimeTerminationReason, SendError, VersionedNodeLease, actor,
+    ActorId, AmbiguousMutation, CommandContext, DistributedRuntimeConfig, LeaseMutation,
+    LeaseTiming, NodeLease, NodeLeaseStorage, NodeSessionId, OwnershipStorageError, RuntimeBuilder,
+    RuntimeStartError, RuntimeTerminationReason, SendError, VersionedNodeLease, actor,
 };
 use tokio::sync::Notify;
 
@@ -25,6 +25,7 @@ struct FakeLeaseStorage {
     renew_block: Mutex<Option<Arc<Notify>>>,
     acquire_block: Mutex<Option<Arc<Notify>>>,
     reads: Mutex<usize>,
+    released: Mutex<Vec<(NodeSessionId, String)>>,
 }
 
 #[async_trait]
@@ -55,21 +56,21 @@ impl NodeLeaseStorage for FakeLeaseStorage {
         if let Some(result) = self.read.lock().unwrap().pop_front() {
             return result;
         }
-        if *self.confirm_latest_acquire.lock().unwrap()
-            && let Some(lease) = self.acquired.lock().unwrap().last()
-        {
-            return Ok(Some(VersionedNodeLease {
-                lease: lease.clone(),
-                etag: "lease-after-lost-acquire-response".to_owned(),
-            }));
+        if *self.confirm_latest_acquire.lock().unwrap() {
+            if let Some(lease) = self.acquired.lock().unwrap().last() {
+                return Ok(Some(VersionedNodeLease {
+                    lease: lease.clone(),
+                    etag: "lease-after-lost-acquire-response".to_owned(),
+                }));
+            }
         }
-        if *self.confirm_latest_renewal.lock().unwrap()
-            && let Some((lease, _)) = self.renewed.lock().unwrap().last()
-        {
-            return Ok(Some(VersionedNodeLease {
-                lease: lease.clone(),
-                etag: "lease-after-lost-response".to_owned(),
-            }));
+        if *self.confirm_latest_renewal.lock().unwrap() {
+            if let Some((lease, _)) = self.renewed.lock().unwrap().last() {
+                return Ok(Some(VersionedNodeLease {
+                    lease: lease.clone(),
+                    etag: "lease-after-lost-response".to_owned(),
+                }));
+            }
         }
         Ok(None)
     }
@@ -91,6 +92,20 @@ impl NodeLeaseStorage for FakeLeaseStorage {
             .unwrap_or(Ok(LeaseMutation::Applied {
                 etag: "renewed".to_owned(),
             }))
+    }
+
+    async fn release_node_lease(
+        &self,
+        session_id: &NodeSessionId,
+        etag: &str,
+    ) -> Result<LeaseMutation, OwnershipStorageError> {
+        self.released
+            .lock()
+            .unwrap()
+            .push((session_id.clone(), etag.to_owned()));
+        Ok(LeaseMutation::Applied {
+            etag: etag.to_owned(),
+        })
     }
 }
 
@@ -242,7 +257,9 @@ async fn an_ambiguous_acquire_requires_exact_bounded_read_back() {
         .acquire
         .lock()
         .unwrap()
-        .push_back(Ok(LeaseMutation::Ambiguous));
+        .push_back(Ok(LeaseMutation::Ambiguous(
+            AmbiguousMutation::ResponseLost,
+        )));
     *confirmed.confirm_latest_acquire.lock().unwrap() = true;
     let runtime = RuntimeBuilder::new(())
         .distributed(config().lease_timing(fast_timing()), confirmed.clone())
@@ -258,7 +275,9 @@ async fn an_ambiguous_acquire_requires_exact_bounded_read_back() {
         .acquire
         .lock()
         .unwrap()
-        .push_back(Ok(LeaseMutation::Ambiguous));
+        .push_back(Ok(LeaseMutation::Ambiguous(
+            AmbiguousMutation::ResponseLost,
+        )));
     assert!(matches!(
         RuntimeBuilder::new(())
             .distributed(config().lease_timing(fast_timing()), rejected.clone())
@@ -274,7 +293,7 @@ async fn an_ambiguous_acquire_requires_exact_bounded_read_back() {
 async fn graceful_shutdown_reports_shutdown_without_terminating_the_host() {
     let storage = Arc::new(FakeLeaseStorage::default());
     let runtime = RuntimeBuilder::new(())
-        .distributed(config(), storage)
+        .distributed(config(), storage.clone())
         .unwrap()
         .start()
         .await
@@ -287,6 +306,34 @@ async fn graceful_shutdown_reports_shutdown_without_terminating_the_host() {
         supervision.terminated().await.reason,
         RuntimeTerminationReason::Shutdown
     );
+    let released = storage.released.lock().unwrap();
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].1, "lease-1");
+}
+
+#[tokio::test(start_paused = true)]
+async fn graceful_shutdown_releases_with_the_latest_renewed_etag() {
+    let storage = Arc::new(FakeLeaseStorage::default());
+    storage
+        .renew
+        .lock()
+        .unwrap()
+        .push_back(Ok(LeaseMutation::Applied {
+            etag: "lease-2".to_owned(),
+        }));
+    let runtime = RuntimeBuilder::new(())
+        .distributed(config().lease_timing(fast_timing()), storage.clone())
+        .unwrap()
+        .start()
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    tokio::task::yield_now().await;
+
+    runtime.shutdown().await;
+
+    assert_eq!(storage.released.lock().unwrap()[0].1, "lease-2");
 }
 
 #[tokio::test(start_paused = true)]
@@ -384,7 +431,7 @@ async fn conditional_lease_loss_fences_pending_and_new_actor_calls() {
     let state = BlockingState::default();
     let runtime = RuntimeBuilder::new(state.clone())
         .register::<BlockingActor>()
-        .distributed(config().lease_timing(fast_timing()), storage)
+        .distributed(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await
@@ -405,6 +452,7 @@ async fn conditional_lease_loss_fences_pending_and_new_actor_calls() {
     assert_eq!(actor_ref.block().await, Err(SendError::NodeFenced));
 
     runtime.shutdown().await;
+    assert!(storage.released.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -464,7 +512,9 @@ async fn an_ambiguous_renewal_is_confirmed_by_exact_read_back() {
         .renew
         .lock()
         .unwrap()
-        .push_back(Ok(LeaseMutation::Ambiguous));
+        .push_back(Ok(LeaseMutation::Ambiguous(
+            AmbiguousMutation::ResponseLost,
+        )));
     *storage.confirm_latest_renewal.lock().unwrap() = true;
     let runtime = RuntimeBuilder::new(())
         .distributed(config().lease_timing(fast_timing()), storage.clone())
@@ -534,7 +584,9 @@ async fn unreconciled_renewal_ambiguity_is_bounded_then_fences() {
         .renew
         .lock()
         .unwrap()
-        .push_back(Ok(LeaseMutation::Ambiguous));
+        .push_back(Ok(LeaseMutation::Ambiguous(
+            AmbiguousMutation::ResponseLost,
+        )));
     let runtime = RuntimeBuilder::new(())
         .distributed(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
