@@ -248,6 +248,9 @@ where
     }
 }
 
+pub(crate) mod command;
+pub(crate) mod core;
+
 #[cfg(test)]
 pub(crate) mod testing {
     use super::RuntimeBuilder;

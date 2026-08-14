@@ -4,7 +4,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-use super::runtime::ActorRef;
+use super::core::ActorRef;
 use crate::{
     ActorId, CommandContext, DeactivationReason, RemoteProtocolError, SendError, peer_protocol,
 };
