@@ -10,6 +10,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 futures-util = "0.3.31"
+hex = "0.4.3"
 async-trait = "0.1.89"
 axum = "0.7.9"
 aws-credential-types = "=1.2.3"

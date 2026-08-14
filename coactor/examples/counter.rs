@@ -29,12 +29,13 @@ impl CounterActor {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let runtime = RuntimeBuilder::new(AppState { increment_scale: 2 })
+    let runtime = RuntimeBuilder::local(AppState { increment_scale: 2 })
         .mailbox_capacity(32)
         .max_active_actors(1_000)
         .idle_timeout(Duration::from_secs(60))
         .register::<CounterActor>()
-        .build()
+        .start()
+        .await
         .expect("valid CoActor configuration");
 
     let counter = runtime

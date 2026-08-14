@@ -73,11 +73,12 @@ fn state() -> AppState {
 #[tokio::test(start_paused = true)]
 async fn idle_actor_deactivates_irreversibly_and_reactivates_empty() {
     let state = state();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .idle_timeout(Duration::from_secs(30))
         .deactivation_timeout(Duration::from_secs(10))
         .register::<PassivatingActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let actor = runtime
         .actor_ref::<PassivatingActor>(ActorId::from("idle"))
@@ -98,11 +99,12 @@ async fn idle_actor_deactivates_irreversibly_and_reactivates_empty() {
 #[tokio::test(start_paused = true)]
 async fn active_actor_capacity_is_released_after_passivation() {
     let state = state();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .max_active_actors(1)
         .idle_timeout(Duration::from_secs(5))
         .register::<PassivatingActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let first = runtime
         .actor_ref::<PassivatingActor>(ActorId::from("first"))
@@ -125,12 +127,13 @@ async fn active_actor_capacity_is_released_after_passivation() {
 #[tokio::test(start_paused = true)]
 async fn an_actor_type_can_override_the_runtime_idle_timeout() {
     let state = state();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .idle_timeout(Duration::from_secs(60))
         .register_with::<PassivatingActor>(
             ActorTypeConfig::new().idle_timeout(Duration::from_secs(5)),
         )
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let actor = runtime
         .actor_ref::<PassivatingActor>(ActorId::from("override"))
@@ -147,11 +150,12 @@ async fn an_actor_type_can_override_the_runtime_idle_timeout() {
 #[tokio::test(start_paused = true)]
 async fn deactivation_timeout_removes_the_route() {
     let state = state();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .idle_timeout(Duration::from_secs(5))
         .deactivation_timeout(Duration::from_secs(2))
         .register::<PassivatingActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let actor = runtime
         .actor_ref::<PassivatingActor>(ActorId::from("timeout"))
@@ -172,11 +176,12 @@ async fn deactivation_timeout_removes_the_route() {
 async fn calls_racing_with_passivation_are_never_lost() {
     for round in 0_u32..100 {
         let state = state();
-        let runtime = RuntimeBuilder::new(state.clone())
+        let runtime = RuntimeBuilder::local(state.clone())
             .idle_timeout(Duration::from_secs(1))
             .deactivation_timeout(Duration::from_secs(1))
             .register::<PassivatingActor>()
-            .build()
+            .start()
+            .await
             .expect("runtime should build");
         let actor = runtime
             .actor_ref::<PassivatingActor>(ActorId::new(round.to_be_bytes()))
@@ -201,10 +206,11 @@ async fn calls_racing_with_passivation_are_never_lost() {
 #[tokio::test(start_paused = true)]
 async fn idle_deactivation_panic_does_not_poison_the_actor_address() {
     let state = state();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .idle_timeout(Duration::from_secs(1))
         .register::<PanickingDeactivationActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let actor = runtime
         .actor_ref::<PanickingDeactivationActor>(ActorId::from("panic-idle"))

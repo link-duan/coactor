@@ -1,7 +1,11 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use crate::{
+    runtime::testing,
+    test_support::{TestOwnershipBackend, start_cluster},
+};
 use coactor::{
-    ActorId, CommandContext, RemoteProtocolError, RuntimeBuilder, SendError, actor, testing,
+    ActorAddress, ActorId, CommandContext, RemoteProtocolError, RuntimeBuilder, SendError, actor,
 };
 use prost::Message;
 use tokio::sync::Notify;
@@ -176,24 +180,27 @@ impl MismatchedCommandActor {
 
 #[tokio::test]
 async fn a_typed_actor_ref_calls_an_actor_on_another_runtime() {
-    let server_runtime = RuntimeBuilder::new(AppState::default())
-        .register::<CounterActor>()
-        .build()
-        .expect("server runtime should build");
-    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
-        .await
-        .expect("peer server should bind");
-
-    let client_runtime = RuntimeBuilder::new(AppState::default())
-        .register::<CounterActor>()
-        .build()
-        .expect("client runtime should build");
-    let counter = testing::remote_actor_ref::<_, CounterActor>(
-        &client_runtime,
-        ActorId::from("counter-1"),
-        peer.endpoint(),
+    let storage = Arc::new(TestOwnershipBackend::default());
+    let server_runtime = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<CounterActor>(),
+        storage.clone(),
+        "server",
     )
-    .expect("remote Actor Type should be registered");
+    .await;
+    let server_counter = server_runtime
+        .actor_ref::<CounterActor>(ActorId::from("counter-1"))
+        .unwrap();
+    server_counter.add(AddRequest { amount: 0 }).await.unwrap();
+
+    let client_runtime = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<CounterActor>(),
+        storage,
+        "client",
+    )
+    .await;
+    let counter = client_runtime
+        .actor_ref::<CounterActor>(ActorId::from("counter-1"))
+        .unwrap();
 
     assert_eq!(
         counter.add(AddRequest { amount: 2 }).await.unwrap(),
@@ -204,16 +211,16 @@ async fn a_typed_actor_ref_calls_an_actor_on_another_runtime() {
         AddResponse { value: 5 }
     );
 
-    peer.shutdown().await;
     server_runtime.shutdown().await;
     client_runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn remote_enabled_commands_keep_the_local_typed_ref_contract() {
-    let runtime = RuntimeBuilder::new(AppState::default())
+    let runtime = RuntimeBuilder::local(AppState::default())
         .register::<CounterActor>()
-        .build()
+        .start()
+        .await
         .unwrap();
     let counter = runtime
         .actor_ref::<CounterActor>(ActorId::from("local"))
@@ -235,25 +242,30 @@ async fn remote_enabled_commands_keep_the_local_typed_ref_contract() {
 
 #[tokio::test]
 async fn remote_calls_preserve_business_errors_and_mailbox_overload() {
+    let storage = Arc::new(TestOwnershipBackend::default());
     let state = AppState::default();
-    let server_runtime = RuntimeBuilder::new(state.clone())
-        .mailbox_capacity(1)
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let client_runtime = RuntimeBuilder::new(AppState::default())
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let counter = testing::remote_actor_ref::<_, CounterActor>(
-        &client_runtime,
-        ActorId::from("overload"),
-        peer.endpoint(),
+    let server_runtime = start_cluster(
+        RuntimeBuilder::local(state.clone())
+            .mailbox_capacity(1)
+            .register::<CounterActor>(),
+        storage.clone(),
+        "server",
     )
-    .unwrap();
+    .await;
+    let server_counter = server_runtime
+        .actor_ref::<CounterActor>(ActorId::from("overload"))
+        .unwrap();
+    server_counter.add(AddRequest { amount: 0 }).await.unwrap();
+
+    let client_runtime = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<CounterActor>(),
+        storage,
+        "client",
+    )
+    .await;
+    let counter = client_runtime
+        .actor_ref::<CounterActor>(ActorId::from("overload"))
+        .unwrap();
 
     assert_eq!(
         counter.checked_add(CheckedAddRequest { amount: -1 }).await,
@@ -285,115 +297,130 @@ async fn remote_calls_preserve_business_errors_and_mailbox_overload() {
     state.release.notify_one();
     assert_eq!(executing.await.unwrap().unwrap().value, 1);
     assert_eq!(queued.await.unwrap().unwrap().value, 3);
-    peer.shutdown().await;
     server_runtime.shutdown().await;
     client_runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn remote_handler_failure_preserves_the_local_error_category() {
-    let server_runtime = RuntimeBuilder::new(AppState::default())
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let client_runtime = RuntimeBuilder::new(AppState::default())
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let counter = testing::remote_actor_ref::<_, CounterActor>(
-        &client_runtime,
-        ActorId::from("panic"),
-        peer.endpoint(),
+    let storage = Arc::new(TestOwnershipBackend::default());
+    let server_runtime = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<CounterActor>(),
+        storage.clone(),
+        "server",
     )
-    .unwrap();
+    .await;
+    let server_counter = server_runtime
+        .actor_ref::<CounterActor>(ActorId::from("panic"))
+        .unwrap();
+    server_counter.add(AddRequest { amount: 0 }).await.unwrap();
+
+    let client_runtime = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<CounterActor>(),
+        storage,
+        "client",
+    )
+    .await;
+    let counter = client_runtime
+        .actor_ref::<CounterActor>(ActorId::from("panic"))
+        .unwrap();
 
     assert_eq!(
         counter.panic(PanicRequest {}).await,
         Err(SendError::ActorStopped)
     );
 
-    peer.shutdown().await;
     server_runtime.shutdown().await;
     client_runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn remote_protocol_failures_are_structured() {
-    let empty_server = RuntimeBuilder::new(AppState::default()).build().unwrap();
-    let empty_peer = testing::serve_peer(&empty_server, "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let client_runtime = RuntimeBuilder::new(AppState::default())
-        .register::<ClientOnlyActor>()
-        .build()
-        .unwrap();
-    let missing_actor = testing::remote_actor_ref::<_, ClientOnlyActor>(
-        &client_runtime,
-        ActorId::from("missing"),
-        empty_peer.endpoint(),
+    let storage = Arc::new(TestOwnershipBackend::default());
+    let empty_server = start_cluster(
+        RuntimeBuilder::local(AppState::default()),
+        storage.clone(),
+        "empty",
     )
-    .unwrap();
+    .await;
+    let client_runtime = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<ClientOnlyActor>(),
+        storage.clone(),
+        "client",
+    )
+    .await;
+    let missing_id = ActorId::from("missing");
+    storage.assign_owner(
+        ActorAddress::new("client-only", missing_id.clone()),
+        "empty",
+    );
+    let missing_actor = client_runtime
+        .actor_ref::<ClientOnlyActor>(missing_id)
+        .unwrap();
     assert_eq!(
         missing_actor.add(AddRequest { amount: 1 }).await,
         Err(SendError::RemoteProtocol(
             RemoteProtocolError::ActorTypeNotRegistered
         ))
     );
-    empty_peer.shutdown().await;
     empty_server.shutdown().await;
+    client_runtime.shutdown().await;
 
-    let mismatched_server = RuntimeBuilder::new(AppState::default())
-        .register::<MismatchedCommandActor>()
-        .build()
-        .unwrap();
-    let mismatched_peer = testing::serve_peer(&mismatched_server, "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let command_client = RuntimeBuilder::new(AppState::default())
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let missing_command = testing::remote_actor_ref::<_, CounterActor>(
-        &command_client,
-        ActorId::from("missing"),
-        mismatched_peer.endpoint(),
+    let storage = Arc::new(TestOwnershipBackend::default());
+    let mismatched_server = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<MismatchedCommandActor>(),
+        storage.clone(),
+        "mismatched",
     )
-    .unwrap();
+    .await;
+    let command_client = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<CounterActor>(),
+        storage.clone(),
+        "client",
+    )
+    .await;
+    let missing_id = ActorId::from("missing");
+    storage.assign_owner(
+        ActorAddress::new("remote-counter", missing_id.clone()),
+        "mismatched",
+    );
+    let missing_command = command_client
+        .actor_ref::<CounterActor>(missing_id)
+        .unwrap();
     assert_eq!(
         missing_command.add(AddRequest { amount: 1 }).await,
         Err(SendError::RemoteProtocol(
             RemoteProtocolError::CommandNotRegistered
         ))
     );
-    mismatched_peer.shutdown().await;
     mismatched_server.shutdown().await;
     command_client.shutdown().await;
-    client_runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn incompatible_runtime_protocols_are_rejected() {
-    let server_runtime =
-        testing::with_peer_protocol_version(RuntimeBuilder::new(AppState::default()), 2)
-            .register::<CounterActor>()
-            .build()
-            .unwrap();
-    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let client_runtime = RuntimeBuilder::new(AppState::default())
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let counter = testing::remote_actor_ref::<_, CounterActor>(
-        &client_runtime,
-        ActorId::from("version"),
-        peer.endpoint(),
+    let storage = Arc::new(TestOwnershipBackend::default());
+    let server_runtime = start_cluster(
+        testing::with_peer_protocol_version(RuntimeBuilder::local(AppState::default()), 2)
+            .register::<CounterActor>(),
+        storage.clone(),
+        "server",
     )
-    .unwrap();
+    .await;
+    let server_counter = server_runtime
+        .actor_ref::<CounterActor>(ActorId::from("version"))
+        .unwrap();
+    server_counter.add(AddRequest { amount: 0 }).await.unwrap();
+
+    let client_runtime = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<CounterActor>(),
+        storage,
+        "client",
+    )
+    .await;
+    let counter = client_runtime
+        .actor_ref::<CounterActor>(ActorId::from("version"))
+        .unwrap();
 
     assert_eq!(
         counter.add(AddRequest { amount: 1 }).await,
@@ -402,38 +429,45 @@ async fn incompatible_runtime_protocols_are_rejected() {
         ))
     );
 
-    peer.shutdown().await;
     server_runtime.shutdown().await;
     client_runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn a_lost_reply_reports_unknown_outcome_without_replaying_the_command() {
+    let storage = Arc::new(TestOwnershipBackend::default());
     let state = AppState::default();
-    let server_runtime = RuntimeBuilder::new(state.clone())
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let upstream = peer
-        .endpoint()
-        .strip_prefix("http://")
-        .unwrap()
-        .parse()
-        .unwrap();
-    let proxy = ReplyDroppingProxy::start(upstream).await;
-    let client_runtime = RuntimeBuilder::new(AppState::default())
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let counter = testing::remote_actor_ref::<_, CounterActor>(
-        &client_runtime,
-        ActorId::from("lost-reply"),
-        proxy.endpoint(),
+    let server_runtime = start_cluster(
+        RuntimeBuilder::local(state.clone()).register::<CounterActor>(),
+        storage.clone(),
+        "server",
     )
-    .unwrap();
+    .await;
+    let server_counter = server_runtime
+        .actor_ref::<CounterActor>(ActorId::from("lost-reply"))
+        .unwrap();
+    server_counter.add(AddRequest { amount: 0 }).await.unwrap();
+
+    let upstream = storage.endpoint("server");
+    let proxy = ReplyDroppingProxy::start(upstream).await;
+    storage.redirect(
+        "server",
+        proxy
+            .endpoint()
+            .strip_prefix("http://")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    let client_runtime = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<CounterActor>(),
+        storage,
+        "client",
+    )
+    .await;
+    let counter = client_runtime
+        .actor_ref::<CounterActor>(ActorId::from("lost-reply"))
+        .unwrap();
 
     let call = tokio::spawn({
         let counter = counter.clone();
@@ -444,42 +478,39 @@ async fn a_lost_reply_reports_unknown_outcome_without_replaying_the_command() {
     assert_eq!(call.await.unwrap(), Err(SendError::OutcomeUnknown));
     state.release.notify_one();
 
-    let observer = testing::remote_actor_ref::<_, CounterActor>(
-        &client_runtime,
-        ActorId::from("lost-reply"),
-        peer.endpoint(),
-    )
-    .unwrap();
     assert_eq!(
-        observer.add(AddRequest { amount: 1 }).await.unwrap(),
+        server_counter.add(AddRequest { amount: 1 }).await.unwrap(),
         AddResponse { value: 2 }
     );
 
-    peer.shutdown().await;
     server_runtime.shutdown().await;
     client_runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn caller_timeout_does_not_retract_an_accepted_remote_command() {
+    let storage = Arc::new(TestOwnershipBackend::default());
     let state = AppState::default();
-    let server_runtime = RuntimeBuilder::new(state.clone())
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let peer = testing::serve_peer(&server_runtime, "127.0.0.1:0".parse().unwrap())
-        .await
-        .unwrap();
-    let client_runtime = RuntimeBuilder::new(AppState::default())
-        .register::<CounterActor>()
-        .build()
-        .unwrap();
-    let counter = testing::remote_actor_ref::<_, CounterActor>(
-        &client_runtime,
-        ActorId::from("caller-timeout"),
-        peer.endpoint(),
+    let server_runtime = start_cluster(
+        RuntimeBuilder::local(state.clone()).register::<CounterActor>(),
+        storage.clone(),
+        "server",
     )
-    .unwrap();
+    .await;
+    let server_counter = server_runtime
+        .actor_ref::<CounterActor>(ActorId::from("caller-timeout"))
+        .unwrap();
+    server_counter.add(AddRequest { amount: 0 }).await.unwrap();
+
+    let client_runtime = start_cluster(
+        RuntimeBuilder::local(AppState::default()).register::<CounterActor>(),
+        storage,
+        "client",
+    )
+    .await;
+    let counter = client_runtime
+        .actor_ref::<CounterActor>(ActorId::from("caller-timeout"))
+        .unwrap();
 
     let timed_out = tokio::spawn({
         let counter = counter.clone();
@@ -500,7 +531,6 @@ async fn caller_timeout_does_not_retract_an_accepted_remote_command() {
         AddResponse { value: 5 }
     );
 
-    peer.shutdown().await;
     server_runtime.shutdown().await;
     client_runtime.shutdown().await;
 }

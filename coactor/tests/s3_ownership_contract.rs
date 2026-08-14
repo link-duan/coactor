@@ -13,8 +13,9 @@ use axum::{
     routing::any,
 };
 use coactor::{
-    AmbiguousMutation, LeaseMutation, NodeLease, NodeLeaseStorage, OwnershipStorageError,
-    S3NodeLeaseConfig, S3NodeLeaseStorage, VersionedNodeLease,
+    ActorAddress, ActorId, ActorOwner, ActorOwnerRecord, AmbiguousMutation, LeaseMutation,
+    NodeLease, OwnershipBackend, OwnershipBackendError, RuntimeBuilder, S3OwnershipBackend,
+    S3OwnershipConfig, VersionedActorOwnerRecord, VersionedNodeLease, cluster::ClusterConfig,
 };
 use tokio::io::AsyncReadExt;
 
@@ -93,8 +94,8 @@ fn lease() -> NodeLease {
     .unwrap()
 }
 
-fn storage(endpoint: String) -> S3NodeLeaseStorage {
-    S3NodeLeaseStorage::new(S3NodeLeaseConfig::local(
+fn storage(endpoint: String) -> S3OwnershipBackend {
+    S3OwnershipBackend::new(S3OwnershipConfig::local(
         "lease-bucket",
         "contract-prefix",
         endpoint,
@@ -104,7 +105,7 @@ fn storage(endpoint: String) -> S3NodeLeaseStorage {
 #[test]
 fn local_configuration_redacts_test_credentials() {
     let config =
-        S3NodeLeaseConfig::local("lease-bucket", "contract-prefix", "http://127.0.0.1:9000");
+        S3OwnershipConfig::local("lease-bucket", "contract-prefix", "http://127.0.0.1:9000");
 
     let debug = format!("{config:?}");
 
@@ -112,7 +113,32 @@ fn local_configuration_redacts_test_credentials() {
     assert!(!debug.contains("test-secret-key"));
 }
 
-async fn assert_node_lease_behavior(storage: &dyn NodeLeaseStorage) {
+#[tokio::test]
+async fn public_cluster_start_uses_the_built_in_s3_authority() {
+    let (endpoint, server, task) = contract_server([
+        response(StatusCode::OK, Some("\"lease-1\""), ""),
+        response(StatusCode::NO_CONTENT, None, ""),
+    ])
+    .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let ownership = S3OwnershipConfig::local("lease-bucket", "contract-prefix", endpoint);
+    let config = ClusterConfig::new("node-a", address, address, ownership);
+
+    let runtime = RuntimeBuilder::cluster((), config).start().await.unwrap();
+    runtime.shutdown().await;
+
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method, Method::PUT);
+    assert!(requests[0].path.contains("/nodes/"));
+    assert_eq!(requests[1].method, Method::DELETE);
+    drop(requests);
+    task.abort();
+}
+
+async fn assert_node_lease_behavior(storage: &dyn OwnershipBackend) {
     let current = lease();
     let acquired = storage.acquire_node_lease(current.clone()).await.unwrap();
     let LeaseMutation::Applied { etag: first_etag } = acquired else {
@@ -178,11 +204,11 @@ impl MemoryLeaseStorage {
 }
 
 #[async_trait]
-impl NodeLeaseStorage for MemoryLeaseStorage {
+impl OwnershipBackend for MemoryLeaseStorage {
     async fn acquire_node_lease(
         &self,
         lease: NodeLease,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         let key = lease.session_id.as_str().to_owned();
         let mut entries = self.entries.lock().unwrap();
         if entries.contains_key(&key) {
@@ -202,7 +228,7 @@ impl NodeLeaseStorage for MemoryLeaseStorage {
     async fn read_node_lease(
         &self,
         session_id: &coactor::NodeSessionId,
-    ) -> Result<Option<VersionedNodeLease>, OwnershipStorageError> {
+    ) -> Result<Option<VersionedNodeLease>, OwnershipBackendError> {
         Ok(self
             .entries
             .lock()
@@ -211,7 +237,7 @@ impl NodeLeaseStorage for MemoryLeaseStorage {
             .cloned())
     }
 
-    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipStorageError> {
+    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipBackendError> {
         Ok(self.entries.lock().unwrap().values().cloned().collect())
     }
 
@@ -219,7 +245,7 @@ impl NodeLeaseStorage for MemoryLeaseStorage {
         &self,
         lease: NodeLease,
         etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         let key = lease.session_id.as_str().to_owned();
         let mut entries = self.entries.lock().unwrap();
         if !entries.get(&key).is_some_and(|entry| entry.etag == etag) {
@@ -240,7 +266,7 @@ impl NodeLeaseStorage for MemoryLeaseStorage {
         &self,
         session_id: &coactor::NodeSessionId,
         etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         let mut entries = self.entries.lock().unwrap();
         if !entries
             .get(session_id.as_str())
@@ -252,6 +278,22 @@ impl NodeLeaseStorage for MemoryLeaseStorage {
         Ok(LeaseMutation::Applied {
             etag: etag.to_owned(),
         })
+    }
+
+    async fn read_actor_owner(
+        &self,
+        _address: &ActorAddress,
+    ) -> Result<Option<VersionedActorOwnerRecord>, OwnershipBackendError> {
+        Err(OwnershipBackendError::Failed)
+    }
+
+    async fn claim_actor_owner(
+        &self,
+        _address: &ActorAddress,
+        _record: ActorOwnerRecord,
+        _etag: Option<&str>,
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
+        Err(OwnershipBackendError::Failed)
     }
 }
 
@@ -331,6 +373,79 @@ async fn aws_adapter_runs_the_node_lease_contract_with_conditional_requests() {
 }
 
 #[tokio::test]
+async fn aws_adapter_runs_the_actor_owner_contract_with_conditional_requests() {
+    let address = ActorAddress::new("room", ActorId::from("room-7"));
+    let claimed = ActorOwnerRecord {
+        owner: Some(ActorOwner {
+            node_id: "node-a".to_owned(),
+            session_id: lease().session_id,
+        }),
+        ownership_epoch: 3,
+    };
+    let released = ActorOwnerRecord::unowned(3);
+    let (endpoint, server, task) = contract_server([
+        response(StatusCode::OK, Some("\"owner-1\""), ""),
+        response(
+            StatusCode::OK,
+            Some("\"owner-1\""),
+            serde_json::to_string(&claimed).unwrap(),
+        ),
+        response(StatusCode::OK, Some("\"owner-2\""), ""),
+    ])
+    .await;
+    let storage = storage(endpoint);
+
+    assert_eq!(
+        storage
+            .claim_actor_owner(&address, claimed.clone(), None)
+            .await
+            .unwrap(),
+        LeaseMutation::Applied {
+            etag: "\"owner-1\"".into()
+        }
+    );
+    assert_eq!(
+        storage.read_actor_owner(&address).await.unwrap(),
+        Some(VersionedActorOwnerRecord {
+            record: claimed.clone(),
+            etag: "\"owner-1\"".into(),
+        })
+    );
+    assert_eq!(
+        storage
+            .claim_actor_owner(&address, released.clone(), Some("\"owner-1\""))
+            .await
+            .unwrap(),
+        LeaseMutation::Applied {
+            etag: "\"owner-2\"".into()
+        }
+    );
+
+    let expected_path = format!(
+        "/lease-bucket/contract-prefix/actors/{}/ownership.json",
+        hex::encode(address.to_bytes())
+    );
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].method, Method::PUT);
+    assert_eq!(requests[0].path, expected_path);
+    assert_eq!(requests[0].headers["if-none-match"], "*");
+    assert_eq!(
+        serde_json::from_slice::<ActorOwnerRecord>(&requests[0].body).unwrap(),
+        claimed
+    );
+    assert_eq!(requests[1].method, Method::GET);
+    assert_eq!(requests[2].method, Method::PUT);
+    assert_eq!(requests[2].headers["if-match"], "\"owner-1\"");
+    assert_eq!(
+        serde_json::from_slice::<ActorOwnerRecord>(&requests[2].body).unwrap(),
+        released
+    );
+    drop(requests);
+    task.abort();
+}
+
+#[tokio::test]
 async fn aws_adapter_lists_node_capacity_samples_under_the_node_prefix() {
     let current = lease();
     let listed = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>contract-prefix/nodes/session-a.json</Key></Contents></ListBucketResult>".to_owned();
@@ -394,11 +509,11 @@ async fn aws_adapter_keeps_conditional_and_definite_failures_distinct() {
     );
     assert_eq!(
         storage.acquire_node_lease(lease.clone()).await,
-        Err(OwnershipStorageError::Failed)
+        Err(OwnershipBackendError::Failed)
     );
     assert_eq!(
         storage.read_node_lease(&lease.session_id).await,
-        Err(OwnershipStorageError::Unavailable)
+        Err(OwnershipBackendError::Unavailable)
     );
     task.abort();
 }
@@ -415,7 +530,7 @@ async fn aws_adapter_treats_a_malformed_lease_as_a_definite_read_failure() {
 
     assert_eq!(
         storage.read_node_lease(&lease().session_id).await,
-        Err(OwnershipStorageError::Failed)
+        Err(OwnershipBackendError::Failed)
     );
     task.abort();
 }
@@ -449,7 +564,7 @@ async fn aws_adapter_keeps_release_conflicts_and_failures_distinct() {
         storage
             .release_node_lease(&session_id, "\"current-etag\"")
             .await,
-        Err(OwnershipStorageError::Failed)
+        Err(OwnershipBackendError::Failed)
     );
 
     let requests = server.requests.lock().unwrap();
@@ -523,13 +638,13 @@ async fn aws_adapter_reports_request_timeout_separately_from_response_loss() {
         let (_stream, _) = listener.accept().await.unwrap();
         tokio::time::sleep(Duration::from_secs(10)).await;
     });
-    let mut config = S3NodeLeaseConfig::local(
+    let mut config = S3OwnershipConfig::local(
         "lease-bucket",
         "contract-prefix",
         format!("http://{address}"),
     );
     config.request_timeout = Duration::from_millis(50);
-    let storage = S3NodeLeaseStorage::new(config);
+    let storage = S3OwnershipBackend::new(config);
 
     assert_eq!(
         storage.acquire_node_lease(lease()).await.unwrap(),

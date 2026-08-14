@@ -48,22 +48,23 @@ impl ProbeActor {
     }
 }
 
-fn runtime(mailbox_capacity: usize) -> (coactor::Runtime<AppState>, AppState) {
+async fn runtime(mailbox_capacity: usize) -> (coactor::Runtime<AppState>, AppState) {
     let state = AppState {
         entered: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
     };
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .mailbox_capacity(mailbox_capacity)
         .register::<ProbeActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     (runtime, state)
 }
 
 #[tokio::test]
 async fn one_actor_is_non_reentrant_while_another_actor_progresses() {
-    let (runtime, state) = runtime(4);
+    let (runtime, state) = runtime(4).await;
     let first = runtime
         .actor_ref::<ProbeActor>(ActorId::from("first"))
         .expect("registered Actor Type");
@@ -96,7 +97,7 @@ async fn one_actor_is_non_reentrant_while_another_actor_progresses() {
 
 #[tokio::test]
 async fn a_full_mailbox_is_rejected_immediately() {
-    let (runtime, state) = runtime(1);
+    let (runtime, state) = runtime(1).await;
     let actor = runtime
         .actor_ref::<ProbeActor>(ActorId::from("hot"))
         .expect("registered Actor Type");
@@ -124,7 +125,7 @@ async fn a_full_mailbox_is_rejected_immediately() {
 
 #[tokio::test]
 async fn cancelling_a_caller_does_not_retract_an_accepted_command() {
-    let (runtime, state) = runtime(2);
+    let (runtime, state) = runtime(2).await;
     let actor = runtime
         .actor_ref::<ProbeActor>(ActorId::from("cancel"))
         .expect("registered Actor Type");
@@ -149,7 +150,7 @@ async fn cancelling_a_caller_does_not_retract_an_accepted_command() {
 
 #[tokio::test]
 async fn handler_errors_are_flattened_and_do_not_stop_the_actor() {
-    let (runtime, _state) = runtime(2);
+    let (runtime, _state) = runtime(2).await;
     let actor = runtime
         .actor_ref::<ProbeActor>(ActorId::from("errors"))
         .expect("registered Actor Type");
@@ -163,7 +164,7 @@ async fn handler_errors_are_flattened_and_do_not_stop_the_actor() {
 
 #[tokio::test]
 async fn concurrent_accepted_commands_are_all_processed_once() {
-    let (runtime, _state) = runtime(64);
+    let (runtime, _state) = runtime(64).await;
     let actor = runtime
         .actor_ref::<ProbeActor>(ActorId::from("many"))
         .expect("registered Actor Type");
@@ -192,10 +193,11 @@ async fn an_actor_type_can_override_the_runtime_mailbox_capacity() {
         entered: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
     };
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .mailbox_capacity(1)
         .register_with::<ProbeActor>(ActorTypeConfig::new().mailbox_capacity(2))
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let actor = runtime
         .actor_ref::<ProbeActor>(ActorId::from("override"))

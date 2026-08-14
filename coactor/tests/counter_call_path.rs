@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use coactor::{
-    ActorAddress, ActorId, ActorRefError, BuildError, CommandContext, RuntimeBuilder, actor,
+    ActorAddress, ActorId, ActorRefError, CommandContext, RuntimeBuilder, StartError, actor,
 };
 
 static CONSTRUCTIONS: AtomicUsize = AtomicUsize::new(0);
@@ -89,12 +89,13 @@ impl UnregisteredActor {
 #[tokio::test]
 async fn counter_activates_lazily_and_returns_a_typed_result() {
     CONSTRUCTIONS.store(0, Ordering::SeqCst);
-    let runtime = RuntimeBuilder::new(AppState {
+    let runtime = RuntimeBuilder::local(AppState {
         offset: 1,
         ..AppState::default()
     })
     .register::<CounterActor>()
-    .build()
+    .start()
+    .await
     .expect("runtime should build");
 
     let counter = runtime
@@ -120,24 +121,26 @@ fn actor_address_has_a_stable_length_prefixed_encoding() {
     );
 }
 
-#[test]
-fn duplicate_actor_type_names_fail_runtime_construction() {
-    let result = RuntimeBuilder::new(AppState::default())
+#[tokio::test]
+async fn duplicate_actor_type_names_fail_runtime_construction() {
+    let result = RuntimeBuilder::local(AppState::default())
         .register::<CounterActor>()
         .register::<DuplicateCounterActor>()
-        .build();
+        .start()
+        .await;
 
     assert!(matches!(
         result,
-        Err(BuildError::DuplicateActorType("counter"))
+        Err(StartError::DuplicateActorType("counter"))
     ));
 }
 
-#[test]
-fn unregistered_actor_type_fails_before_activation() {
-    let runtime = RuntimeBuilder::new(AppState::default())
+#[tokio::test]
+async fn unregistered_actor_type_fails_before_activation() {
+    let runtime = RuntimeBuilder::local(AppState::default())
         .register::<CounterActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
 
     let result = runtime.actor_ref::<UnregisteredActor>(ActorId::from("missing"));
@@ -152,9 +155,10 @@ fn unregistered_actor_type_fails_before_activation() {
 async fn actor_ids_are_isolated_while_refs_for_one_address_share_state() {
     let state = AppState::default();
     let injected_pointers = state.injected_pointers.clone();
-    let runtime = RuntimeBuilder::new(state)
+    let runtime = RuntimeBuilder::local(state)
         .register::<CounterActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
 
     let first = runtime

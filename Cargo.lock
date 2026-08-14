@@ -553,6 +553,7 @@ dependencies = [
  "axum",
  "coactor-macros",
  "futures-util",
+ "hex",
  "parking_lot",
  "prost",
  "serde",

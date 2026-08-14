@@ -90,7 +90,7 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                 if let ::core::option::Option::Some(reply) = reply {
                     let _ = reply.send(::core::result::Result::Ok(result));
                 } else if let ::core::option::Option::Some(remote_reply) = remote_reply {
-                    let encoded = ::coactor::__private::prost::Message::encode_to_vec(&result);
+                    let encoded = ::coactor::__macro::prost::Message::encode_to_vec(&result);
                     let _ = remote_reply.send(::core::result::Result::Ok(encoded));
                 }
             }
@@ -109,13 +109,13 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                 } else if let ::core::option::Option::Some(remote_reply) = remote_reply {
                     match result {
                         ::core::result::Result::Ok(result) => {
-                            let encoded = ::coactor::__private::prost::Message::encode_to_vec(&result);
+                            let encoded = ::coactor::__macro::prost::Message::encode_to_vec(&result);
                             let _ = remote_reply.send(::core::result::Result::Ok(encoded));
                         }
                         ::core::result::Result::Err(error) => {
-                            let encoded = ::coactor::__private::prost::Message::encode_to_vec(&error);
+                            let encoded = ::coactor::__macro::prost::Message::encode_to_vec(&error);
                             let _ = remote_reply.send(::core::result::Result::Err(
-                                ::coactor::__private::RemoteReplyError::Handler(encoded),
+                                ::coactor::__macro::RemoteReplyError::Handler(encoded),
                             ));
                         }
                     }
@@ -137,8 +137,8 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                     ));
                 } else if let ::core::option::Option::Some(remote_reply) = remote_reply {
                     let _ = remote_reply.send(::core::result::Result::Err(
-                        ::coactor::__private::RemoteReplyError::Runtime(
-                            ::coactor::__private::RuntimeError::ActorStopped,
+                        ::coactor::__macro::RemoteReplyError::Runtime(
+                            ::coactor::__macro::RuntimeError::ActorStopped,
                         ),
                     ));
                 }
@@ -155,7 +155,7 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
         let invoke = if handler_returns_result {
             quote! {
                 let #message_ident { #(#argument_names,)* reply, remote_reply } = *self;
-                let outcome = ::coactor::__private::FutureExt::catch_unwind(
+                let outcome = ::coactor::__macro::FutureExt::catch_unwind(
                     ::std::panic::AssertUnwindSafe(
                         actor.#method_ident(&context, #(#argument_names),*)
                     )
@@ -163,10 +163,10 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                 match outcome {
                     ::core::result::Result::Ok(result) => {
                         #send_handler_result
-                        ::coactor::__private::CommandOutcome::Completed
+                        ::coactor::__macro::CommandOutcome::Completed
                     }
                     ::core::result::Result::Err(_) => {
-                        ::coactor::__private::CommandOutcome::Panicked(
+                        ::coactor::__macro::CommandOutcome::Panicked(
                             ::std::boxed::Box::new(move || {
                                 #panic_reply
                             })
@@ -177,7 +177,7 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
         } else {
             quote! {
                 let #message_ident { #(#argument_names,)* reply, remote_reply } = *self;
-                let outcome = ::coactor::__private::FutureExt::catch_unwind(
+                let outcome = ::coactor::__macro::FutureExt::catch_unwind(
                     ::std::panic::AssertUnwindSafe(
                         actor.#method_ident(&context, #(#argument_names),*)
                     )
@@ -185,10 +185,10 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                 match outcome {
                     ::core::result::Result::Ok(result) => {
                         #send_success
-                        ::coactor::__private::CommandOutcome::Completed
+                        ::coactor::__macro::CommandOutcome::Completed
                     }
                     ::core::result::Result::Err(_) => {
-                        ::coactor::__private::CommandOutcome::Panicked(
+                        ::coactor::__macro::CommandOutcome::Panicked(
                             ::std::boxed::Box::new(move || {
                                 #panic_reply
                             })
@@ -199,13 +199,13 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
         };
 
         let reply_fields = quote! {
-            reply: ::core::option::Option<::coactor::__private::tokio::sync::oneshot::Sender<
+            reply: ::core::option::Option<::coactor::__macro::tokio::sync::oneshot::Sender<
                 ::core::result::Result<#reply_type, ::coactor::SendError<#error_type>>
             >>,
-            remote_reply: ::core::option::Option<::coactor::__private::tokio::sync::oneshot::Sender<
+            remote_reply: ::core::option::Option<::coactor::__macro::tokio::sync::oneshot::Sender<
                 ::core::result::Result<
                     ::std::vec::Vec<u8>,
-                    ::coactor::__private::RemoteReplyError,
+                    ::coactor::__macro::RemoteReplyError,
                 >
             >>,
         };
@@ -216,12 +216,12 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                 #reply_fields
             }
 
-            impl ::coactor::__private::ErasedCommand<#state_type> for #message_ident {
+            impl ::coactor::__macro::ErasedCommand<#state_type> for #message_ident {
                 fn execute<'a>(
                     self: ::std::boxed::Box<Self>,
                     actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
                     context: ::coactor::CommandContext,
-                ) -> ::coactor::__private::BoxFuture<'a, ::coactor::__private::CommandOutcome> {
+                ) -> ::coactor::__macro::BoxFuture<'a, ::coactor::__macro::CommandOutcome> {
                     ::std::boxed::Box::pin(async move {
                         let actor = actor
                             .downcast_mut::<#actor_type>()
@@ -232,14 +232,14 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
 
                 fn fail(
                     self: ::std::boxed::Box<Self>,
-                    error: ::coactor::__private::RuntimeError,
+                    error: ::coactor::__macro::RuntimeError,
                 ) {
                     if let ::core::option::Option::Some(reply) = self.reply {
                         let _ = reply.send(::core::result::Result::Err(error.into()));
                     }
                     if let ::core::option::Option::Some(reply) = self.remote_reply {
                         let _ = reply.send(::core::result::Result::Err(
-                            ::coactor::__private::RemoteReplyError::Runtime(error),
+                            ::coactor::__macro::RemoteReplyError::Runtime(error),
                         ));
                     }
                 }
@@ -248,7 +248,7 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
 
         let remote_handler_error = if handler_returns_result {
             quote! {
-                let error = ::coactor::__private::prost::Message::decode(bytes.as_slice())
+                let error = ::coactor::__macro::prost::Message::decode(bytes.as_slice())
                     .map_err(|_| ::coactor::SendError::RemoteProtocol(
                         ::coactor::RemoteProtocolError::MalformedHandlerError,
                     ))?;
@@ -270,29 +270,33 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                     &self,
                     #request_name: #request_type,
                 ) -> ::core::result::Result<#reply_type, ::coactor::SendError<#error_type>> {
-                    let payload = ::coactor::__private::prost::Message::encode_to_vec(&#request_name);
-                    let (reservation, resolution) = match self.inner.route_remote_command(stringify!(#method_ident), payload).await {
-                        ::core::result::Result::Ok(::coactor::__private::RouteDecision::Remote(remote)) => return match remote {
-                            ::coactor::__private::RemotePayload::Success(bytes) => {
-                                ::coactor::__private::prost::Message::decode(bytes.as_slice())
+                    let payload = ::coactor::__macro::prost::Message::encode_to_vec(&#request_name);
+                    let (reply, receive) = ::coactor::__macro::tokio::sync::oneshot::channel();
+                    match self.inner.dispatch(
+                        ::core::option::Option::Some(::coactor::__macro::RemoteCall {
+                            command: stringify!(#method_ident),
+                            payload,
+                        }),
+                        move || ::std::boxed::Box::new(#message_ident {
+                            #request_name,
+                            reply: ::core::option::Option::Some(reply),
+                            remote_reply: ::core::option::Option::None,
+                        }),
+                    ).await {
+                        ::core::result::Result::Ok(::coactor::__macro::DispatchOutcome::Remote(remote)) => return match remote {
+                            ::coactor::__macro::RemotePayload::Success(bytes) => {
+                                ::coactor::__macro::prost::Message::decode(bytes.as_slice())
                                     .map_err(|_| ::coactor::SendError::RemoteProtocol(
                                         ::coactor::RemoteProtocolError::MalformedSuccess,
                                     ))
                             }
-                            ::coactor::__private::RemotePayload::HandlerError(bytes) => {
+                            ::coactor::__macro::RemotePayload::HandlerError(bytes) => {
                                 #remote_handler_error
                             }
                         },
-                        ::core::result::Result::Ok(::coactor::__private::RouteDecision::Local { reservation, resolution }) => (reservation, resolution),
+                        ::core::result::Result::Ok(::coactor::__macro::DispatchOutcome::Local) => {}
                         ::core::result::Result::Err(error) => return ::core::result::Result::Err(error.into()),
-                    };
-                    let (reply, receive) = ::coactor::__private::tokio::sync::oneshot::channel();
-                    self.inner.send_with_reservation(::std::boxed::Box::new(#message_ident {
-                        #request_name,
-                        reply: ::core::option::Option::Some(reply),
-                        remote_reply: ::core::option::Option::None,
-                    }), reservation)?;
-                    ::core::mem::drop(resolution);
+                    }
                     let result = receive.await.unwrap_or_else(|_| ::core::result::Result::Err(
                         self.inner.reply_channel_closed_error(),
                     ));
@@ -311,13 +315,18 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                 __coactor_assert_send_static::<(#(#argument_types,)*)>();
                 __coactor_assert_send_static::<#reply_type>();
                 __coactor_assert_error::<#error_type>();
-                let (reply, receive) = ::coactor::__private::tokio::sync::oneshot::channel();
+                let (reply, receive) = ::coactor::__macro::tokio::sync::oneshot::channel();
                 self.inner
-                    .send(::std::boxed::Box::new(#message_ident {
-                        #(#argument_names,)*
-                        reply: ::core::option::Option::Some(reply),
-                        remote_reply: ::core::option::Option::None,
-                    }))?;
+                    .dispatch(
+                        ::core::option::Option::None,
+                        move || ::std::boxed::Box::new(#message_ident {
+                            #(#argument_names,)*
+                            reply: ::core::option::Option::Some(reply),
+                            remote_reply: ::core::option::Option::None,
+                        }),
+                    )
+                    .await
+                    .map_err(::coactor::SendError::from)?;
                 let result = receive.await.unwrap_or_else(|_| ::core::result::Result::Err(
                     self.inner.reply_channel_closed_error(),
                 ));
@@ -335,10 +344,10 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                 commands.insert(
                     stringify!(#method_ident),
                     (|payload: ::std::vec::Vec<u8>| {
-                    let #request_name: #request_type = ::coactor::__private::prost::Message::decode(payload.as_slice())
-                        .map_err(|_| ::coactor::__private::RuntimeError::MalformedPayload)?;
-                    let (remote_reply, receive) = ::coactor::__private::tokio::sync::oneshot::channel();
-                    Ok(::coactor::__private::RemoteInvocation {
+                    let #request_name: #request_type = ::coactor::__macro::prost::Message::decode(payload.as_slice())
+                        .map_err(|_| ::coactor::__macro::RuntimeError::MalformedPayload)?;
+                    let (remote_reply, receive) = ::coactor::__macro::tokio::sync::oneshot::channel();
+                    Ok(::coactor::__macro::RemoteInvocation {
                         command: ::std::boxed::Box::new(#message_ident {
                             #request_name,
                             reply: ::core::option::Option::None,
@@ -346,13 +355,13 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
                         }),
                         reply: ::std::boxed::Box::pin(async move {
                             receive.await.unwrap_or(::core::result::Result::Err(
-                                ::coactor::__private::RemoteReplyError::Runtime(
-                                    ::coactor::__private::RuntimeError::ActorStopped,
+                                ::coactor::__macro::RemoteReplyError::Runtime(
+                                    ::coactor::__macro::RuntimeError::ActorStopped,
                                 ),
                             ))
                         }),
                     })
-                    }) as ::coactor::__private::RemoteCommandFactory<#state_type>,
+                    }) as ::coactor::__macro::RemoteCommandFactory<#state_type>,
                 );
             });
         }
@@ -362,7 +371,7 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
         quote! {
             fn activate<'a>(
                 actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
-            ) -> ::coactor::__private::BoxFuture<'a, ::core::result::Result<(), ::std::string::String>> {
+            ) -> ::coactor::__macro::BoxFuture<'a, ::core::result::Result<(), ::std::string::String>> {
                 ::std::boxed::Box::pin(async move {
                     let actor = actor
                         .downcast_mut::<#actor_type>()
@@ -375,7 +384,7 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
         quote! {
             fn activate<'a>(
                 _actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
-            ) -> ::coactor::__private::BoxFuture<'a, ::core::result::Result<(), ::std::string::String>> {
+            ) -> ::coactor::__macro::BoxFuture<'a, ::core::result::Result<(), ::std::string::String>> {
                 ::std::boxed::Box::pin(async { ::core::result::Result::Ok(()) })
             }
         }
@@ -385,7 +394,7 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
             fn deactivate<'a>(
                 actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
                 reason: ::coactor::DeactivationReason,
-            ) -> ::coactor::__private::BoxFuture<'a, ()> {
+            ) -> ::coactor::__macro::BoxFuture<'a, ()> {
                 ::std::boxed::Box::pin(async move {
                     let actor = actor
                         .downcast_mut::<#actor_type>()
@@ -399,7 +408,7 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
             fn deactivate<'a>(
                 _actor: &'a mut (dyn ::core::any::Any + ::core::marker::Send),
                 _reason: ::coactor::DeactivationReason,
-            ) -> ::coactor::__private::BoxFuture<'a, ()> {
+            ) -> ::coactor::__macro::BoxFuture<'a, ()> {
                 ::std::boxed::Box::pin(async {})
             }
         }
@@ -412,14 +421,14 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
 
         #[derive(Clone)]
         pub struct #ref_ident {
-            inner: ::coactor::__private::ActorRef<#state_type>,
+            inner: ::coactor::__macro::ActorRef<#state_type>,
         }
 
         impl #ref_ident {
             #(#generated_ref_methods)*
         }
 
-        impl ::coactor::__private::ActorType<#state_type> for #actor_type {
+        impl ::coactor::__macro::ActorType<#state_type> for #actor_type {
             const NAME: &'static str = #actor_name;
             type Ref = #ref_ident;
 
@@ -433,13 +442,13 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
             #activate
             #deactivate
 
-            fn make_ref(inner: ::coactor::__private::ActorRef<#state_type>) -> Self::Ref {
+            fn make_ref(inner: ::coactor::__macro::ActorRef<#state_type>) -> Self::Ref {
                 #ref_ident { inner }
             }
 
             fn remote_commands() -> ::std::collections::HashMap<
                 &'static str,
-                ::coactor::__private::RemoteCommandFactory<#state_type>,
+                ::coactor::__macro::RemoteCommandFactory<#state_type>,
             > {
                 let mut commands = ::std::collections::HashMap::new();
                 #(#generated_remote_factories)*

@@ -11,10 +11,10 @@ use std::{
 
 use async_trait::async_trait;
 use coactor::{
-    ActorAddress, ActorId, ActorOwner, ActorOwnerRecord, ActorOwnerStorage, AmbiguousMutation,
-    CommandContext, DeactivationReason, DistributedRuntimeConfig, LeaseMutation, LeaseTiming,
-    NodeLease, NodeLeaseStorage, NodeSessionId, OwnershipStorageError, RuntimeBuilder,
-    VersionedActorOwnerRecord, VersionedNodeLease, actor,
+    ActorAddress, ActorId, ActorOwner, ActorOwnerRecord, AmbiguousMutation, ClusterRuntimeConfig,
+    CommandContext, DeactivationReason, LeaseMutation, LeaseTiming, NodeLease, NodeSessionId,
+    OwnershipBackend, OwnershipBackendError, RuntimeBuilder, VersionedActorOwnerRecord,
+    VersionedNodeLease, actor,
 };
 use prost::Message;
 use tokio::sync::Notify;
@@ -122,10 +122,10 @@ async fn idle_release_runtime(
     storage: Arc<OwnershipFake>,
     idle_timeout: Duration,
 ) -> coactor::Runtime<IdleReleaseState> {
-    RuntimeBuilder::new(state)
+    RuntimeBuilder::local(state)
         .idle_timeout(idle_timeout)
         .register::<IdleReleaseActor>()
-        .distributed(config(node, address), storage)
+        .cluster_with_backend(config(node, address), storage)
         .unwrap()
         .start()
         .await
@@ -261,11 +261,11 @@ impl OwnershipFake {
 }
 
 #[async_trait]
-impl NodeLeaseStorage for OwnershipFake {
+impl OwnershipBackend for OwnershipFake {
     async fn acquire_node_lease(
         &self,
         lease: NodeLease,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         let mut state = self.state.lock().unwrap();
         let etag = Self::next_etag(&mut state);
         state.leases.insert(
@@ -281,9 +281,9 @@ impl NodeLeaseStorage for OwnershipFake {
     async fn read_node_lease(
         &self,
         session_id: &NodeSessionId,
-    ) -> Result<Option<VersionedNodeLease>, OwnershipStorageError> {
+    ) -> Result<Option<VersionedNodeLease>, OwnershipBackendError> {
         if *self.fail_lease_reads.lock().unwrap() {
-            return Err(OwnershipStorageError::Unavailable);
+            return Err(OwnershipBackendError::Unavailable);
         }
         Ok(self
             .state
@@ -294,7 +294,7 @@ impl NodeLeaseStorage for OwnershipFake {
             .cloned())
     }
 
-    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipStorageError> {
+    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipBackendError> {
         Ok(self
             .state
             .lock()
@@ -309,7 +309,7 @@ impl NodeLeaseStorage for OwnershipFake {
         &self,
         lease: NodeLease,
         _etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         self.acquire_node_lease(lease).await
     }
 
@@ -317,7 +317,7 @@ impl NodeLeaseStorage for OwnershipFake {
         &self,
         session_id: &NodeSessionId,
         etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         self.state
             .lock()
             .unwrap()
@@ -327,14 +327,11 @@ impl NodeLeaseStorage for OwnershipFake {
             etag: etag.to_owned(),
         })
     }
-}
 
-#[async_trait]
-impl ActorOwnerStorage for OwnershipFake {
     async fn read_actor_owner(
         &self,
         address: &ActorAddress,
-    ) -> Result<Option<VersionedActorOwnerRecord>, OwnershipStorageError> {
+    ) -> Result<Option<VersionedActorOwnerRecord>, OwnershipBackendError> {
         self.owner_reads.fetch_add(1, Ordering::Relaxed);
         let redirect = self
             .redirect_owner_after_read
@@ -377,7 +374,7 @@ impl ActorOwnerStorage for OwnershipFake {
         address: &ActorAddress,
         record: ActorOwnerRecord,
         etag: Option<&str>,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         self.owner_claims.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         let matches = match (state.owners.get(address), etag) {
@@ -439,7 +436,7 @@ impl ActorOwnerStorage for OwnershipFake {
         &self,
         address: &ActorAddress,
         current: &VersionedActorOwnerRecord,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         if std::mem::take(
             &mut *self
                 .lose_next_release_response_without_applying
@@ -484,8 +481,8 @@ async fn free_address() -> SocketAddr {
     address
 }
 
-fn config(node: &str, address: SocketAddr) -> DistributedRuntimeConfig {
-    DistributedRuntimeConfig::new(node, address, address).lease_timing(LeaseTiming {
+fn config(node: &str, address: SocketAddr) -> ClusterRuntimeConfig {
+    ClusterRuntimeConfig::new(node, address, address).lease_timing(LeaseTiming {
         ttl: Duration::from_secs(60),
         renewal_interval: Duration::from_secs(20),
         operation_timeout: Duration::from_secs(1),
@@ -497,10 +494,10 @@ fn config(node: &str, address: SocketAddr) -> DistributedRuntimeConfig {
 async fn concurrent_cold_calls_share_one_claim_and_one_active_actor() {
     let storage = Arc::new(OwnershipFake::default());
     let address = free_address().await;
-    let runtime = RuntimeBuilder::new(())
+    let runtime = RuntimeBuilder::local(())
         .max_active_actors(1)
         .register::<CounterActor>()
-        .distributed(config("node-a", address), storage.clone())
+        .cluster_with_backend(config("node-a", address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -532,16 +529,16 @@ async fn a_losing_node_resolves_the_winner_and_forwards_the_typed_call() {
     let storage = Arc::new(OwnershipFake::default());
     let first_address = free_address().await;
     let second_address = free_address().await;
-    let first = RuntimeBuilder::new(())
+    let first = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-a", first_address), storage.clone())
+        .cluster_with_backend(config("node-a", first_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let second = RuntimeBuilder::new(())
+    let second = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-b", second_address), storage.clone())
+        .cluster_with_backend(config("node-b", second_address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -577,16 +574,16 @@ async fn a_never_connected_route_refreshes_once_before_dispatch() {
     let stale_address = free_address().await;
     let winner_address = free_address().await;
     let unreachable = free_address().await;
-    let stale = RuntimeBuilder::new(())
+    let stale = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-stale", stale_address), storage.clone())
+        .cluster_with_backend(config("node-stale", stale_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let winner = RuntimeBuilder::new(())
+    let winner = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-winner", winner_address), storage.clone())
+        .cluster_with_backend(config("node-winner", winner_address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -617,16 +614,16 @@ async fn an_explicit_not_owner_response_refreshes_once() {
     let storage = Arc::new(OwnershipFake::default());
     let stale_address = free_address().await;
     let winner_address = free_address().await;
-    let stale = RuntimeBuilder::new(())
+    let stale = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-stale", stale_address), storage.clone())
+        .cluster_with_backend(config("node-stale", stale_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let winner = RuntimeBuilder::new(())
+    let winner = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-winner", winner_address), storage.clone())
+        .cluster_with_backend(config("node-winner", winner_address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -656,16 +653,16 @@ async fn a_conditional_claim_rejection_is_reresolved_to_the_winner() {
     let storage = Arc::new(OwnershipFake::default());
     let first_address = free_address().await;
     let second_address = free_address().await;
-    let first = RuntimeBuilder::new(())
+    let first = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-a", first_address), storage.clone())
+        .cluster_with_backend(config("node-a", first_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let second = RuntimeBuilder::new(())
+    let second = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-b", second_address), storage.clone())
+        .cluster_with_backend(config("node-b", second_address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -689,10 +686,10 @@ async fn a_conditional_claim_rejection_is_reresolved_to_the_winner() {
 async fn local_capacity_is_reserved_before_an_owner_claim() {
     let storage = Arc::new(OwnershipFake::default());
     let address = free_address().await;
-    let runtime = RuntimeBuilder::new(())
+    let runtime = RuntimeBuilder::local(())
         .max_active_actors(1)
         .register::<CounterActor>()
-        .distributed(config("node-a", address), storage.clone())
+        .cluster_with_backend(config("node-a", address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -719,18 +716,18 @@ async fn a_full_ingress_places_one_cold_actor_on_an_available_node() {
     let storage = Arc::new(OwnershipFake::default());
     let ingress_address = free_address().await;
     let target_address = free_address().await;
-    let ingress = RuntimeBuilder::new(())
+    let ingress = RuntimeBuilder::local(())
         .max_active_actors(1)
         .register::<CounterActor>()
-        .distributed(config("node-a", ingress_address), storage.clone())
+        .cluster_with_backend(config("node-a", ingress_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let target = RuntimeBuilder::new(())
+    let target = RuntimeBuilder::local(())
         .max_active_actors(1)
         .register::<CounterActor>()
-        .distributed(config("node-b", target_address), storage.clone())
+        .cluster_with_backend(config("node-b", target_address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -766,26 +763,26 @@ async fn one_stale_capacity_rejection_selects_one_alternative() {
     let ingress_address = free_address().await;
     let stale_address = free_address().await;
     let alternative_address = free_address().await;
-    let ingress = RuntimeBuilder::new(())
+    let ingress = RuntimeBuilder::local(())
         .max_active_actors(1)
         .register::<CounterActor>()
-        .distributed(config("node-a", ingress_address), storage.clone())
+        .cluster_with_backend(config("node-a", ingress_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let stale = RuntimeBuilder::new(())
+    let stale = RuntimeBuilder::local(())
         .max_active_actors(1)
         .register::<CounterActor>()
-        .distributed(config("node-b", stale_address), storage.clone())
+        .cluster_with_backend(config("node-b", stale_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let alternative = RuntimeBuilder::new(())
+    let alternative = RuntimeBuilder::local(())
         .max_active_actors(1)
         .register::<CounterActor>()
-        .distributed(config("node-c", alternative_address), storage.clone())
+        .cluster_with_backend(config("node-c", alternative_address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -833,18 +830,18 @@ async fn exhausted_placement_returns_runtime_capacity() {
     let storage = Arc::new(OwnershipFake::default());
     let ingress_address = free_address().await;
     let full_target_address = free_address().await;
-    let ingress = RuntimeBuilder::new(())
+    let ingress = RuntimeBuilder::local(())
         .max_active_actors(1)
         .register::<CounterActor>()
-        .distributed(config("node-a", ingress_address), storage.clone())
+        .cluster_with_backend(config("node-a", ingress_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let full_target = RuntimeBuilder::new(())
+    let full_target = RuntimeBuilder::local(())
         .max_active_actors(1)
         .register::<CounterActor>()
-        .distributed(config("node-b", full_target_address), storage.clone())
+        .cluster_with_backend(config("node-b", full_target_address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -880,9 +877,9 @@ async fn ambiguous_claim_is_confirmed_by_exact_owner_and_epoch_read_back() {
     let storage = Arc::new(OwnershipFake::default());
     *storage.ambiguous_next_claim.lock().unwrap() = true;
     let address = free_address().await;
-    let runtime = RuntimeBuilder::new(())
+    let runtime = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-a", address), storage.clone())
+        .cluster_with_backend(config("node-a", address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -909,9 +906,9 @@ async fn unreconciled_ambiguous_claim_is_bounded_and_never_replayed() {
         .lock()
         .unwrap() = true;
     let address = free_address().await;
-    let runtime = RuntimeBuilder::new(())
+    let runtime = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-a", address), storage.clone())
+        .cluster_with_backend(config("node-a", address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -949,16 +946,16 @@ async fn absent_owner_lease_allows_higher_epoch_empty_state_failover() {
         external_seed: 40,
         ..RebuildingState::default()
     };
-    let first = RuntimeBuilder::new(first_state.clone())
+    let first = RuntimeBuilder::local(first_state.clone())
         .register::<RebuildingActor>()
-        .distributed(config("node-a", first_address), storage.clone())
+        .cluster_with_backend(config("node-a", first_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let second = RuntimeBuilder::new(second_state.clone())
+    let second = RuntimeBuilder::local(second_state.clone())
         .register::<RebuildingActor>()
-        .distributed(config("node-b", second_address), storage.clone())
+        .cluster_with_backend(config("node-b", second_address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -1005,16 +1002,16 @@ async fn lease_read_failure_never_permits_takeover() {
     let storage = Arc::new(OwnershipFake::default());
     let first_address = free_address().await;
     let second_address = free_address().await;
-    let first = RuntimeBuilder::new(())
+    let first = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-a", first_address), storage.clone())
+        .cluster_with_backend(config("node-a", first_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let second = RuntimeBuilder::new(())
+    let second = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-b", second_address), storage.clone())
+        .cluster_with_backend(config("node-b", second_address), storage.clone())
         .unwrap()
         .start()
         .await
@@ -1058,16 +1055,16 @@ async fn unreachable_owner_endpoint_never_permits_takeover() {
     let first_address = free_address().await;
     let second_address = free_address().await;
     let unreachable = free_address().await;
-    let first = RuntimeBuilder::new(())
+    let first = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-a", first_address), storage.clone())
+        .cluster_with_backend(config("node-a", first_address), storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
-    let second = RuntimeBuilder::new(())
+    let second = RuntimeBuilder::local(())
         .register::<CounterActor>()
-        .distributed(config("node-b", second_address), storage.clone())
+        .cluster_with_backend(config("node-b", second_address), storage.clone())
         .unwrap()
         .start()
         .await

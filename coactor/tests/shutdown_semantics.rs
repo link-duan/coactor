@@ -43,23 +43,24 @@ impl ShutdownActor {
     }
 }
 
-fn runtime(timeout: Duration) -> (coactor::Runtime<AppState>, AppState) {
+async fn runtime(timeout: Duration) -> (coactor::Runtime<AppState>, AppState) {
     let state = AppState {
         entered: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
         deactivations: Arc::new(Mutex::new(Vec::new())),
     };
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .shutdown_timeout(timeout)
         .register::<ShutdownActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     (runtime, state)
 }
 
 #[tokio::test]
 async fn graceful_shutdown_rejects_new_calls_and_drains_accepted_work() {
-    let (runtime, state) = runtime(Duration::from_secs(5));
+    let (runtime, state) = runtime(Duration::from_secs(5)).await;
     let actor = runtime
         .actor_ref::<ShutdownActor>(ActorId::from("drain"))
         .expect("registered Actor Type");
@@ -91,7 +92,7 @@ async fn graceful_shutdown_rejects_new_calls_and_drains_accepted_work() {
 
 #[tokio::test(start_paused = true)]
 async fn shutdown_timeout_stops_unfinished_commands() {
-    let (runtime, state) = runtime(Duration::from_secs(2));
+    let (runtime, state) = runtime(Duration::from_secs(2)).await;
     let actor = runtime
         .actor_ref::<ShutdownActor>(ActorId::from("timeout"))
         .expect("registered Actor Type");

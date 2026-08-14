@@ -6,12 +6,12 @@ use aws_sdk_s3::{Client, config::Region, primitives::ByteStream};
 use aws_smithy_types::{retry::RetryConfig, timeout::TimeoutConfig};
 
 use crate::{
-    AmbiguousMutation, LeaseMutation, NodeLease, NodeLeaseStorage, NodeSessionId,
-    OwnershipStorageError, VersionedNodeLease,
+    ActorAddress, ActorOwnerRecord, AmbiguousMutation, LeaseMutation, NodeLease, NodeSessionId,
+    OwnershipBackend, OwnershipBackendError, VersionedActorOwnerRecord, VersionedNodeLease,
 };
 
 #[derive(Clone)]
-pub struct S3NodeLeaseConfig {
+pub struct S3OwnershipConfig {
     pub bucket: String,
     pub prefix: String,
     pub region: String,
@@ -20,10 +20,10 @@ pub struct S3NodeLeaseConfig {
     pub request_timeout: Duration,
 }
 
-impl fmt::Debug for S3NodeLeaseConfig {
+impl fmt::Debug for S3OwnershipConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("S3NodeLeaseConfig")
+            .debug_struct("S3OwnershipConfig")
             .field("bucket", &self.bucket)
             .field("prefix", &self.prefix)
             .field("region", &self.region)
@@ -34,7 +34,7 @@ impl fmt::Debug for S3NodeLeaseConfig {
     }
 }
 
-impl S3NodeLeaseConfig {
+impl S3OwnershipConfig {
     pub fn local(
         bucket: impl Into<String>,
         prefix: impl Into<String>,
@@ -57,14 +57,14 @@ impl S3NodeLeaseConfig {
     }
 }
 
-pub struct S3NodeLeaseStorage {
+pub(crate) struct S3OwnershipBackend {
     client: Client,
     bucket: Arc<str>,
     prefix: Arc<str>,
 }
 
-impl S3NodeLeaseStorage {
-    pub fn new(config: S3NodeLeaseConfig) -> Self {
+impl S3OwnershipBackend {
+    pub(crate) fn new(config: S3OwnershipConfig) -> Self {
         let mut sdk = aws_sdk_s3::Config::builder()
             .behavior_version_latest()
             .region(Region::new(config.region))
@@ -86,14 +86,22 @@ impl S3NodeLeaseStorage {
         }
     }
 
-    fn key(&self, session_id: &NodeSessionId) -> String {
+    fn node_key(&self, session_id: &NodeSessionId) -> String {
         format!("{}/nodes/{}.json", self.prefix, session_id.as_str())
     }
 
-    async fn read_key(
+    fn actor_key(&self, address: &ActorAddress) -> String {
+        format!(
+            "{}/actors/{}/ownership.json",
+            self.prefix,
+            hex::encode(address.to_bytes())
+        )
+    }
+
+    async fn read_node_key(
         &self,
         key: String,
-    ) -> Result<Option<VersionedNodeLease>, OwnershipStorageError> {
+    ) -> Result<Option<VersionedNodeLease>, OwnershipBackendError> {
         let output = match self
             .client
             .get_object()
@@ -110,16 +118,16 @@ impl S3NodeLeaseStorage {
             {
                 return Ok(None);
             }
-            Err(_) => return Err(OwnershipStorageError::Unavailable),
+            Err(_) => return Err(OwnershipBackendError::Unavailable),
         };
-        let etag = output.e_tag.ok_or(OwnershipStorageError::Failed)?;
+        let etag = output.e_tag.ok_or(OwnershipBackendError::Failed)?;
         let bytes = output
             .body
             .collect()
             .await
-            .map_err(|_| OwnershipStorageError::Unavailable)?
+            .map_err(|_| OwnershipBackendError::Unavailable)?
             .into_bytes();
-        let lease = serde_json::from_slice(&bytes).map_err(|_| OwnershipStorageError::Failed)?;
+        let lease = serde_json::from_slice(&bytes).map_err(|_| OwnershipBackendError::Failed)?;
         Ok(Some(VersionedNodeLease { lease, etag }))
     }
 
@@ -127,13 +135,13 @@ impl S3NodeLeaseStorage {
         &self,
         lease: NodeLease,
         etag: Option<&str>,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
-        let body = serde_json::to_vec(&lease).map_err(|_| OwnershipStorageError::Failed)?;
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
+        let body = serde_json::to_vec(&lease).map_err(|_| OwnershipBackendError::Failed)?;
         let mut request = self
             .client
             .put_object()
             .bucket(self.bucket.as_ref())
-            .key(self.key(&lease.session_id))
+            .key(self.node_key(&lease.session_id))
             .body(ByteStream::from(body));
         request = match etag {
             Some(etag) => request.if_match(etag),
@@ -143,29 +151,88 @@ impl S3NodeLeaseStorage {
             Ok(output) => output
                 .e_tag
                 .map(|etag| LeaseMutation::Applied { etag })
-                .ok_or(OwnershipStorageError::Failed),
+                .ok_or(OwnershipBackendError::Failed),
+            Err(error) => classify_write_error(&error),
+        }
+    }
+
+    async fn read_actor_key(
+        &self,
+        key: String,
+    ) -> Result<Option<VersionedActorOwnerRecord>, OwnershipBackendError> {
+        let output = match self
+            .client
+            .get_object()
+            .bucket(self.bucket.as_ref())
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => output,
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|error| error.is_no_such_key()) =>
+            {
+                return Ok(None);
+            }
+            Err(_) => return Err(OwnershipBackendError::Unavailable),
+        };
+        let etag = output.e_tag.ok_or(OwnershipBackendError::Failed)?;
+        let bytes = output
+            .body
+            .collect()
+            .await
+            .map_err(|_| OwnershipBackendError::Unavailable)?
+            .into_bytes();
+        let record = serde_json::from_slice(&bytes).map_err(|_| OwnershipBackendError::Failed)?;
+        Ok(Some(VersionedActorOwnerRecord { record, etag }))
+    }
+
+    async fn put_actor(
+        &self,
+        address: &ActorAddress,
+        record: ActorOwnerRecord,
+        etag: Option<&str>,
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
+        let body = serde_json::to_vec(&record).map_err(|_| OwnershipBackendError::Failed)?;
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(self.bucket.as_ref())
+            .key(self.actor_key(address))
+            .body(ByteStream::from(body));
+        request = match etag {
+            Some(etag) => request.if_match(etag),
+            None => request.if_none_match("*"),
+        };
+        match request.send().await {
+            Ok(output) => output
+                .e_tag
+                .map(|etag| LeaseMutation::Applied { etag })
+                .ok_or(OwnershipBackendError::Failed),
             Err(error) => classify_write_error(&error),
         }
     }
 }
 
 #[async_trait]
-impl NodeLeaseStorage for S3NodeLeaseStorage {
+impl OwnershipBackend for S3OwnershipBackend {
     async fn acquire_node_lease(
         &self,
         lease: NodeLease,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         self.put(lease, None).await
     }
 
     async fn read_node_lease(
         &self,
         session_id: &NodeSessionId,
-    ) -> Result<Option<VersionedNodeLease>, OwnershipStorageError> {
-        self.read_key(self.key(session_id)).await
+    ) -> Result<Option<VersionedNodeLease>, OwnershipBackendError> {
+        self.read_node_key(self.node_key(session_id)).await
     }
 
-    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipStorageError> {
+    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipBackendError> {
         let prefix = format!("{}/nodes/", self.prefix);
         let mut continuation_token = None;
         let mut leases = Vec::new();
@@ -181,12 +248,12 @@ impl NodeLeaseStorage for S3NodeLeaseStorage {
             let output = request
                 .send()
                 .await
-                .map_err(|_| OwnershipStorageError::Unavailable)?;
+                .map_err(|_| OwnershipBackendError::Unavailable)?;
             for object in output.contents() {
                 let Some(key) = object.key() else {
                     continue;
                 };
-                if let Some(lease) = self.read_key(key.to_owned()).await? {
+                if let Some(lease) = self.read_node_key(key.to_owned()).await? {
                     leases.push(lease);
                 }
             }
@@ -195,7 +262,7 @@ impl NodeLeaseStorage for S3NodeLeaseStorage {
             }
             continuation_token = output.next_continuation_token;
             if continuation_token.is_none() {
-                return Err(OwnershipStorageError::Failed);
+                return Err(OwnershipBackendError::Failed);
             }
         }
         Ok(leases)
@@ -205,7 +272,7 @@ impl NodeLeaseStorage for S3NodeLeaseStorage {
         &self,
         lease: NodeLease,
         etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         self.put(lease, Some(etag)).await
     }
 
@@ -213,12 +280,12 @@ impl NodeLeaseStorage for S3NodeLeaseStorage {
         &self,
         session_id: &NodeSessionId,
         etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         match self
             .client
             .delete_object()
             .bucket(self.bucket.as_ref())
-            .key(self.key(session_id))
+            .key(self.node_key(session_id))
             .if_match(etag)
             .send()
             .await
@@ -229,11 +296,27 @@ impl NodeLeaseStorage for S3NodeLeaseStorage {
             Err(error) => classify_write_error(&error),
         }
     }
+
+    async fn read_actor_owner(
+        &self,
+        address: &ActorAddress,
+    ) -> Result<Option<VersionedActorOwnerRecord>, OwnershipBackendError> {
+        self.read_actor_key(self.actor_key(address)).await
+    }
+
+    async fn claim_actor_owner(
+        &self,
+        address: &ActorAddress,
+        record: ActorOwnerRecord,
+        etag: Option<&str>,
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
+        self.put_actor(address, record, etag).await
+    }
 }
 
 fn classify_write_error<E>(
     error: &aws_sdk_s3::error::SdkError<E>,
-) -> Result<LeaseMutation, OwnershipStorageError>
+) -> Result<LeaseMutation, OwnershipBackendError>
 where
     E: aws_sdk_s3::error::ProvideErrorMetadata,
 {
@@ -243,14 +326,14 @@ where
     {
         Ok(LeaseMutation::ConditionalRejected)
     } else if error.as_service_error().is_some() {
-        Err(OwnershipStorageError::Failed)
+        Err(OwnershipBackendError::Failed)
     } else {
         use aws_sdk_s3::error::SdkError;
         let reason = match error {
             SdkError::TimeoutError(_) => AmbiguousMutation::Timeout,
             SdkError::ResponseError(_) => AmbiguousMutation::ResponseLost,
             SdkError::DispatchFailure(_) => AmbiguousMutation::ResponseLost,
-            SdkError::ConstructionFailure(_) => return Err(OwnershipStorageError::Failed),
+            SdkError::ConstructionFailure(_) => return Err(OwnershipBackendError::Failed),
             SdkError::ServiceError(_) => unreachable!("service errors were handled above"),
             _ => AmbiguousMutation::DispatchUnknown,
         };

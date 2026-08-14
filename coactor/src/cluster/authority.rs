@@ -10,18 +10,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
 
-use crate::{__private, ActorAddress, BuildError, Runtime, RuntimeBuilder};
+use super::{
+    ClusterRouter,
+    node::{NodeAuthority, spawn_lease_renewal},
+};
+use crate::{ActorAddress, Runtime, RuntimeBuilder, S3OwnershipConfig, StartError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct NodeSessionId(Arc<str>);
+pub(crate) struct NodeSessionId(Arc<str>);
 
 impl NodeSessionId {
     pub(crate) fn generate() -> Self {
         Self(uuid::Uuid::new_v4().to_string().into())
     }
 
-    pub fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
 }
@@ -53,15 +57,44 @@ impl Default for LeaseTiming {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DistributedRuntimeConfig {
+pub(crate) struct ClusterRuntimeConfig {
     pub node_id: String,
     pub bind_address: SocketAddr,
     pub advertised_address: SocketAddr,
     pub lease_timing: LeaseTiming,
 }
 
-impl DistributedRuntimeConfig {
+#[derive(Clone, Debug)]
+pub struct ClusterConfig {
+    runtime: ClusterRuntimeConfig,
+    ownership: S3OwnershipConfig,
+}
+
+impl ClusterConfig {
     pub fn new(
+        node_id: impl Into<String>,
+        bind_address: SocketAddr,
+        advertised_address: SocketAddr,
+        ownership: S3OwnershipConfig,
+    ) -> Self {
+        Self {
+            runtime: ClusterRuntimeConfig::new(node_id, bind_address, advertised_address),
+            ownership,
+        }
+    }
+
+    pub fn lease_timing(mut self, timing: LeaseTiming) -> Self {
+        self.runtime = self.runtime.lease_timing(timing);
+        self
+    }
+
+    pub(crate) fn into_parts(self) -> (ClusterRuntimeConfig, S3OwnershipConfig) {
+        (self.runtime, self.ownership)
+    }
+}
+
+impl ClusterRuntimeConfig {
+    pub(crate) fn new(
         node_id: impl Into<String>,
         bind_address: SocketAddr,
         advertised_address: SocketAddr,
@@ -74,17 +107,17 @@ impl DistributedRuntimeConfig {
         }
     }
 
-    pub fn lease_timing(mut self, timing: LeaseTiming) -> Self {
+    pub(crate) fn lease_timing(mut self, timing: LeaseTiming) -> Self {
         self.lease_timing = timing;
         self
     }
 
-    pub(crate) fn validate(&self) -> Result<(), RuntimeStartError> {
+    pub(crate) fn validate(&self) -> Result<(), StartError> {
         if self.node_id.trim().is_empty() {
-            return Err(RuntimeStartError::InvalidNodeId);
+            return Err(StartError::InvalidNodeId);
         }
         if self.advertised_address.port() == 0 {
-            return Err(RuntimeStartError::InvalidAdvertisedAddress);
+            return Err(StartError::InvalidAdvertisedAddress);
         }
         let timing = self.lease_timing;
         if timing.ttl.is_zero()
@@ -93,14 +126,14 @@ impl DistributedRuntimeConfig {
             || timing.operation_timeout.is_zero()
             || timing.peer_connect_timeout.is_zero()
         {
-            return Err(RuntimeStartError::InvalidLeaseTiming);
+            return Err(StartError::InvalidLeaseTiming);
         }
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeLease {
+pub(crate) struct NodeLease {
     pub node_id: String,
     pub session_id: NodeSessionId,
     pub advertised_address: SocketAddr,
@@ -119,19 +152,19 @@ pub struct NodeLease {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VersionedNodeLease {
+pub(crate) struct VersionedNodeLease {
     pub lease: NodeLease,
     pub etag: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ActorOwnerRecord {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActorOwnerRecord {
     pub owner: Option<ActorOwner>,
     pub ownership_epoch: u64,
 }
 
 impl ActorOwnerRecord {
-    pub fn unowned(ownership_epoch: u64) -> Self {
+    pub(crate) fn unowned(ownership_epoch: u64) -> Self {
         Self {
             owner: None,
             ownership_epoch,
@@ -139,34 +172,34 @@ impl ActorOwnerRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ActorOwner {
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActorOwner {
     pub node_id: String,
     pub session_id: NodeSessionId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VersionedActorOwnerRecord {
+pub(crate) struct VersionedActorOwnerRecord {
     pub record: ActorOwnerRecord,
     pub etag: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LeaseMutation {
+pub(crate) enum LeaseMutation {
     Applied { etag: String },
     ConditionalRejected,
     Ambiguous(AmbiguousMutation),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AmbiguousMutation {
+pub(crate) enum AmbiguousMutation {
     Timeout,
     ResponseLost,
     DispatchUnknown,
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum OwnershipStorageError {
+pub(crate) enum OwnershipBackendError {
     #[error("ownership storage is temporarily unavailable")]
     Unavailable,
     #[error("ownership storage operation failed")]
@@ -174,51 +207,48 @@ pub enum OwnershipStorageError {
 }
 
 #[async_trait]
-pub trait NodeLeaseStorage: Send + Sync + 'static {
+pub(crate) trait OwnershipBackend: Send + Sync + 'static {
     async fn acquire_node_lease(
         &self,
         lease: NodeLease,
-    ) -> Result<LeaseMutation, OwnershipStorageError>;
+    ) -> Result<LeaseMutation, OwnershipBackendError>;
 
     async fn read_node_lease(
         &self,
         session_id: &NodeSessionId,
-    ) -> Result<Option<VersionedNodeLease>, OwnershipStorageError>;
+    ) -> Result<Option<VersionedNodeLease>, OwnershipBackendError>;
 
-    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipStorageError>;
+    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipBackendError>;
 
     async fn renew_node_lease(
         &self,
         lease: NodeLease,
         etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError>;
+    ) -> Result<LeaseMutation, OwnershipBackendError>;
 
     async fn release_node_lease(
         &self,
         session_id: &NodeSessionId,
         etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError>;
-}
+    ) -> Result<LeaseMutation, OwnershipBackendError>;
 
-#[async_trait]
-pub trait ActorOwnerStorage: Send + Sync + 'static {
     async fn read_actor_owner(
         &self,
         address: &ActorAddress,
-    ) -> Result<Option<VersionedActorOwnerRecord>, OwnershipStorageError>;
+    ) -> Result<Option<VersionedActorOwnerRecord>, OwnershipBackendError>;
 
     async fn claim_actor_owner(
         &self,
         address: &ActorAddress,
         record: ActorOwnerRecord,
         etag: Option<&str>,
-    ) -> Result<LeaseMutation, OwnershipStorageError>;
+    ) -> Result<LeaseMutation, OwnershipBackendError>;
 
     async fn release_actor_owner(
         &self,
         address: &ActorAddress,
         current: &VersionedActorOwnerRecord,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         self.claim_actor_owner(
             address,
             ActorOwnerRecord::unowned(current.record.ownership_epoch),
@@ -226,30 +256,6 @@ pub trait ActorOwnerStorage: Send + Sync + 'static {
         )
         .await
     }
-}
-
-pub trait OwnershipStorage: NodeLeaseStorage + ActorOwnerStorage {}
-
-impl<T> OwnershipStorage for T where T: NodeLeaseStorage + ActorOwnerStorage {}
-
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum RuntimeStartError {
-    #[error(transparent)]
-    Build(#[from] BuildError),
-    #[error("Node ID must not be empty")]
-    InvalidNodeId,
-    #[error("advertised address must have a non-zero port")]
-    InvalidAdvertisedAddress,
-    #[error("lease timing is invalid")]
-    InvalidLeaseTiming,
-    #[error("the peer listener could not bind")]
-    BindFailed,
-    #[error("Node Lease is already owned")]
-    LeaseConflict,
-    #[error("Node Lease acquisition could not be confirmed")]
-    LeaseUnconfirmed,
-    #[error("ownership storage failed during startup")]
-    OwnershipStorage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,30 +289,30 @@ impl RuntimeSupervision {
     }
 }
 
-pub struct DistributedRuntimeBuilder<S> {
+pub(crate) struct ClusterStarter<S> {
     pub(crate) builder: RuntimeBuilder<S>,
-    pub(crate) config: DistributedRuntimeConfig,
-    pub(crate) storage: Arc<dyn OwnershipStorage>,
+    pub(crate) config: ClusterRuntimeConfig,
+    pub(crate) storage: Arc<dyn OwnershipBackend>,
 }
 
-impl<S> fmt::Debug for DistributedRuntimeBuilder<S> {
+impl<S> fmt::Debug for ClusterStarter<S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DistributedRuntimeBuilder")
+            .debug_struct("ClusterStarter")
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
 }
 
-impl<S> DistributedRuntimeBuilder<S>
+impl<S> ClusterStarter<S>
 where
     S: Send + Sync + 'static,
 {
-    pub async fn start(self) -> Result<Runtime<S>, RuntimeStartError> {
+    pub async fn start(self) -> Result<Runtime<S>, StartError> {
         self.builder.validate()?;
         let listener = tokio::net::TcpListener::bind(self.config.bind_address)
             .await
-            .map_err(|_| RuntimeStartError::BindFailed)?;
+            .map_err(|_| StartError::BindFailed)?;
         let session_id = NodeSessionId::generate();
         let lease = NodeLease {
             node_id: self.config.node_id.clone(),
@@ -330,11 +336,11 @@ where
             self.storage.acquire_node_lease(lease.clone()),
         )
         .await
-        .map_err(|_| RuntimeStartError::LeaseUnconfirmed)?
-        .map_err(|_| RuntimeStartError::OwnershipStorage)?;
+        .map_err(|_| StartError::LeaseUnconfirmed)?
+        .map_err(|_| StartError::OwnershipUnavailable)?;
         let etag = match acquired {
             LeaseMutation::Applied { etag } => etag,
-            LeaseMutation::ConditionalRejected => return Err(RuntimeStartError::LeaseConflict),
+            LeaseMutation::ConditionalRejected => return Err(StartError::LeaseConflict),
             LeaseMutation::Ambiguous(_) => {
                 let Some(etag) = confirm_node_lease(
                     self.storage.as_ref(),
@@ -344,22 +350,22 @@ where
                 )
                 .await
                 else {
-                    return Err(RuntimeStartError::LeaseUnconfirmed);
+                    return Err(StartError::LeaseUnconfirmed);
                 };
                 etag
             }
         };
 
         let (termination_sender, termination_receiver) = watch::channel(None);
-        let authority = Arc::new(__private::NodeAuthority::new(
+        let authority = Arc::new(NodeAuthority::new(
             authority_started,
             self.config.lease_timing.ttl,
             termination_sender,
         ));
         if !authority.is_valid() {
-            return Err(RuntimeStartError::LeaseUnconfirmed);
+            return Err(StartError::LeaseUnconfirmed);
         }
-        let distributed = __private::DistributedContext::new(
+        let cluster = ClusterRouter::new(
             self.storage.clone(),
             self.config.node_id.clone(),
             session_id,
@@ -368,9 +374,9 @@ where
         );
         let runtime = self
             .builder
-            .build_with_authority(Some(authority.clone()), Some(distributed))?;
+            .build_with_authority(Some(authority.clone()), Some(cluster))?;
         let peer = runtime.spawn_peer(listener);
-        let renewal = __private::spawn_lease_renewal(
+        let renewal = spawn_lease_renewal(
             runtime.inner.clone(),
             authority,
             self.storage,
@@ -378,12 +384,12 @@ where
             etag,
             self.config.lease_timing,
         );
-        Ok(runtime.with_distributed_tasks(peer, renewal, termination_receiver))
+        Ok(runtime.with_cluster_tasks(peer, renewal, termination_receiver))
     }
 }
 
 pub(crate) async fn confirm_node_lease(
-    storage: &dyn OwnershipStorage,
+    storage: &dyn OwnershipBackend,
     expected: &NodeLease,
     deadline: tokio::time::Instant,
     operation_timeout: Duration,

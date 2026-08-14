@@ -133,9 +133,10 @@ async fn lifecycle_failures_emit_identity_and_category_without_command_payloads(
         .with_writer(captured.clone())
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
-    let runtime = RuntimeBuilder::new(())
+    let runtime = RuntimeBuilder::local(())
         .register::<FailingActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let actor = runtime
         .actor_ref::<FailingActor>(ActorId::from("actor-42"))
@@ -165,9 +166,10 @@ async fn successful_activation_and_shutdown_deactivation_are_traced() {
         .with_writer(captured.clone())
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
-    let runtime = RuntimeBuilder::new(())
+    let runtime = RuntimeBuilder::local(())
         .register::<LifecycleActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let actor = runtime
         .actor_ref::<LifecycleActor>(ActorId::from("lifecycle-1"))
@@ -195,12 +197,13 @@ async fn important_failure_events_have_structured_tracing_fields() {
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let panic_runtime = RuntimeBuilder::new(FailureState {
+    let panic_runtime = RuntimeBuilder::local(FailureState {
         entered: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
     })
     .register::<PanicActor>()
-    .build()
+    .start()
+    .await
     .unwrap();
     let panic_actor = panic_runtime
         .actor_ref::<PanicActor>(ActorId::from("panic-1"))
@@ -212,11 +215,12 @@ async fn important_failure_events_have_structured_tracing_fields() {
         entered: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
     };
-    let idle_runtime = RuntimeBuilder::new(idle_state.clone())
+    let idle_runtime = RuntimeBuilder::local(idle_state.clone())
         .idle_timeout(Duration::from_secs(1))
         .deactivation_timeout(Duration::from_secs(1))
         .register::<DeactivationTimeoutActor>()
-        .build()
+        .start()
+        .await
         .unwrap();
     let idle_actor = idle_runtime
         .actor_ref::<DeactivationTimeoutActor>(ActorId::from("idle-timeout-1"))
@@ -232,10 +236,11 @@ async fn important_failure_events_have_structured_tracing_fields() {
         entered: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
     };
-    let shutdown_runtime = RuntimeBuilder::new(shutdown_state.clone())
+    let shutdown_runtime = RuntimeBuilder::local(shutdown_state.clone())
         .shutdown_timeout(Duration::from_secs(1))
         .register::<ShutdownTimeoutActor>()
-        .build()
+        .start()
+        .await
         .unwrap();
     let shutdown_actor = shutdown_runtime
         .actor_ref::<ShutdownTimeoutActor>(ActorId::from("shutdown-timeout-1"))

@@ -1,11 +1,11 @@
-# Proposed distributed runtime semantics
+# Distributed runtime semantics
 
-本文记录 Issue #8 对应的下一 distributed vertical slice。它是尚未实现的目标语义，不是当前版本已经提供的保证；当前实现仍以 `runtime-semantics.md` 为准。
+本文记录当前已交付的 distributed runtime 语义。它建立在 `runtime-semantics.md` 的 Actor 执行与生命周期语义之上，并补充集群 authority、路由、传输和 stateless Availability Failover 边界。
 
 ## Product boundary
 
 - CoActor 保持嵌入 consumer 进程的 Rust library，不要求独立 control plane。
-- production runtime 必须显式配置 distributed dependencies；仅进程内执行保留为测试能力。
+- consumer 必须显式选择 local 或 cluster mode；cluster mode 必须完整配置 distributed dependencies，不能静默退化为 local mode。
 - caller 继续只按 Actor Address 使用 typed Actor Ref，Node location 对业务 API 透明。
 - Node 间使用 Tonic gRPC 的通用 Invoke boundary；command payload、reply 与业务错误使用显式 Protobuf message。
 - consumer 负责业务 Protobuf schema 与 method rename 的 rolling-upgrade 兼容。
@@ -56,8 +56,8 @@
 
 ## Verification boundary
 
-- ownership protocol 以一个可替换的 high-level storage seam 做确定性测试；fake 可控制 ETag、CAS race、clock、response loss、ambiguous completion 与 lease expiry。
+- ownership protocol 通过 crate-private backend seam 做确定性测试；fake 可控制 ETag、CAS race、clock、response loss、ambiguous completion 与 lease expiry，该 seam 不是 consumer API。
 - 最高层验收以多个真实 CoActor runtime、loopback gRPC endpoint 与共享 ownership storage 实现运行 typed Actor Ref 调用。
 - AWS adapter 使用本地 HTTP contract server 验证 conditional headers、ETag、错误分类与 SDK retry 行为。
-- LocalStack 是 CI 必选的对象存储集成环境；MinIO 只可作为可选 smoke test，不属于支持保证。
+- S3-compatible local endpoint 可用于集成验证，但兼容实现不替代真实 AWS qualification。
 - real AWS qualification suite 默认不运行，是首次生产发布条件。在其通过前只能表述为“面向 AWS S3 语义设计”。

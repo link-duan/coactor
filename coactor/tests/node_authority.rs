@@ -7,18 +7,17 @@ use std::{
 
 use async_trait::async_trait;
 use coactor::{
-    ActorId, ActorOwnerStorage, AmbiguousMutation, CommandContext, DistributedRuntimeConfig,
-    LeaseMutation, LeaseTiming, NodeLease, NodeLeaseStorage, NodeSessionId, OwnershipStorageError,
-    RuntimeBuilder, RuntimeStartError, RuntimeTerminationReason, SendError, VersionedNodeLease,
-    actor,
+    ActorId, AmbiguousMutation, ClusterRuntimeConfig, CommandContext, LeaseMutation, LeaseTiming,
+    NodeLease, NodeSessionId, OwnershipBackend, OwnershipBackendError, RuntimeBuilder,
+    RuntimeTerminationReason, SendError, StartError, VersionedNodeLease, actor,
 };
 use tokio::sync::Notify;
 
 #[derive(Default)]
 struct FakeLeaseStorage {
-    acquire: Mutex<VecDeque<Result<LeaseMutation, OwnershipStorageError>>>,
-    renew: Mutex<VecDeque<Result<LeaseMutation, OwnershipStorageError>>>,
-    read: Mutex<VecDeque<Result<Option<VersionedNodeLease>, OwnershipStorageError>>>,
+    acquire: Mutex<VecDeque<Result<LeaseMutation, OwnershipBackendError>>>,
+    renew: Mutex<VecDeque<Result<LeaseMutation, OwnershipBackendError>>>,
+    read: Mutex<VecDeque<Result<Option<VersionedNodeLease>, OwnershipBackendError>>>,
     confirm_latest_acquire: Mutex<bool>,
     confirm_latest_renewal: Mutex<bool>,
     acquired: Mutex<Vec<NodeLease>>,
@@ -30,12 +29,12 @@ struct FakeLeaseStorage {
 }
 
 #[async_trait]
-impl ActorOwnerStorage for FakeLeaseStorage {
+impl OwnershipBackend for FakeLeaseStorage {
     async fn read_actor_owner(
         &self,
         _address: &coactor::ActorAddress,
-    ) -> Result<Option<coactor::VersionedActorOwnerRecord>, OwnershipStorageError> {
-        Err(OwnershipStorageError::Failed)
+    ) -> Result<Option<coactor::VersionedActorOwnerRecord>, OwnershipBackendError> {
+        Err(OwnershipBackendError::Failed)
     }
 
     async fn claim_actor_owner(
@@ -43,17 +42,14 @@ impl ActorOwnerStorage for FakeLeaseStorage {
         _address: &coactor::ActorAddress,
         _record: coactor::ActorOwnerRecord,
         _etag: Option<&str>,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
-        Err(OwnershipStorageError::Failed)
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
+        Err(OwnershipBackendError::Failed)
     }
-}
 
-#[async_trait]
-impl NodeLeaseStorage for FakeLeaseStorage {
     async fn acquire_node_lease(
         &self,
         lease: NodeLease,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         self.acquired.lock().unwrap().push(lease);
         let block = self.acquire_block.lock().unwrap().clone();
         if let Some(block) = block {
@@ -71,7 +67,7 @@ impl NodeLeaseStorage for FakeLeaseStorage {
     async fn read_node_lease(
         &self,
         _session_id: &NodeSessionId,
-    ) -> Result<Option<VersionedNodeLease>, OwnershipStorageError> {
+    ) -> Result<Option<VersionedNodeLease>, OwnershipBackendError> {
         *self.reads.lock().unwrap() += 1;
         if let Some(result) = self.read.lock().unwrap().pop_front() {
             return result;
@@ -95,7 +91,7 @@ impl NodeLeaseStorage for FakeLeaseStorage {
         Ok(None)
     }
 
-    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipStorageError> {
+    async fn list_node_leases(&self) -> Result<Vec<VersionedNodeLease>, OwnershipBackendError> {
         Ok(Vec::new())
     }
 
@@ -103,7 +99,7 @@ impl NodeLeaseStorage for FakeLeaseStorage {
         &self,
         lease: NodeLease,
         etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         self.renewed.lock().unwrap().push((lease, etag.to_owned()));
         let block = self.renew_block.lock().unwrap().clone();
         if let Some(block) = block {
@@ -122,7 +118,7 @@ impl NodeLeaseStorage for FakeLeaseStorage {
         &self,
         session_id: &NodeSessionId,
         etag: &str,
-    ) -> Result<LeaseMutation, OwnershipStorageError> {
+    ) -> Result<LeaseMutation, OwnershipBackendError> {
         self.released
             .lock()
             .unwrap()
@@ -174,8 +170,8 @@ fn fast_timing() -> LeaseTiming {
     }
 }
 
-fn config() -> DistributedRuntimeConfig {
-    DistributedRuntimeConfig::new(
+fn config() -> ClusterRuntimeConfig {
+    ClusterRuntimeConfig::new(
         "node-a",
         "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
         "127.0.0.1:41001".parse::<SocketAddr>().unwrap(),
@@ -186,9 +182,9 @@ fn config() -> DistributedRuntimeConfig {
 fn distributed_runtime_configuration_is_validated_before_startup() {
     let storage = Arc::new(FakeLeaseStorage::default());
 
-    let empty_id = RuntimeBuilder::new(())
-        .distributed(
-            DistributedRuntimeConfig::new(
+    let empty_id = RuntimeBuilder::local(())
+        .cluster_with_backend(
+            ClusterRuntimeConfig::new(
                 " ",
                 "127.0.0.1:0".parse().unwrap(),
                 "127.0.0.1:41001".parse().unwrap(),
@@ -196,11 +192,11 @@ fn distributed_runtime_configuration_is_validated_before_startup() {
             storage.clone(),
         )
         .unwrap_err();
-    assert_eq!(empty_id, RuntimeStartError::InvalidNodeId);
+    assert_eq!(empty_id, StartError::InvalidNodeId);
 
-    let missing_advertised_port = RuntimeBuilder::new(())
-        .distributed(
-            DistributedRuntimeConfig::new(
+    let missing_advertised_port = RuntimeBuilder::local(())
+        .cluster_with_backend(
+            ClusterRuntimeConfig::new(
                 "node-a",
                 "127.0.0.1:0".parse().unwrap(),
                 "127.0.0.1:0".parse().unwrap(),
@@ -210,11 +206,11 @@ fn distributed_runtime_configuration_is_validated_before_startup() {
         .unwrap_err();
     assert_eq!(
         missing_advertised_port,
-        RuntimeStartError::InvalidAdvertisedAddress
+        StartError::InvalidAdvertisedAddress
     );
 
-    let invalid_timing = RuntimeBuilder::new(())
-        .distributed(
+    let invalid_timing = RuntimeBuilder::local(())
+        .cluster_with_backend(
             config().lease_timing(LeaseTiming {
                 ttl: Duration::from_secs(1),
                 renewal_interval: Duration::from_secs(1),
@@ -224,40 +220,35 @@ fn distributed_runtime_configuration_is_validated_before_startup() {
             storage,
         )
         .unwrap_err();
-    assert_eq!(invalid_timing, RuntimeStartError::InvalidLeaseTiming);
+    assert_eq!(invalid_timing, StartError::InvalidLeaseTiming);
 }
 
 #[tokio::test]
 async fn invalid_runtime_configuration_does_not_acquire_node_authority() {
     let storage = Arc::new(FakeLeaseStorage::default());
-    let result = RuntimeBuilder::new(())
+    let result = RuntimeBuilder::local(())
         .mailbox_capacity(0)
-        .distributed(config(), storage.clone())
+        .cluster_with_backend(config(), storage.clone())
         .unwrap()
         .start()
         .await;
 
-    assert!(matches!(
-        result,
-        Err(RuntimeStartError::Build(
-            coactor::BuildError::InvalidMailboxCapacity
-        ))
-    ));
+    assert!(matches!(result, Err(StartError::InvalidMailboxCapacity)));
     assert!(storage.acquired.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn startup_acquires_a_unique_node_session_before_returning_a_runtime() {
     let first_storage = Arc::new(FakeLeaseStorage::default());
-    let first = RuntimeBuilder::new(())
-        .distributed(config(), first_storage.clone())
+    let first = RuntimeBuilder::local(())
+        .cluster_with_backend(config(), first_storage.clone())
         .unwrap()
         .start()
         .await
         .unwrap();
     let second_storage = Arc::new(FakeLeaseStorage::default());
-    let second = RuntimeBuilder::new(())
-        .distributed(config(), second_storage.clone())
+    let second = RuntimeBuilder::local(())
+        .cluster_with_backend(config(), second_storage.clone())
         .unwrap()
         .start()
         .await
@@ -278,10 +269,10 @@ async fn startup_acquires_a_unique_node_session_before_returning_a_runtime() {
 async fn node_lease_renewal_publishes_current_capacity_sample() {
     let storage = Arc::new(FakeLeaseStorage::default());
     let state = BlockingState::default();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .max_active_actors(1)
         .register::<BlockingActor>()
-        .distributed(config().lease_timing(fast_timing()), storage.clone())
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await
@@ -323,8 +314,8 @@ async fn an_ambiguous_acquire_requires_exact_bounded_read_back() {
             AmbiguousMutation::ResponseLost,
         )));
     *confirmed.confirm_latest_acquire.lock().unwrap() = true;
-    let runtime = RuntimeBuilder::new(())
-        .distributed(config().lease_timing(fast_timing()), confirmed.clone())
+    let runtime = RuntimeBuilder::local(())
+        .cluster_with_backend(config().lease_timing(fast_timing()), confirmed.clone())
         .unwrap()
         .start()
         .await
@@ -341,12 +332,12 @@ async fn an_ambiguous_acquire_requires_exact_bounded_read_back() {
             AmbiguousMutation::ResponseLost,
         )));
     assert!(matches!(
-        RuntimeBuilder::new(())
-            .distributed(config().lease_timing(fast_timing()), rejected.clone())
+        RuntimeBuilder::local(())
+            .cluster_with_backend(config().lease_timing(fast_timing()), rejected.clone())
             .unwrap()
             .start()
             .await,
-        Err(RuntimeStartError::LeaseUnconfirmed)
+        Err(StartError::LeaseUnconfirmed)
     ));
     assert_eq!(*rejected.reads.lock().unwrap(), 3);
 }
@@ -354,8 +345,8 @@ async fn an_ambiguous_acquire_requires_exact_bounded_read_back() {
 #[tokio::test]
 async fn graceful_shutdown_reports_shutdown_without_terminating_the_host() {
     let storage = Arc::new(FakeLeaseStorage::default());
-    let runtime = RuntimeBuilder::new(())
-        .distributed(config(), storage.clone())
+    let runtime = RuntimeBuilder::local(())
+        .cluster_with_backend(config(), storage.clone())
         .unwrap()
         .start()
         .await
@@ -383,8 +374,8 @@ async fn graceful_shutdown_releases_with_the_latest_renewed_etag() {
         .push_back(Ok(LeaseMutation::Applied {
             etag: "lease-2".to_owned(),
         }));
-    let runtime = RuntimeBuilder::new(())
-        .distributed(config().lease_timing(fast_timing()), storage.clone())
+    let runtime = RuntimeBuilder::local(())
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await
@@ -405,7 +396,7 @@ async fn a_temporary_renewal_failure_retries_while_local_authority_remains_valid
         .renew
         .lock()
         .unwrap()
-        .push_back(Err(OwnershipStorageError::Unavailable));
+        .push_back(Err(OwnershipBackendError::Unavailable));
     storage
         .renew
         .lock()
@@ -413,8 +404,8 @@ async fn a_temporary_renewal_failure_retries_while_local_authority_remains_valid
         .push_back(Ok(LeaseMutation::Applied {
             etag: "lease-2".to_owned(),
         }));
-    let runtime = RuntimeBuilder::new(())
-        .distributed(config().lease_timing(fast_timing()), storage.clone())
+    let runtime = RuntimeBuilder::local(())
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await
@@ -451,10 +442,10 @@ async fn repeated_temporary_failures_fence_at_the_original_monotonic_deadline() 
             .renew
             .lock()
             .unwrap()
-            .push_back(Err(OwnershipStorageError::Unavailable));
+            .push_back(Err(OwnershipBackendError::Unavailable));
     }
-    let runtime = RuntimeBuilder::new(())
-        .distributed(config().lease_timing(fast_timing()), storage.clone())
+    let runtime = RuntimeBuilder::local(())
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await
@@ -491,9 +482,9 @@ async fn conditional_lease_loss_fences_pending_and_new_actor_calls() {
         .unwrap()
         .push_back(Ok(LeaseMutation::ConditionalRejected));
     let state = BlockingState::default();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .register::<BlockingActor>()
-        .distributed(config().lease_timing(fast_timing()), storage.clone())
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await
@@ -526,9 +517,9 @@ async fn fencing_supersedes_a_pending_business_error_reply() {
         .unwrap()
         .push_back(Ok(LeaseMutation::ConditionalRejected));
     let state = BlockingState::default();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .register::<BlockingActor>()
-        .distributed(config().lease_timing(fast_timing()), storage)
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage)
         .unwrap()
         .start()
         .await
@@ -552,8 +543,8 @@ async fn fencing_supersedes_a_pending_business_error_reply() {
 #[tokio::test(start_paused = true)]
 async fn a_process_pause_past_the_monotonic_deadline_fences_before_renewing() {
     let storage = Arc::new(FakeLeaseStorage::default());
-    let runtime = RuntimeBuilder::new(())
-        .distributed(config().lease_timing(fast_timing()), storage.clone())
+    let runtime = RuntimeBuilder::local(())
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await
@@ -578,8 +569,8 @@ async fn an_ambiguous_renewal_is_confirmed_by_exact_read_back() {
             AmbiguousMutation::ResponseLost,
         )));
     *storage.confirm_latest_renewal.lock().unwrap() = true;
-    let runtime = RuntimeBuilder::new(())
-        .distributed(config().lease_timing(fast_timing()), storage.clone())
+    let runtime = RuntimeBuilder::local(())
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await
@@ -600,8 +591,8 @@ async fn a_delayed_renewal_response_cannot_extend_authority_past_its_deadline() 
     let storage = Arc::new(FakeLeaseStorage::default());
     let release = Arc::new(Notify::new());
     *storage.renew_block.lock().unwrap() = Some(release.clone());
-    let runtime = RuntimeBuilder::new(())
-        .distributed(config().lease_timing(fast_timing()), storage.clone())
+    let runtime = RuntimeBuilder::local(())
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await
@@ -625,8 +616,8 @@ async fn a_delayed_acquire_response_cannot_start_with_expired_authority() {
     let release = Arc::new(Notify::new());
     *storage.acquire_block.lock().unwrap() = Some(release);
     let startup = tokio::spawn(
-        RuntimeBuilder::new(())
-            .distributed(config().lease_timing(fast_timing()), storage)
+        RuntimeBuilder::local(())
+            .cluster_with_backend(config().lease_timing(fast_timing()), storage)
             .unwrap()
             .start(),
     );
@@ -635,7 +626,7 @@ async fn a_delayed_acquire_response_cannot_start_with_expired_authority() {
     tokio::time::advance(Duration::from_secs(9)).await;
     assert!(matches!(
         startup.await.unwrap(),
-        Err(RuntimeStartError::LeaseUnconfirmed)
+        Err(StartError::LeaseUnconfirmed)
     ));
 }
 
@@ -649,8 +640,8 @@ async fn unreconciled_renewal_ambiguity_is_bounded_then_fences() {
         .push_back(Ok(LeaseMutation::Ambiguous(
             AmbiguousMutation::ResponseLost,
         )));
-    let runtime = RuntimeBuilder::new(())
-        .distributed(config().lease_timing(fast_timing()), storage.clone())
+    let runtime = RuntimeBuilder::local(())
+        .cluster_with_backend(config().lease_timing(fast_timing()), storage.clone())
         .unwrap()
         .start()
         .await

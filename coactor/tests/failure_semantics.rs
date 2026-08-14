@@ -79,7 +79,7 @@ impl LifecycleActor {
     }
 }
 
-fn runtime() -> (coactor::Runtime<AppState>, AppState) {
+async fn runtime() -> (coactor::Runtime<AppState>, AppState) {
     let state = AppState {
         activation_attempts: Arc::new(AtomicUsize::new(0)),
         activation_entered: Arc::new(Notify::new()),
@@ -87,17 +87,18 @@ fn runtime() -> (coactor::Runtime<AppState>, AppState) {
         panic_entered: Arc::new(Notify::new()),
         panic_release: Arc::new(Notify::new()),
     };
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .mailbox_capacity(4)
         .register::<LifecycleActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     (runtime, state)
 }
 
 #[tokio::test]
 async fn activation_gates_queued_commands_and_a_failure_is_retryable() {
-    let (runtime, state) = runtime();
+    let (runtime, state) = runtime().await;
     let actor = runtime
         .actor_ref::<LifecycleActor>(ActorId::from("activation"))
         .expect("registered Actor Type");
@@ -139,7 +140,7 @@ async fn activation_gates_queued_commands_and_a_failure_is_retryable() {
 
 #[tokio::test]
 async fn handler_panic_stops_current_and_queued_commands_then_allows_fresh_activation() {
-    let (runtime, state) = runtime();
+    let (runtime, state) = runtime().await;
     state.activation_attempts.store(1, Ordering::SeqCst);
     let actor = runtime
         .actor_ref::<LifecycleActor>(ActorId::from("panic"))
@@ -181,10 +182,11 @@ async fn activation_failure_releases_runtime_capacity() {
             panic_entered: Arc::new(Notify::new()),
             panic_release: Arc::new(Notify::new()),
         };
-        let runtime = RuntimeBuilder::new(state.clone())
+        let runtime = RuntimeBuilder::local(state.clone())
             .max_active_actors(1)
             .register::<LifecycleActor>()
-            .build()
+            .start()
+            .await
             .expect("runtime should build");
         (runtime, state)
     };
@@ -215,10 +217,11 @@ async fn activation_panic_does_not_leave_a_closed_route_registered() {
         panic_entered: Arc::new(Notify::new()),
         panic_release: Arc::new(Notify::new()),
     };
-    let runtime = RuntimeBuilder::new(state)
+    let runtime = RuntimeBuilder::local(state)
         .max_active_actors(1)
         .register::<PanickingActivationActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let actor = runtime
         .actor_ref::<PanickingActivationActor>(ActorId::from("panic-once"))

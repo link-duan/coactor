@@ -67,10 +67,11 @@ fn state() -> AppState {
 #[tokio::test]
 async fn counter_ref_covers_activation_serialization_overload_and_failure() {
     let state = state();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .mailbox_capacity(1)
         .register::<CounterActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let counter = runtime
         .actor_ref::<CounterActor>(ActorId::from("hot"))
@@ -101,11 +102,12 @@ async fn counter_ref_covers_activation_serialization_overload_and_failure() {
 #[tokio::test(start_paused = true)]
 async fn counter_ref_covers_capacity_passivation_reset_and_shutdown() {
     let state = state();
-    let runtime = RuntimeBuilder::new(state.clone())
+    let runtime = RuntimeBuilder::local(state.clone())
         .max_active_actors(1)
         .idle_timeout(Duration::from_secs(5))
         .register::<CounterActor>()
-        .build()
+        .start()
+        .await
         .expect("runtime should build");
     let first = runtime
         .actor_ref::<CounterActor>(ActorId::from("first"))

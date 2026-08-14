@@ -1,4 +1,21 @@
-use super::*;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+use parking_lot::Mutex;
+use tokio::sync::{oneshot, watch};
+use tokio_stream::wrappers::TcpListenerStream;
+
+use super::transport::PeerService;
+use super::{confirm_node_lease, wall_time_millis};
+use crate::{
+    __macro::RuntimeInner, LeaseMutation, LeaseTiming, NodeLease, NodeSessionId, OwnershipBackend,
+    RuntimeTermination, RuntimeTerminationReason, peer_protocol,
+};
 
 pub struct NodeAuthority {
     valid: AtomicBool,
@@ -59,19 +76,19 @@ pub struct RenewalTask {
 }
 
 struct RenewalExit {
-    storage: Arc<dyn OwnershipStorage>,
+    storage: Arc<dyn OwnershipBackend>,
     session_id: NodeSessionId,
     etag: String,
     release: bool,
 }
 
-pub struct DistributedTasks {
+pub struct ClusterTasks {
     pub peer: PeerTask,
     pub renewal: RenewalTask,
     pub termination: watch::Receiver<Option<RuntimeTermination>>,
 }
 
-impl DistributedTasks {
+impl ClusterTasks {
     pub async fn shutdown(self) {
         let _ = self.renewal.shutdown.send(());
         let _ = self.peer.shutdown.send(());
@@ -107,7 +124,7 @@ where
 pub fn spawn_lease_renewal<S>(
     runtime: Arc<RuntimeInner<S>>,
     authority: Arc<NodeAuthority>,
-    storage: Arc<dyn OwnershipStorage>,
+    storage: Arc<dyn OwnershipBackend>,
     mut lease: NodeLease,
     mut etag: String,
     timing: LeaseTiming,

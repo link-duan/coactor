@@ -35,8 +35,5 @@ impl Counter {
 }
 
 fn main() {
-    let _runtime = RuntimeBuilder::new(())
-        .register::<Counter>()
-        .build()
-        .unwrap();
+    let _builder = RuntimeBuilder::local(()).register::<Counter>();
 }

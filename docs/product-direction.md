@@ -12,20 +12,20 @@
 - CoActor 自己定义并掌控 Actor 语义、生命周期、路由以及 ownership/fencing 正确性边界。
 - 共识算法、数据库和通用网络传输优先复用成熟基础设施，通过明确接口接入。
 - 外部基础设施的能力不能未经验证就表述为 CoActor 提供的保证。
-- 跨节点 ownership、故障恢复和迁移是 CoActor 的长期核心能力。
-- 这些能力按单机生命周期、durable recovery、双节点 ownership/fencing、迁移逐步验证，不要求首个切片同时完成。
+- 跨节点 ownership/fencing 与 Availability Failover 已交付；durable Recovery 和 Migration 是后续核心能力。
+- 这些能力按单机生命周期、双节点 ownership/fencing、durable Recovery、Migration 逐步验证。
 - 单机 Active Actor registry、进程存活和 handler reply 不得表述为全局 ownership、durable delivery 或 durable ACK。
-- 下一 distributed slice 采用纯嵌入式 Node，不要求独立 CoActor control-plane、service 或 binary。
+- distributed runtime 采用纯嵌入式 Node，不要求独立 CoActor control-plane、service 或 binary。
 - 生产方向以位置透明的跨节点 Actor Ref 为入口；Node 间使用 gRPC 与 Protobuf command payload，consumer 负责其业务 schema 兼容。
 - distributed ownership 采用 Node Lease 与 Actor Owner Record 两层模型：Node Lease 证明 Node Session 资格，Actor Owner Record 通过 CAS 绑定 Actor Address、Node Session 与 Ownership Epoch。
-- 下一 distributed slice 不提供 CoActor 状态持久化或 Recovery；Owner 失效后由新 Owner 从空状态启动，该能力称为 Availability Failover。
+- 当前 distributed runtime 不提供 CoActor 状态持久化或 Recovery；Owner 失效后由新 Owner 从空状态启动，该能力称为 Availability Failover。
 - Node self-fence 是 runtime-wide fail-stop，但 CoActor 作为 library 不退出宿主进程；consumer 通过 runtime supervision 结果决定进程处置。
 - 外部数据库写、HTTP 调用等 consumer side effect 不在 CoActor fencing 保证内。
-- production runtime 必须显式配置 distributed dependencies；本地执行保留为明确的测试能力，不允许生产配置缺失时静默退化。
+- consumer 必须显式选择 local 或 cluster mode；cluster mode 必须完整配置 distributed dependencies，不能在配置缺失时静默退化为 local mode。
 
 ## Post-MVP candidate design
 
-以下内容是已经讨论并接受的后续方向，但因首版已明确排除状态存储和分布式能力，仍允许在真正实施前根据验证结果调整。它们不是首版 API、实现要求或保证。
+以下内容是已经讨论并接受的持久化后续方向，仍允许在真正实施前根据验证结果调整。它们不是当前 API、实现要求或保证。
 
 - CoActor 提供 Actor 可使用的 Actor-scoped KV API，不规定 consumer 在 KV 中保存 journal、snapshot 或其他业务数据模型。
 - consumer 定义业务状态、持久记录 schema 与序列化；后续首个 persistence slice 暂不提供 durable ACK 或 `ensure_durable()`。
@@ -34,10 +34,11 @@
 - consumer 绕过 CoActor Persistence API 的外部写不属于 CoActor 的 fencing 正确性保证范围。
 - Persistence API 的底层持久化模型面向对象存储。
 - consumer 只看到 Actor-scoped KV，不传入 Actor Address，也不接触物理 bucket、object key 或 storage address；runtime 负责命名空间映射。
-- ownership provider 必须可替换；项目提供 S3 ownership provider 并将其作为默认实现方向。
-- 默认 S3 ownership provider 以 S3 conditional write/CAS 作为 ownership 与 epoch 分配的权威协调点，不依赖额外 coordinator。
+- cluster mode 的公开 API 绑定内置 S3 Ownership Authority，不向 consumer 暴露可替换 provider。
+- runtime 内部保留最小 backend seam，仅用于协议实现隔离和 deterministic tests，不构成公共扩展点。
+- S3 Ownership Authority 以 conditional write/CAS 作为 ownership 与 epoch 分配的权威协调点，不依赖额外 coordinator。
 - S3 默认方案采用组合安全模型：ownership CAS、node/owner self-fence、epoch-isolated Actor Store、异步持久化与明确定义的 Restore Cut。Durable ACK Gate 保留为更后续能力，普通 Handler Reply 不经过它。
-- 后续首个 distributed slice 按 Actor Address 独立管理 ownership；每个 Actor 在 S3 上对应一个 ownership object。
+- 当前 cluster mode 按 Actor Address 独立管理 ownership；每个 Actor 在 S3 上对应一个 ownership object。
 - 选择 Per-Actor ownership 是为了简化首个协议并支持单 Actor 独立迁移，暂时接受 ownership 对象和续租请求随 Active Actor 数量增长的成本。
 - ownership object 只保存 owner、epoch、lease 等控制信息；Actor Store 使用独立 state object。
 - 每个 Active Actor 使用本地嵌入式 KV 引擎操作一个本地单文件 Actor Store。
@@ -64,9 +65,9 @@
 - 本地 KV 引擎负责 KV 索引、事务与 batch 原子性；对象存储层不再把每个 KV mutation 表示为独立 commit object。
 - CoActor 不把 Active Actor 内存当作唯一状态真源，也不强制所有负载采用同一种业务状态模型。
 
-## Next distributed slice
+## Delivered distributed slice
 
-- AWS S3 conditional write/CAS 是 Node Lease 与 Actor Owner Record 的目标 authority；实现前先以 deterministic fake、AWS SDK HTTP contract tests 与 LocalStack 验证协议和 adapter。
+- AWS S3 conditional write/CAS 是 Node Lease 与 Actor Owner Record 的内置 authority；协议与 adapter 通过 deterministic fake、AWS SDK HTTP contract tests 与 S3-compatible local endpoint 验证。
 - 在真实 AWS qualification suite 通过前，项目只表述为“面向 AWS S3 语义设计”，不宣称已通过真实 AWS S3 验证；qualification 是首次生产发布条件，不是日常 CI 阻塞项。
 - lease 时序采用 celld 的务实基线：默认 TTL 10 秒、约每 TTL/3 续租、ownership 单操作 15 秒、peer connect 3 秒；部署要求正常 NTP，不宣称容忍任意时钟偏差。
 - Node ID 是运维标签；每次 runtime 启动必须产生唯一 Node Session ID，ownership authority 以 session 身份区分重叠运行的新旧进程。
@@ -80,7 +81,7 @@
 ## First version scope
 
 - 首个版本不引入状态存储、Actor-scoped KV、journal、snapshot、checkpoint 或 restore。
-- 首个版本不实现 distributed ownership、Ownership Epoch、fencing、故障转移或 migration；这些能力与状态恢复在后续阶段整体推进。
+- local mode 不实现 distributed ownership、Ownership Epoch、fencing 或故障转移；cluster mode 已提供这些能力，但仍不提供 durable Recovery 或 Migration。
 - Active Actor 的业务状态只存在于当前进程内；passivation、异常退出或进程重启后，同一 Actor 通过 `new(actor_id, Arc<AppState>)` 从空状态重新启动。
 - Handler Reply 只表示内存中的 command handling 完成，不具有 durable 含义。
 - 已讨论的 Actor Store、S3 state object、Restore Cut、Persistence Fault 与 `max_dirty_age` 均保留为后续版本候选设计，不属于首版实现或保证。

@@ -1,6 +1,7 @@
 [package]
 name = "coactor"
 version = "0.1.0"
+autotests = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -13,6 +14,7 @@ aws-sdk-s3.workspace = true
 aws-smithy-types.workspace = true
 coactor-macros = { path = "../coactor-macros" }
 futures-util.workspace = true
+hex.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 serde.workspace = true
@@ -36,3 +38,7 @@ trybuild = "1.0.105"
 [[example]]
 name = "counter"
 path = "examples/counter.rs"
+
+[[test]]
+name = "macro_ui"
+path = "tests/macro_ui.rs"

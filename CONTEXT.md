@@ -120,9 +120,9 @@ _Avoid_: Ownership loss, node-wide fence
 选定的历史 state object 存在但无法通过完整性、格式或 KV 文件校验时的 activation 失败状态；runtime 不自动回退到更早状态。
 _Avoid_: Empty state, first activation
 
-**Ownership Provider**:
-负责竞争、续持和释放 ownership，并产生单调 Ownership Epoch 的可替换实现。
-_Avoid_: Actor registry, service discovery
+**Ownership Authority**:
+由 runtime 掌控、负责竞争、续持和释放 ownership，并产生单调 Ownership Epoch 的共享权威。它是集群正确性边界，不是 consumer 可替换的插件 API。
+_Avoid_: Ownership Provider, Actor registry, service discovery
 
 **Node**:
 嵌入 CoActor runtime 并通过网络接收或转发 Command 的 consumer 进程运行位置；一个 Node 的长期运维身份与单次运行会话必须区分。

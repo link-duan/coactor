@@ -1,4 +1,4 @@
-# MVP runtime semantics
+# Local runtime semantics
 
 本文定义首个单进程 vertical slice 的可观察语义。未写在“当前保证”中的能力均不能从实现中推导出来。
 
@@ -80,7 +80,7 @@
 - command handler panic 会立即终止整个 Active Actor；当前及 mailbox 中已接纳但未处理的 command 返回 `ActorStopped`，不调用 deactivation lifecycle，并移除本地路由。后续 command 从空状态创建新实例；首版不重放或原地重启。
 - command handler 正常返回业务错误只结束当前 command；Active Actor 保持运行并继续消费 mailbox。runtime 不解释业务错误，也不据此重启或 passivate Actor。
 - idle passivation 后再次访问同一 Actor Address 也通过 `new(actor_id, Arc<AppState>)` 从空状态重新启动。
-- 当前不提供 exactly-once、at-least-once、跨节点单 writer、故障转移或迁移保证。
+- 本文描述的 local mode 不提供 exactly-once、at-least-once、跨节点 ownership、故障转移或迁移保证；cluster mode 的附加保证见 `distributed-runtime-semantics.md`。
 
 ## Graceful shutdown
 
@@ -90,11 +90,11 @@
 - 整个 shutdown 受全局 timeout 约束；超时后终止剩余 Active Actor，尚未完成的 command 返回 `ActorStopped`。
 - consumer 必须显式 await graceful shutdown。未调用 shutdown 而直接释放最后一个 runtime handle 属于 API 误用；首版不定义 drain、deactivation 或 pending reply 的结果，implementation 可以取消 tasks、记录错误或 panic，但不涉及 Rust memory-safety 意义上的 Undefined Behavior。
 
-## First-version boundary
+## Local-mode boundary
 
 - 每个 CoActor runtime 实例独立维护 Actor Address 到 Active Actor 的唯一映射；同一 runtime 内同一地址最多一个 Active Actor。
 - 同一进程可以创建多个 runtime，但它们不共享全局 registry，也不协调相同 Actor Address。
-- 首版没有 node identity、membership、placement、Ownership Provider、Ownership Epoch 或 self-fence。
+- local mode 没有 Node identity、placement、Ownership Authority、Ownership Epoch 或 self-fence；这些只由显式配置的 cluster mode 提供。
 - 进程内唯一 Active Actor 不能被解释为跨节点 ownership 保证。
 - 首版没有 Actor-scoped timer/tick；Actor 只由外部 method call 驱动，consumer 可自行使用 Tokio task 定时调用 Actor Ref。
 - CoActor 必须运行在 consumer 提供的 Tokio runtime 中；library 不创建隐藏线程或嵌套 runtime，只 spawn Actor tasks。graceful shutdown 由 consumer 显式调用并 await。
