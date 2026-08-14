@@ -78,7 +78,9 @@ jobs:
             --env MINIO_ROOT_PASSWORD=test-secret-key \
             minio/minio:latest server /data
           for attempt in $(seq 1 60); do
-            if curl --fail --silent http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+            if docker exec coactor-minio \
+              mc alias set ci http://127.0.0.1:9000 test-access-key test-secret-key >/dev/null 2>&1 \
+              && docker exec coactor-minio mc ready ci >/dev/null 2>&1; then
               exit 0
             fi
             sleep 1
