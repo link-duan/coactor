@@ -250,6 +250,9 @@ where
 
 pub(crate) mod command;
 pub(crate) mod core;
+pub(crate) mod lifecycle;
+pub(crate) mod route;
+pub(crate) mod shutdown;
 
 #[cfg(test)]
 pub(crate) mod testing {
