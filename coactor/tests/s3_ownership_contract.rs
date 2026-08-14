@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -13,11 +14,12 @@ use axum::{
     routing::any,
 };
 use coactor::{
-    ActorAddress, ActorId, ActorOwner, ActorOwnerRecord, AmbiguousMutation, LeaseMutation,
-    NodeLease, OwnershipBackend, OwnershipBackendError, RuntimeBuilder, S3OwnershipBackend,
-    S3OwnershipConfig, VersionedActorOwnerRecord, VersionedNodeLease, cluster::ClusterConfig,
+    ActorAddress, ActorId, ActorOwner, ActorOwnerRecord, AmbiguousMutation, CommandContext,
+    LeaseMutation, LeaseTiming, NodeLease, OwnershipBackend, OwnershipBackendError, RuntimeBuilder,
+    S3OwnershipBackend, S3OwnershipConfig, SendError, VersionedActorOwnerRecord,
+    VersionedNodeLease, actor, cluster::ClusterConfig,
 };
-use tokio::io::AsyncReadExt;
+use tokio::{io::AsyncReadExt, sync::Notify};
 
 #[derive(Clone, Debug)]
 struct CapturedRequest {
@@ -446,6 +448,47 @@ async fn aws_adapter_runs_the_actor_owner_contract_with_conditional_requests() {
 }
 
 #[tokio::test]
+async fn aws_adapter_keeps_actor_owner_conflicts_and_failures_distinct() {
+    let (endpoint, _, task) = contract_server([
+        response(
+            StatusCode::PRECONDITION_FAILED,
+            None,
+            "<Error><Code>PreconditionFailed</Code></Error>",
+        ),
+        response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            None,
+            "<Error><Code>InternalError</Code></Error>",
+        ),
+    ])
+    .await;
+    let storage = storage(endpoint);
+    let address = ActorAddress::new("room", ActorId::from("room-7"));
+    let owner = ActorOwnerRecord {
+        owner: Some(ActorOwner {
+            node_id: "node-a".to_owned(),
+            session_id: lease().session_id,
+        }),
+        ownership_epoch: 4,
+    };
+
+    assert_eq!(
+        storage
+            .claim_actor_owner(&address, owner.clone(), Some("\"stale\""))
+            .await
+            .unwrap(),
+        LeaseMutation::ConditionalRejected
+    );
+    assert_eq!(
+        storage
+            .claim_actor_owner(&address, owner, Some("\"current\""))
+            .await,
+        Err(OwnershipBackendError::Failed)
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn aws_adapter_lists_node_capacity_samples_under_the_node_prefix() {
     let current = lease();
     let listed = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>contract-prefix/nodes/session-a.json</Key></Contents></ListBucketResult>".to_owned();
@@ -690,5 +733,496 @@ async fn node_lease_behavior_contract_passes_for_memory_and_aws_adapters() {
     ])
     .await;
     assert_node_lease_behavior(&storage(endpoint)).await;
+    task.abort();
+}
+
+#[derive(Clone)]
+struct StoredObject {
+    body: Vec<u8>,
+    etag: String,
+}
+
+#[derive(Clone, Default)]
+struct StatefulS3 {
+    objects: Arc<Mutex<HashMap<String, StoredObject>>>,
+    next_etag: Arc<Mutex<u64>>,
+    dropped_put_responses: Arc<Mutex<HashMap<String, usize>>>,
+    put_counts: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl StatefulS3 {
+    fn next_etag(&self) -> String {
+        let mut next = self.next_etag.lock().unwrap();
+        *next += 1;
+        format!("\"stateful-{next}\"")
+    }
+
+    fn drop_next_put_response(&self, key: &str) {
+        *self
+            .dropped_put_responses
+            .lock()
+            .unwrap()
+            .entry(key.to_owned())
+            .or_default() += 1;
+    }
+
+    fn take_dropped_put_response(&self, key: &str) -> bool {
+        let mut responses = self.dropped_put_responses.lock().unwrap();
+        let Some(remaining) = responses.get_mut(key) else {
+            return false;
+        };
+        *remaining -= 1;
+        if *remaining == 0 {
+            responses.remove(key);
+        }
+        true
+    }
+
+    fn record_put(&self, key: &str) {
+        *self
+            .put_counts
+            .lock()
+            .unwrap()
+            .entry(key.to_owned())
+            .or_default() += 1;
+    }
+
+    fn put_count(&self, key: &str) -> usize {
+        self.put_counts
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+async fn stateful_s3_handle(
+    State(state): State<StatefulS3>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path();
+    let key = path
+        .strip_prefix("/lease-bucket/")
+        .unwrap_or_default()
+        .to_owned();
+
+    if parts.method == Method::GET && path == "/lease-bucket/" {
+        let prefix = parts
+            .uri
+            .query()
+            .and_then(|query| {
+                query.split('&').find_map(|part| {
+                    part.strip_prefix("prefix=")
+                        .map(|value| value.replace("%2F", "/"))
+                })
+            })
+            .unwrap_or_default();
+        let objects = state.objects.lock().unwrap();
+        let contents = objects
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .map(|key| format!("<Contents><Key>{key}</Key></Contents>"))
+            .collect::<String>();
+        return Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from(format!(
+                "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+            )))
+            .unwrap();
+    }
+
+    match parts.method {
+        Method::GET => match state.objects.lock().unwrap().get(&key).cloned() {
+            Some(object) => Response::builder()
+                .status(StatusCode::OK)
+                .header("etag", object.etag)
+                .body(Body::from(object.body))
+                .unwrap(),
+            None => Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from("<Error><Code>NoSuchKey</Code></Error>"))
+                .unwrap(),
+        },
+        Method::PUT => {
+            state.record_put(&key);
+            let body = to_bytes(body, usize::MAX).await.unwrap().to_vec();
+            let mut objects = state.objects.lock().unwrap();
+            let conditional_rejected = parts
+                .headers
+                .get("if-none-match")
+                .is_some_and(|value| value == "*" && objects.contains_key(&key))
+                || parts.headers.get("if-match").is_some_and(|expected| {
+                    objects
+                        .get(&key)
+                        .is_none_or(|current| current.etag.as_bytes() != expected.as_bytes())
+                });
+            if conditional_rejected {
+                return Response::builder()
+                    .status(StatusCode::PRECONDITION_FAILED)
+                    .body(Body::from("<Error><Code>PreconditionFailed</Code></Error>"))
+                    .unwrap();
+            }
+            let etag = state.next_etag();
+            objects.insert(
+                key.clone(),
+                StoredObject {
+                    body,
+                    etag: etag.clone(),
+                },
+            );
+            drop(objects);
+            if state.take_dropped_put_response(&key) {
+                panic!("programmable S3 endpoint dropped an applied PUT response");
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("etag", etag)
+                .body(Body::empty())
+                .unwrap()
+        }
+        Method::DELETE => {
+            let mut objects = state.objects.lock().unwrap();
+            let conditional_rejected = parts.headers.get("if-match").is_some_and(|expected| {
+                objects
+                    .get(&key)
+                    .is_none_or(|current| current.etag.as_bytes() != expected.as_bytes())
+            });
+            if conditional_rejected {
+                return Response::builder()
+                    .status(StatusCode::PRECONDITION_FAILED)
+                    .body(Body::from("<Error><Code>PreconditionFailed</Code></Error>"))
+                    .unwrap();
+            }
+            objects.remove(&key);
+            Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap()
+        }
+        _ => Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Body::empty())
+            .unwrap(),
+    }
+}
+
+async fn stateful_s3_server() -> (String, StatefulS3, tokio::task::JoinHandle<()>) {
+    let state = StatefulS3::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn({
+        let state = state.clone();
+        async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .fallback(any(stateful_s3_handle))
+                    .with_state(state),
+            )
+            .await
+            .unwrap()
+        }
+    });
+    (format!("http://{address}"), state, task)
+}
+
+struct ReplyDroppingProxy {
+    address: SocketAddr,
+    drop_connection: Arc<Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ReplyDroppingProxy {
+    async fn start(upstream: SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let drop_connection = Arc::new(Notify::new());
+        let task = tokio::spawn({
+            let drop_connection = drop_connection.clone();
+            async move {
+                let (mut downstream, _) = listener.accept().await.unwrap();
+                let mut upstream = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                tokio::select! {
+                    _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {}
+                    _ = drop_connection.notified() => {}
+                }
+            }
+        });
+        Self {
+            address,
+            drop_connection,
+            task,
+        }
+    }
+
+    async fn drop_connection(self) {
+        self.drop_connection.notify_one();
+        self.task.await.unwrap();
+    }
+}
+
+fn unused_loopback_address() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    address
+}
+
+fn cluster_config(node_id: &str, address: SocketAddr, endpoint: &str) -> ClusterConfig {
+    ClusterConfig::new(
+        node_id,
+        address,
+        address,
+        S3OwnershipConfig::local("lease-bucket", "runtime-prefix", endpoint),
+    )
+    .lease_timing(LeaseTiming {
+        ttl: Duration::from_secs(60),
+        renewal_interval: Duration::from_secs(30),
+        operation_timeout: Duration::from_secs(2),
+        peer_connect_timeout: Duration::from_millis(200),
+    })
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct S3AddRequest {
+    #[prost(int64, tag = "1")]
+    amount: i64,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct S3AddResponse {
+    #[prost(int64, tag = "1")]
+    value: i64,
+}
+
+struct S3CounterActor {
+    value: i64,
+}
+
+#[actor(name = "s3-counter")]
+impl S3CounterActor {
+    pub fn new(_actor_id: ActorId, _state: Arc<()>) -> Self {
+        Self { value: 0 }
+    }
+
+    #[coactor::command(remote)]
+    pub async fn add(&mut self, _context: &CommandContext, request: S3AddRequest) -> S3AddResponse {
+        self.value += request.amount;
+        S3AddResponse { value: self.value }
+    }
+}
+
+#[derive(Clone, Default)]
+struct OutcomeState {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+struct OutcomeActor {
+    state: Arc<OutcomeState>,
+    value: i64,
+}
+
+#[actor(name = "s3-outcome")]
+impl OutcomeActor {
+    pub fn new(_actor_id: ActorId, state: Arc<OutcomeState>) -> Self {
+        Self { state, value: 0 }
+    }
+
+    #[coactor::command(remote)]
+    pub async fn add(&mut self, _context: &CommandContext, request: S3AddRequest) -> S3AddResponse {
+        self.value += request.amount;
+        S3AddResponse { value: self.value }
+    }
+
+    #[coactor::command(remote)]
+    pub async fn blocked_add(
+        &mut self,
+        _context: &CommandContext,
+        request: S3AddRequest,
+    ) -> S3AddResponse {
+        self.state.entered.notify_one();
+        self.state.release.notified().await;
+        self.value += request.amount;
+        S3AddResponse { value: self.value }
+    }
+}
+
+#[tokio::test]
+async fn public_s3_adapter_reconciles_lost_claim_and_release_responses() {
+    let (endpoint, state, task) = stateful_s3_server().await;
+    let address = unused_loopback_address();
+    let actor_address = ActorAddress::new("s3-counter", ActorId::from("passivate"));
+    let actor_key = format!(
+        "runtime-prefix/actors/{}/ownership.json",
+        hex::encode(actor_address.to_bytes())
+    );
+    state.drop_next_put_response(&actor_key);
+    let runtime = RuntimeBuilder::cluster((), cluster_config("node-a", address, &endpoint))
+        .idle_timeout(Duration::from_millis(50))
+        .register::<S3CounterActor>()
+        .start()
+        .await
+        .unwrap();
+    let counter = runtime
+        .actor_ref::<S3CounterActor>(ActorId::from("passivate"))
+        .unwrap();
+
+    assert_eq!(
+        counter.add(S3AddRequest { amount: 1 }).await.unwrap(),
+        S3AddResponse { value: 1 }
+    );
+    state.drop_next_put_response(&actor_key);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let record =
+                state.objects.lock().unwrap().get(&actor_key).map(|object| {
+                    serde_json::from_slice::<ActorOwnerRecord>(&object.body).unwrap()
+                });
+            if record.is_some_and(|record| record.owner.is_none() && record.ownership_epoch == 1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        state.put_count(&actor_key),
+        2,
+        "lost claim and release responses must be reconciled by read-back, not PUT replay"
+    );
+
+    runtime.shutdown().await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn public_s3_adapter_runs_remote_calls_and_higher_epoch_availability_failover() {
+    let (endpoint, state, task) = stateful_s3_server().await;
+    let first_address = unused_loopback_address();
+    let first = RuntimeBuilder::cluster((), cluster_config("node-a", first_address, &endpoint))
+        .register::<S3CounterActor>()
+        .start()
+        .await
+        .unwrap();
+    let counter = first
+        .actor_ref::<S3CounterActor>(ActorId::from("shared"))
+        .unwrap();
+    assert_eq!(
+        counter.add(S3AddRequest { amount: 2 }).await.unwrap(),
+        S3AddResponse { value: 2 }
+    );
+
+    let second_address = unused_loopback_address();
+    let second = RuntimeBuilder::cluster((), cluster_config("node-b", second_address, &endpoint))
+        .register::<S3CounterActor>()
+        .start()
+        .await
+        .unwrap();
+    let remote_counter = second
+        .actor_ref::<S3CounterActor>(ActorId::from("shared"))
+        .unwrap();
+    assert_eq!(
+        remote_counter
+            .add(S3AddRequest { amount: 3 })
+            .await
+            .unwrap(),
+        S3AddResponse { value: 5 }
+    );
+
+    let actor_key = format!(
+        "runtime-prefix/actors/{}/ownership.json",
+        hex::encode(ActorAddress::new("s3-counter", ActorId::from("shared")).to_bytes())
+    );
+    state.drop_next_put_response(&actor_key);
+    first.shutdown().await;
+    assert_eq!(
+        remote_counter
+            .add(S3AddRequest { amount: 7 })
+            .await
+            .unwrap(),
+        S3AddResponse { value: 7 },
+        "the replacement Owner must start from empty state"
+    );
+
+    let owner: ActorOwnerRecord =
+        serde_json::from_slice(&state.objects.lock().unwrap().get(&actor_key).unwrap().body)
+            .unwrap();
+    assert_eq!(owner.ownership_epoch, 2);
+    assert_eq!(owner.owner.unwrap().node_id, "node-b");
+    assert_eq!(
+        state.put_count(&actor_key),
+        2,
+        "cold claim and lost-response takeover must each issue exactly one PUT"
+    );
+
+    second.shutdown().await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn public_s3_adapter_keeps_post_dispatch_failures_unknown_without_replay() {
+    let (endpoint, state, task) = stateful_s3_server().await;
+    let owner_state = OutcomeState::default();
+    let owner_address = unused_loopback_address();
+    let owner = RuntimeBuilder::cluster(
+        owner_state.clone(),
+        cluster_config("node-a", owner_address, &endpoint),
+    )
+    .register::<OutcomeActor>()
+    .start()
+    .await
+    .unwrap();
+    let owner_counter = owner
+        .actor_ref::<OutcomeActor>(ActorId::from("unknown"))
+        .unwrap();
+    owner_counter.add(S3AddRequest { amount: 0 }).await.unwrap();
+
+    let proxy = ReplyDroppingProxy::start(owner_address).await;
+    {
+        let mut objects = state.objects.lock().unwrap();
+        let (_, object) = objects
+            .iter_mut()
+            .find(|(key, object)| {
+                key.starts_with("runtime-prefix/nodes/")
+                    && serde_json::from_slice::<NodeLease>(&object.body)
+                        .is_ok_and(|lease| lease.node_id == "node-a")
+            })
+            .unwrap();
+        let mut lease: NodeLease = serde_json::from_slice(&object.body).unwrap();
+        lease.advertised_address = proxy.address;
+        object.body = serde_json::to_vec(&lease).unwrap();
+    }
+
+    let client_address = unused_loopback_address();
+    let client = RuntimeBuilder::cluster(
+        OutcomeState::default(),
+        cluster_config("node-b", client_address, &endpoint),
+    )
+    .register::<OutcomeActor>()
+    .start()
+    .await
+    .unwrap();
+    let remote_counter = client
+        .actor_ref::<OutcomeActor>(ActorId::from("unknown"))
+        .unwrap();
+    let call =
+        tokio::spawn(async move { remote_counter.blocked_add(S3AddRequest { amount: 1 }).await });
+    owner_state.entered.notified().await;
+    proxy.drop_connection().await;
+    assert_eq!(call.await.unwrap(), Err(SendError::OutcomeUnknown));
+    owner_state.release.notify_one();
+    assert_eq!(
+        owner_counter.add(S3AddRequest { amount: 1 }).await.unwrap(),
+        S3AddResponse { value: 2 },
+        "the ambiguous command must execute exactly once"
+    );
+
+    owner.shutdown().await;
+    client.shutdown().await;
     task.abort();
 }
