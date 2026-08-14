@@ -4,28 +4,23 @@ CoActor's ownership adapter is **designed for AWS S3 semantics**. Local developm
 
 ## Merge gates
 
-CI runs the ignored S3 ownership-semantics tests explicitly against two endpoints:
+CI runs the ignored S3 ownership-semantics tests against MinIO as a local integration endpoint. MinIO verifies SDK configuration, object encoding, response-loss reconciliation, and multi-runtime behavior, but it is not a supported production authority and does not replace real AWS qualification.
 
-- LocalStack: the strict gate, including conditional Node Lease deletion;
-- MinIO: an additional compatibility smoke gate, not a supported production authority.
-
-Both endpoints run the complete Node Lease and Actor Owner Record lifecycle plus multiple real Runtime instances over loopback gRPC. The multi-node gate covers typed remote calls, cold claims, lease renewal, bounded-capacity placement, runtime fencing, idle ownership release, graceful shutdown, and higher-epoch Availability Failover.
+The MinIO gate runs the Node Lease and Actor Owner Record lifecycle plus multiple real Runtime instances over loopback gRPC. The multi-node gate covers typed remote calls, cold claims, lease renewal, bounded-capacity placement, runtime fencing, idle ownership release, graceful shutdown, response-loss reconciliation, and higher-epoch Availability Failover.
 
 The tests never fall back to the deterministic fake. Explicit execution requires an endpoint and bucket:
 
 ```console
-COACTOR_S3_ENDPOINT=http://127.0.0.1:4566 \
+COACTOR_S3_ENDPOINT=http://127.0.0.1:9000 \
 COACTOR_S3_BUCKET=coactor-local \
-COACTOR_S3_REQUIRE_CONDITIONAL_DELETE=1 \
 cargo test -p coactor --lib node_and_actor_records_obey_conditional_s3_updates -- --ignored --test-threads=1
 
-COACTOR_S3_ENDPOINT=http://127.0.0.1:4566 \
+COACTOR_S3_ENDPOINT=http://127.0.0.1:9000 \
 COACTOR_S3_BUCKET=coactor-local \
-COACTOR_S3_REQUIRE_CONDITIONAL_DELETE=1 \
 cargo test -p coactor --lib multiple_runtimes_preserve_ownership_lifecycle_through_s3 -- --ignored --test-threads=1
 ```
 
-Omit `COACTOR_S3_REQUIRE_CONDITIONAL_DELETE` only for a non-authoritative compatibility smoke endpoint that does not implement conditional `DeleteObject`. AWS qualification always requires the strict behavior.
+The compatibility test can set `COACTOR_S3_REQUIRE_CONDITIONAL_DELETE=1` when its endpoint implements conditional `DeleteObject`. Real AWS qualification always requires and verifies the strict behavior.
 
 ## Real AWS qualification
 

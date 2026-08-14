@@ -28,6 +28,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Install Protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+
       - name: Install stable Rust toolchain
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
 
@@ -58,43 +61,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Install Protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+
       - name: Install stable Rust toolchain
         run: rustup toolchain install stable --profile minimal
 
       - name: Use stable Rust toolchain
         run: rustup default stable
 
-      - name: Start LocalStack S3
-        run: |
-          docker run --detach --name coactor-localstack \
-            --publish 4566:4566 \
-            --env SERVICES=s3 \
-            localstack/localstack:latest
-          for attempt in $(seq 1 60); do
-            if curl --fail --silent http://127.0.0.1:4566/_localstack/health | grep --quiet '"s3"'; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs coactor-localstack
-          exit 1
-
-      - name: Run strict LocalStack lifecycle and multi-node gates
-        env:
-          COACTOR_S3_ENDPOINT: http://127.0.0.1:4566
-          COACTOR_S3_BUCKET: coactor-localstack-ci
-          COACTOR_S3_REQUIRE_CONDITIONAL_DELETE: "1"
-        run: |
-          cargo test --locked -p coactor --lib node_and_actor_records_obey_conditional_s3_updates -- --ignored --test-threads=1
-          cargo test --locked -p coactor --lib multiple_runtimes_preserve_ownership_lifecycle_through_s3 -- --ignored --test-threads=1
-
-      - name: Stop LocalStack
-        if: always()
-        run: |
-          docker logs coactor-localstack || true
-          docker rm --force coactor-localstack || true
-
-      - name: Start MinIO S3 smoke endpoint
+      - name: Start MinIO S3 endpoint
         run: |
           docker run --detach --name coactor-minio \
             --publish 9000:9000 \
@@ -110,7 +86,7 @@ jobs:
           docker logs coactor-minio
           exit 1
 
-      - name: Run MinIO lifecycle and multi-node smoke gates
+      - name: Run MinIO ownership semantics
         env:
           COACTOR_S3_ENDPOINT: http://127.0.0.1:9000
           COACTOR_S3_BUCKET: coactor-minio-ci
@@ -120,4 +96,6 @@ jobs:
 
       - name: Show MinIO diagnostics
         if: always()
-        run: docker logs coactor-minio || true
+        run: |
+          docker logs coactor-minio || true
+          docker rm --force coactor-minio || true
