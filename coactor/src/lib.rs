@@ -31,6 +31,10 @@ pub use actor::*;
 pub use runtime::{Runtime, RuntimeBuilder};
 
 #[cfg(test)]
+#[path = "../tests/support/http_fixture.rs"]
+mod http_fixture;
+
+#[cfg(test)]
 #[path = "../tests/actor_ownership.rs"]
 mod actor_ownership_tests;
 #[cfg(test)]

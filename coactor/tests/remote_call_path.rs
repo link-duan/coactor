@@ -1,6 +1,7 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::{
+    http_fixture::ReplyDroppingProxy,
     runtime::testing,
     test_support::{TestOwnershipBackend, start_cluster},
 };
@@ -9,45 +10,6 @@ use coactor::{
 };
 use prost::Message;
 use tokio::sync::Notify;
-
-struct ReplyDroppingProxy {
-    endpoint: String,
-    drop_connection: Arc<Notify>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl ReplyDroppingProxy {
-    async fn start(upstream: SocketAddr) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let drop_connection = Arc::new(Notify::new());
-        let task = tokio::spawn({
-            let drop_connection = drop_connection.clone();
-            async move {
-                let (mut downstream, _) = listener.accept().await.unwrap();
-                let mut upstream = tokio::net::TcpStream::connect(upstream).await.unwrap();
-                tokio::select! {
-                    _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {}
-                    _ = drop_connection.notified() => {}
-                }
-            }
-        });
-        Self {
-            endpoint,
-            drop_connection,
-            task,
-        }
-    }
-
-    fn endpoint(&self) -> String {
-        self.endpoint.clone()
-    }
-
-    async fn drop_connection(self) {
-        self.drop_connection.notify_one();
-        self.task.await.unwrap();
-    }
-}
 
 #[derive(Clone, PartialEq, Message)]
 struct AddRequest {

@@ -21,6 +21,12 @@ use coactor::{
 };
 use tokio::{io::AsyncReadExt, sync::Notify};
 
+#[path = "support/s3_fixture.rs"]
+mod s3_fixture;
+
+use crate::http_fixture::ReplyDroppingProxy;
+use s3_fixture::{ProgrammableS3, unused_loopback_address};
+
 #[derive(Clone, Debug)]
 struct CapturedRequest {
     method: Method,
@@ -736,240 +742,6 @@ async fn node_lease_behavior_contract_passes_for_memory_and_aws_adapters() {
     task.abort();
 }
 
-#[derive(Clone)]
-struct StoredObject {
-    body: Vec<u8>,
-    etag: String,
-}
-
-#[derive(Clone, Default)]
-struct StatefulS3 {
-    objects: Arc<Mutex<HashMap<String, StoredObject>>>,
-    next_etag: Arc<Mutex<u64>>,
-    dropped_put_responses: Arc<Mutex<HashMap<String, usize>>>,
-    put_counts: Arc<Mutex<HashMap<String, usize>>>,
-}
-
-impl StatefulS3 {
-    fn next_etag(&self) -> String {
-        let mut next = self.next_etag.lock().unwrap();
-        *next += 1;
-        format!("\"stateful-{next}\"")
-    }
-
-    fn drop_next_put_response(&self, key: &str) {
-        *self
-            .dropped_put_responses
-            .lock()
-            .unwrap()
-            .entry(key.to_owned())
-            .or_default() += 1;
-    }
-
-    fn take_dropped_put_response(&self, key: &str) -> bool {
-        let mut responses = self.dropped_put_responses.lock().unwrap();
-        let Some(remaining) = responses.get_mut(key) else {
-            return false;
-        };
-        *remaining -= 1;
-        if *remaining == 0 {
-            responses.remove(key);
-        }
-        true
-    }
-
-    fn record_put(&self, key: &str) {
-        *self
-            .put_counts
-            .lock()
-            .unwrap()
-            .entry(key.to_owned())
-            .or_default() += 1;
-    }
-
-    fn put_count(&self, key: &str) -> usize {
-        self.put_counts
-            .lock()
-            .unwrap()
-            .get(key)
-            .copied()
-            .unwrap_or_default()
-    }
-}
-
-async fn stateful_s3_handle(
-    State(state): State<StatefulS3>,
-    request: Request<Body>,
-) -> Response<Body> {
-    let (parts, body) = request.into_parts();
-    let path = parts.uri.path();
-    let key = path
-        .strip_prefix("/lease-bucket/")
-        .unwrap_or_default()
-        .to_owned();
-
-    if parts.method == Method::GET && path == "/lease-bucket/" {
-        let prefix = parts
-            .uri
-            .query()
-            .and_then(|query| {
-                query.split('&').find_map(|part| {
-                    part.strip_prefix("prefix=")
-                        .map(|value| value.replace("%2F", "/"))
-                })
-            })
-            .unwrap_or_default();
-        let objects = state.objects.lock().unwrap();
-        let contents = objects
-            .keys()
-            .filter(|key| key.starts_with(&prefix))
-            .map(|key| format!("<Contents><Key>{key}</Key></Contents>"))
-            .collect::<String>();
-        return Response::builder()
-            .status(StatusCode::OK)
-            .body(Body::from(format!(
-                "<ListBucketResult><IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
-            )))
-            .unwrap();
-    }
-
-    match parts.method {
-        Method::GET => match state.objects.lock().unwrap().get(&key).cloned() {
-            Some(object) => Response::builder()
-                .status(StatusCode::OK)
-                .header("etag", object.etag)
-                .body(Body::from(object.body))
-                .unwrap(),
-            None => Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::from("<Error><Code>NoSuchKey</Code></Error>"))
-                .unwrap(),
-        },
-        Method::PUT => {
-            state.record_put(&key);
-            let body = to_bytes(body, usize::MAX).await.unwrap().to_vec();
-            let mut objects = state.objects.lock().unwrap();
-            let conditional_rejected = parts
-                .headers
-                .get("if-none-match")
-                .is_some_and(|value| value == "*" && objects.contains_key(&key))
-                || parts.headers.get("if-match").is_some_and(|expected| {
-                    objects
-                        .get(&key)
-                        .is_none_or(|current| current.etag.as_bytes() != expected.as_bytes())
-                });
-            if conditional_rejected {
-                return Response::builder()
-                    .status(StatusCode::PRECONDITION_FAILED)
-                    .body(Body::from("<Error><Code>PreconditionFailed</Code></Error>"))
-                    .unwrap();
-            }
-            let etag = state.next_etag();
-            objects.insert(
-                key.clone(),
-                StoredObject {
-                    body,
-                    etag: etag.clone(),
-                },
-            );
-            drop(objects);
-            if state.take_dropped_put_response(&key) {
-                panic!("programmable S3 endpoint dropped an applied PUT response");
-            }
-            Response::builder()
-                .status(StatusCode::OK)
-                .header("etag", etag)
-                .body(Body::empty())
-                .unwrap()
-        }
-        Method::DELETE => {
-            let mut objects = state.objects.lock().unwrap();
-            let conditional_rejected = parts.headers.get("if-match").is_some_and(|expected| {
-                objects
-                    .get(&key)
-                    .is_none_or(|current| current.etag.as_bytes() != expected.as_bytes())
-            });
-            if conditional_rejected {
-                return Response::builder()
-                    .status(StatusCode::PRECONDITION_FAILED)
-                    .body(Body::from("<Error><Code>PreconditionFailed</Code></Error>"))
-                    .unwrap();
-            }
-            objects.remove(&key);
-            Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(Body::empty())
-                .unwrap()
-        }
-        _ => Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .body(Body::empty())
-            .unwrap(),
-    }
-}
-
-async fn stateful_s3_server() -> (String, StatefulS3, tokio::task::JoinHandle<()>) {
-    let state = StatefulS3::default();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let task = tokio::spawn({
-        let state = state.clone();
-        async move {
-            axum::serve(
-                listener,
-                Router::new()
-                    .fallback(any(stateful_s3_handle))
-                    .with_state(state),
-            )
-            .await
-            .unwrap()
-        }
-    });
-    (format!("http://{address}"), state, task)
-}
-
-struct ReplyDroppingProxy {
-    address: SocketAddr,
-    drop_connection: Arc<Notify>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl ReplyDroppingProxy {
-    async fn start(upstream: SocketAddr) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let drop_connection = Arc::new(Notify::new());
-        let task = tokio::spawn({
-            let drop_connection = drop_connection.clone();
-            async move {
-                let (mut downstream, _) = listener.accept().await.unwrap();
-                let mut upstream = tokio::net::TcpStream::connect(upstream).await.unwrap();
-                tokio::select! {
-                    _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => {}
-                    _ = drop_connection.notified() => {}
-                }
-            }
-        });
-        Self {
-            address,
-            drop_connection,
-            task,
-        }
-    }
-
-    async fn drop_connection(self) {
-        self.drop_connection.notify_one();
-        self.task.await.unwrap();
-    }
-}
-
-fn unused_loopback_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    address
-}
-
 fn cluster_config(node_id: &str, address: SocketAddr, endpoint: &str) -> ClusterConfig {
     ClusterConfig::new(
         node_id,
@@ -1052,7 +824,7 @@ impl OutcomeActor {
 
 #[tokio::test]
 async fn public_s3_adapter_reconciles_lost_claim_and_release_responses() {
-    let (endpoint, state, task) = stateful_s3_server().await;
+    let (endpoint, state, task) = ProgrammableS3::start("lease-bucket").await;
     let address = unused_loopback_address();
     let actor_address = ActorAddress::new("s3-counter", ActorId::from("passivate"));
     let actor_key = format!(
@@ -1078,10 +850,9 @@ async fn public_s3_adapter_reconciles_lost_claim_and_release_responses() {
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let record =
-                state.objects.lock().unwrap().get(&actor_key).map(|object| {
-                    serde_json::from_slice::<ActorOwnerRecord>(&object.body).unwrap()
-                });
+            let record = state
+                .object_body(&actor_key)
+                .map(|body| serde_json::from_slice::<ActorOwnerRecord>(&body).unwrap());
             if record.is_some_and(|record| record.owner.is_none() && record.ownership_epoch == 1) {
                 break;
             }
@@ -1102,7 +873,7 @@ async fn public_s3_adapter_reconciles_lost_claim_and_release_responses() {
 
 #[tokio::test]
 async fn public_s3_adapter_runs_remote_calls_and_higher_epoch_availability_failover() {
-    let (endpoint, state, task) = stateful_s3_server().await;
+    let (endpoint, state, task) = ProgrammableS3::start("lease-bucket").await;
     let first_address = unused_loopback_address();
     let first = RuntimeBuilder::cluster((), cluster_config("node-a", first_address, &endpoint))
         .register::<S3CounterActor>()
@@ -1150,8 +921,7 @@ async fn public_s3_adapter_runs_remote_calls_and_higher_epoch_availability_failo
     );
 
     let owner: ActorOwnerRecord =
-        serde_json::from_slice(&state.objects.lock().unwrap().get(&actor_key).unwrap().body)
-            .unwrap();
+        serde_json::from_slice(&state.object_body(&actor_key).unwrap()).unwrap();
     assert_eq!(owner.ownership_epoch, 2);
     assert_eq!(owner.owner.unwrap().node_id, "node-b");
     assert_eq!(
@@ -1166,7 +936,7 @@ async fn public_s3_adapter_runs_remote_calls_and_higher_epoch_availability_failo
 
 #[tokio::test]
 async fn public_s3_adapter_keeps_post_dispatch_failures_unknown_without_replay() {
-    let (endpoint, state, task) = stateful_s3_server().await;
+    let (endpoint, state, task) = ProgrammableS3::start("lease-bucket").await;
     let owner_state = OutcomeState::default();
     let owner_address = unused_loopback_address();
     let owner = RuntimeBuilder::cluster(
@@ -1183,20 +953,16 @@ async fn public_s3_adapter_keeps_post_dispatch_failures_unknown_without_replay()
     owner_counter.add(S3AddRequest { amount: 0 }).await.unwrap();
 
     let proxy = ReplyDroppingProxy::start(owner_address).await;
-    {
-        let mut objects = state.objects.lock().unwrap();
-        let (_, object) = objects
-            .iter_mut()
-            .find(|(key, object)| {
-                key.starts_with("runtime-prefix/nodes/")
-                    && serde_json::from_slice::<NodeLease>(&object.body)
-                        .is_ok_and(|lease| lease.node_id == "node-a")
-            })
-            .unwrap();
-        let mut lease: NodeLease = serde_json::from_slice(&object.body).unwrap();
-        lease.advertised_address = proxy.address;
-        object.body = serde_json::to_vec(&lease).unwrap();
-    }
+    let (lease_key, lease_body) = state
+        .find_object(|key, body| {
+            key.starts_with("runtime-prefix/nodes/")
+                && serde_json::from_slice::<NodeLease>(body)
+                    .is_ok_and(|lease| lease.node_id == "node-a")
+        })
+        .unwrap();
+    let mut lease: NodeLease = serde_json::from_slice(&lease_body).unwrap();
+    lease.advertised_address = proxy.address();
+    state.replace_object_body(&lease_key, serde_json::to_vec(&lease).unwrap());
 
     let client_address = unused_loopback_address();
     let client = RuntimeBuilder::cluster(
