@@ -30,6 +30,8 @@ uuid.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+aws-smithy-http-client.workspace = true
+aws-smithy-runtime-api.workspace = true
 axum.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 tracing-subscriber = { version = "0.3.19", features = ["fmt"] }

@@ -18,6 +18,8 @@ pub struct S3OwnershipConfig {
     pub endpoint_url: Option<String>,
     pub credentials_provider: SharedCredentialsProvider,
     pub request_timeout: Duration,
+    #[cfg(test)]
+    pub(crate) http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
 }
 
 impl fmt::Debug for S3OwnershipConfig {
@@ -53,6 +55,8 @@ impl S3OwnershipConfig {
                 "coactor-local-test",
             )),
             request_timeout: Duration::from_secs(2),
+            #[cfg(test)]
+            http_client: None,
         }
     }
 }
@@ -78,6 +82,10 @@ impl S3OwnershipBackend {
             );
         if let Some(endpoint_url) = config.endpoint_url {
             sdk = sdk.endpoint_url(endpoint_url);
+        }
+        #[cfg(test)]
+        if let Some(http_client) = config.http_client {
+            sdk = sdk.http_client(http_client);
         }
         Self {
             client: Client::from_conf(sdk.build()),

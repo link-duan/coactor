@@ -63,6 +63,9 @@ mod remote_call_path_tests;
 #[path = "../tests/s3_ownership_contract.rs"]
 mod s3_ownership_contract_tests;
 #[cfg(test)]
+#[path = "../tests/s3_ownership_semantics.rs"]
+mod s3_ownership_semantics_tests;
+#[cfg(test)]
 #[path = "../tests/shutdown_semantics.rs"]
 mod shutdown_semantics_tests;
 #[cfg(test)]

@@ -135,4 +135,5 @@ Local mode scopes actor uniqueness to one runtime instance. Cluster mode coordin
 - [Design brief](docs/design-brief.md)
 - [Local runtime semantics](docs/runtime-semantics.md)
 - [Distributed runtime semantics](docs/distributed-runtime-semantics.md)
+- [S3 release gates](docs/s3-release-gates.md)
 - [Product direction](docs/product-direction.md)
