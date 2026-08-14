@@ -32,7 +32,7 @@ CoActor is a Rust library built on the consumer's Tokio runtime. Its local and c
 - graceful runtime shutdown;
 - structured diagnostics through `tracing`.
 
-Cluster mode additionally provides location-transparent Actor Refs, gRPC peer transport, S3-backed Node Leases and Actor Owner Records, ownership epochs, stateless failover, and runtime self-fencing.
+Cluster mode additionally provides location-transparent Actor Refs for remote-enabled commands, gRPC peer transport, S3-backed Node Leases and Actor Owner Records, ownership epochs, stateless failover, and Owner-side self-fencing.
 
 Actor state exists only in memory. After passivation, a process exit, or a crash, the actor starts again from empty state.
 
@@ -108,6 +108,8 @@ let runtime = RuntimeBuilder::cluster((), cluster).start().await?;
 ```
 
 For production, construct `S3OwnershipConfig` with the deployment's bucket, prefix, region, credentials provider, and request timeout. Each node needs a unique advertised address and a stable operational Node ID; every runtime start creates a distinct Node Session internally.
+
+Commands that may cross nodes must use `#[coactor::command(remote)]`. A remote-enabled command takes exactly one request implementing `prost::Message + Default`; its success value and declared business error must satisfy the same wire decoding requirements. Plain `#[coactor::command]` methods remain local-only even when their Actor Type is registered in cluster mode.
 
 The generated Actor Ref is a weak, stable address handle. Obtaining or cloning it does not activate an Actor or keep the runtime alive. A method call lazily activates the addressed Actor, and calls for that Active Actor execute serially through its bounded mailbox.
 

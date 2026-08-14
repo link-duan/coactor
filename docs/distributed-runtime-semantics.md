@@ -6,8 +6,9 @@
 
 - CoActor 保持嵌入 consumer 进程的 Rust library，不要求独立 control plane。
 - consumer 必须显式选择 local 或 cluster mode；cluster mode 必须完整配置 distributed dependencies，不能静默退化为 local mode。
-- caller 继续只按 Actor Address 使用 typed Actor Ref，Node location 对业务 API 透明。
-- Node 间使用 Tonic gRPC 的通用 Invoke boundary；command payload、reply 与业务错误使用显式 Protobuf message。
+- caller 继续只按 Actor Address 使用 typed Actor Ref；标记为 `#[coactor::command(remote)]` 的 command 对 Node location 透明。
+- remote-enabled command 必须只有一个实现 `prost::Message + Default` 的 request；success reply 与声明的 handler error 也必须满足相同的 wire decode 约束。普通 `#[coactor::command]` 只走本地 dispatch。
+- Node 间使用 Tonic gRPC 的通用 Invoke boundary；wire envelope 由 runtime 管理，业务 payload schema 由 consumer 管理。
 - consumer 负责业务 Protobuf schema 与 method rename 的 rolling-upgrade 兼容。
 
 ## Node authority
@@ -16,8 +17,8 @@
 - Node Lease 包含 session、advertised endpoint、protocol version、expiry 与 advisory capacity sample。
 - 默认 lease TTL 为 10 秒，每 TTL/3 续租；ownership 单操作默认 15 秒 deadline，peer connect 默认 3 秒。
 - absolute expiry 使用本地 wall clock，本地 self-fence 使用同次操作锚定的 monotonic deadline；部署必须维持正常 NTP，CoActor 不保证任意 clock skew 下没有短暂 Owner overlap。
-- runtime 在 command admission、mutation continuation 与成功 reply 前检查本地 node authority。
-- Node Lease 失效后 runtime-wide fail-stop：拒绝新调用、失败未完成调用、停止全部 Active Actor，并通过可 await 的 supervision boundary 报告 fenced termination；library 不退出宿主进程。
+- Owner runtime 在本地 command admission 与成功 reply 前检查 Node authority；lease renewal task 在 authority 失效后 fence runtime 并终止 Active Actor tasks。consumer side effect 不获得逐次 mutation fencing。
+- Node Lease 失效后，runtime fence 本节点的 Active Actor execution：本地 admission 被拒绝、未完成的本地/Owner 调用失败、全部 Active Actor 停止，并通过可 await 的 supervision boundary 报告 termination；library 不退出宿主进程。当前 ingress 对 foreign Owner 的纯转发不属于该 fail-stop 保证，consumer 应在收到 supervision 结果后停止使用该 Node。
 
 ## Actor ownership and routing
 
@@ -51,7 +52,7 @@
 - Handler Reply 只表示 handler 本地完成且 reply 时仍通过本地 Node authority check；它不是 Durable ACK，也不证明状态能在 failover 后恢复。
 - 每次 reply 不执行 S3 Actor Owner Record reread。
 - consumer 外部数据库写、HTTP 调用和其他 side effect 不受 CoActor fencing；需要时由 consumer 使用 epoch、CAS、transaction 或 idempotency 控制。
-- public call error 保持结构化分类，覆盖 ownership unavailable、node fenced、remote unavailable、remote protocol、runtime capacity 与 outcome unknown，但不暴露 Tonic 或 AWS SDK 具体错误类型；具体 Rust 命名后续决定。
+- public call error 使用 `SendError` 的 `OwnershipUnavailable`、`NodeFenced`、`RemoteUnavailable`、`RemoteProtocol`、`RuntimeAtCapacity` 与 `OutcomeUnknown` 等结构化分类，不暴露 Tonic 或 AWS SDK 具体错误类型。
 - caller 可以使用 consumer runtime 的普通 timeout 放弃等待；这不会撤销已被本地或远端 mailbox 接纳的 command，本 slice 也不传播 per-call wire deadline。
 
 ## Verification boundary

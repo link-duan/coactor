@@ -1,6 +1,6 @@
 # CoActor Runtime
 
-CoActor 为业务 key 提供按需运行的 Actor 执行边界。当前上下文只定义 Actor 生命周期与寻址语言，不把进程内状态等同于持久化事实。
+CoActor 为业务 key 提供按需运行的 Actor 执行边界。本词汇表同时定义已交付的执行与 ownership 语言，以及为后续持久化保留的术语；术语存在不表示对应能力已经交付。
 
 ## Language
 
@@ -33,7 +33,7 @@ Active Actor 因 handler panic 或异常 task 终止而无法继续处理已接�
 _Avoid_: Passivation, deactivation
 
 **Command**:
-caller 对 Actor method 的一次 request-response 调用；macro 将方法调用转换为内部消息，首版每个 command 必须产生业务结果或可观察的 runtime error。
+caller 对 Actor method 的一次 request-response 调用；macro 将方法调用转换为内部消息，每个 command 必须产生业务结果或可观察的 runtime error。
 _Avoid_: Event, fire-and-forget message
 
 **Send Error**:
@@ -41,7 +41,7 @@ Actor method 调用的统一失败类型，既包含 mailbox、lifecycle 与 Act
 _Avoid_: Nested runtime and handler Results
 
 **Passivation**:
-Active Actor 在满足安全条件后退出；它不删除 Actor 的逻辑身份或持久状态。
+Active Actor 在满足安全条件后退出；它不删除 Actor 的逻辑身份或 ownership 历史。
 _Avoid_: Deletion, shutdown
 
 **Deactivating**:
@@ -49,11 +49,11 @@ Active Actor 已开始执行 deactivation lifecycle、不可再恢复服务的�
 _Avoid_: Idle, passivation candidate
 
 **Ownership Epoch**:
-ownership CAS 产生的单调世代；runtime 将其绑定到持久数据命名空间和恢复边界，consumer 不感知该值。
+ownership CAS 产生的单调 Owner 世代；它区分同一 Actor Address 的先后授权，consumer 不感知该值。未来持久化可将其作为 fencing 与恢复边界。
 _Avoid_: Process generation, activation number
 
 **Owner**:
-当前被授权为某个 Actor Address 处理命令并执行持久写的 runtime 节点；授权必须与 Ownership Epoch 一起判断。
+当前被授权为某个 Actor Address 处理命令的 runtime 节点；授权必须与 Ownership Epoch 一起判断。
 _Avoid_: Active Actor location, registry entry
 
 **Fencing**:
@@ -61,15 +61,15 @@ _Avoid_: Active Actor location, registry entry
 _Avoid_: Heartbeat alone, process shutdown alone
 
 **Self-Fence**:
-节点或 Active Actor 无法在时限内证明自己仍有权威时，主动停止 mutation、持久化和成功响应的状态转换。
+节点无法在时限内证明自己仍有权威时，主动停止 mutation 和成功响应的状态转换。
 _Avoid_: Graceful shutdown, lease renewal
 
 **Durable ACK Gate**:
-在持久化证明覆盖本次 mutation 之前扣留 durable success response 的边界。CoActor 首版不提供 durable ACK，因此普通 Handler Reply 不经过该边界。
+在持久化证明覆盖本次 mutation 之前扣留 durable success response 的边界。CoActor 当前不提供 durable ACK，因此普通 Handler Reply 不经过该边界。
 _Avoid_: Handler Reply, enqueue ACK
 
 **Handler Reply**:
-Actor 完成本地 command handling 后返回的结果；首版中它不证明对应 mutation 已持久化，crash 后可能丢失。
+Actor 完成本地 command handling 后返回的结果；它不证明对应 mutation 已持久化，crash 后可能丢失。
 _Avoid_: Durable ACK, commit receipt
 
 **Restore Cut**:
