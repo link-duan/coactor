@@ -11,9 +11,9 @@ pub(crate) use cluster::{
     S3OwnershipConfig, VersionedActorOwnerRecord, VersionedNodeLease,
 };
 
-pub use coactor_macros::{actor, command};
+pub use coactor_macros::actor;
 
-const PEER_PROTOCOL_VERSION: u32 = 1;
+const PEER_PROTOCOL_VERSION: u32 = 2;
 
 mod peer_protocol {
     tonic::include_proto!("coactor.peer.v1");
@@ -28,46 +28,17 @@ mod runtime;
 mod test_support;
 
 pub use actor::*;
+pub use runtime::actor::{Actor, ActorRuntime, BoxFuture, MessageContext};
+pub use runtime::core::ActorRef;
+pub use runtime::session::{Session, SessionHandle, SessionId};
 pub use runtime::{Runtime, RuntimeBuilder};
 
 #[cfg(test)]
-#[path = "../tests/support/http_fixture.rs"]
-mod http_fixture;
-
+#[path = "../tests/session_semantics.rs"]
+mod session_semantics_tests;
 #[cfg(test)]
-#[path = "../tests/actor_ownership.rs"]
-mod actor_ownership_tests;
+#[path = "../tests/cluster_session.rs"]
+mod cluster_session_tests;
 #[cfg(test)]
-#[allow(dead_code)]
-#[path = "../tests/counter_call_path.rs"]
-mod counter_call_path_tests;
-#[cfg(test)]
-#[path = "../tests/counter_vertical_slice.rs"]
-mod counter_vertical_slice_tests;
-#[cfg(test)]
-#[path = "../tests/failure_semantics.rs"]
-mod failure_semantics_tests;
-#[cfg(test)]
-#[path = "../tests/mailbox_semantics.rs"]
-mod mailbox_semantics_tests;
-#[cfg(test)]
-#[path = "../tests/node_authority.rs"]
-mod node_authority_tests;
-#[cfg(test)]
-#[path = "../tests/passivation_semantics.rs"]
-mod passivation_semantics_tests;
-#[cfg(test)]
-#[path = "../tests/remote_call_path.rs"]
-mod remote_call_path_tests;
-#[cfg(test)]
-#[path = "../tests/s3_ownership_contract.rs"]
-mod s3_ownership_contract_tests;
-#[cfg(test)]
-#[path = "../tests/s3_ownership_semantics.rs"]
-mod s3_ownership_semantics_tests;
-#[cfg(test)]
-#[path = "../tests/shutdown_semantics.rs"]
-mod shutdown_semantics_tests;
-#[cfg(test)]
-#[path = "../tests/tracing_semantics.rs"]
-mod tracing_semantics_tests;
+#[path = "../tests/cluster_authority.rs"]
+mod cluster_authority_tests;

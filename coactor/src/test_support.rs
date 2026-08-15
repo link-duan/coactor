@@ -7,9 +7,9 @@ use std::{
 use async_trait::async_trait;
 
 use crate::{
-    ActorAddress, ActorOwner, ActorOwnerRecord, ClusterRuntimeConfig, LeaseMutation, NodeLease,
-    NodeSessionId, OwnershipBackend, OwnershipBackendError, Runtime, RuntimeBuilder,
-    VersionedActorOwnerRecord, VersionedNodeLease,
+    ActorAddress, ActorOwnerRecord, ClusterRuntimeConfig, LeaseMutation, NodeLease, NodeSessionId,
+    OwnershipBackend, OwnershipBackendError, Runtime, RuntimeBuilder, VersionedActorOwnerRecord,
+    VersionedNodeLease,
 };
 
 #[derive(Default)]
@@ -26,51 +26,6 @@ impl TestOwnershipBackend {
         format!("test-etag-{next}")
     }
 
-    pub(crate) fn endpoint(&self, node_id: &str) -> SocketAddr {
-        self.leases
-            .lock()
-            .unwrap()
-            .values()
-            .find(|entry| entry.lease.node_id == node_id)
-            .unwrap()
-            .lease
-            .advertised_address
-    }
-
-    pub(crate) fn redirect(&self, node_id: &str, endpoint: SocketAddr) {
-        let mut leases = self.leases.lock().unwrap();
-        let entry = leases
-            .values_mut()
-            .find(|entry| entry.lease.node_id == node_id)
-            .unwrap();
-        entry.lease.advertised_address = endpoint;
-    }
-
-    pub(crate) fn assign_owner(&self, address: ActorAddress, node_id: &str) {
-        let session_id = self
-            .leases
-            .lock()
-            .unwrap()
-            .values()
-            .find(|entry| entry.lease.node_id == node_id)
-            .unwrap()
-            .lease
-            .session_id
-            .clone();
-        self.owners.lock().unwrap().insert(
-            address,
-            VersionedActorOwnerRecord {
-                record: ActorOwnerRecord {
-                    owner: Some(ActorOwner {
-                        node_id: node_id.to_owned(),
-                        session_id,
-                    }),
-                    ownership_epoch: 1,
-                },
-                etag: self.next_etag(),
-            },
-        );
-    }
 }
 
 #[async_trait]

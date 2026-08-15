@@ -96,33 +96,29 @@
 - consumer 必须显式调用并 await graceful shutdown；这是 runtime 的使用契约。直接 drop 最后一个 runtime handle 属于误用，CoActor 不承诺 command drain、deactivation 或错误返回语义，可以直接取消 task、记录错误或 panic。这里的“不承诺”不是 Rust `unsafe` 意义上的 Undefined Behavior。
 - 当前 idle passivation 默认开启，不因缺少状态存储增加单独的启用开关；idle timeout 仍可配置。consumer 必须接受 passivation 后同一 Actor 从空状态重新启动。
 - idle timeout 具有 runtime 默认值，Actor Type 注册时可以覆盖；同一 Actor Type 的所有 Actor ID 使用相同值，当前不支持逐 Actor ID 动态配置。
-- 当前只提供 request-response command，不提供 fire-and-forget。每个 command 都必须返回业务结果或可观察的 runtime error；未来若增加 fire-and-forget，需要另行定义丢弃与错误观测语义。
-- command 成功进入 mailbox 后，caller 超时、取消或 drop request future 不会撤回 command；Active Actor 仍按顺序执行，只丢弃无法投递的 reply。当前不提供 mailbox command cancellation。
+- 当前提供 Session 双向消息：入站 Action 与出站 Event 均为字节负载；Action 是 fire-and-forget（send 同步返回投递状态，进入 mailbox 后不确认，at-most-once），业务错误由 Event 表达。所有入站都经过 Session，不提供无 Session 的单向 tell。
+- Action 成功进入 mailbox 后，caller 取消或 drop future 不会撤回消息；Active Actor 仍按顺序执行。当前不提供 mailbox message cancellation。
 - 所有 Actor Type 必须在 runtime 启动前注册；名称在一个 runtime 内唯一，重复注册导致构建失败。runtime 启动后 registry 冻结，当前不支持动态注册或热替换 factory、handler 与配置。
-- 当前对外提供 method-shaped typed API：每种 command 表现为 Actor Ref 上的独立异步方法，并拥有独立参数与返回类型。Rust macro 生成内部消息类型、类型擦除、安全分发与 reply plumbing，consumer 不需要维护统一 command/reply enum。
-- Actor method 的返回采用 Kameo 风格错误展平：handler 声明 `Result<T, E>` 时，caller 获得 `Result<T, SendError<E>>`，业务错误映射为 `SendError::HandlerError(E)`；不会形成 `Result<Result<T, E>, RuntimeError>`。不返回业务错误的方法使用 `Infallible` 作为 handler error 类型。
-- `SendError` 不返还尚未执行 command 的原始方法参数；macro 生成的内部 request 类型保持隐藏。caller 如需重试，自行保留、克隆或重建参数。
-- Actor method future 从开始到结束独占 Active Actor；即使在 `.await` 外部 IO 时也不处理下一条 command。当前不支持 Actor reentrancy，consumer 需要自行避免无限等待和循环 Actor 调用。
-- Actor Ref 是稳定地址句柄，不是 Active Actor 的强引用。获取、持有或 clone Actor Ref 不启动 Actor，也不阻止 idle passivation；method 调用时才按 Actor Address 查找或懒启动实例。passivation 后旧 Actor Ref 仍有效，下一次调用会创建新的空状态 Active Actor。
-- Actor Ref 只持有 runtime 的弱引用，不延长 runtime 生命周期。runtime 已关闭或最后一个强 handle 已释放后，已有 Ref 的 method 调用返回 `RuntimeStopped`。
+- `#[coactor::actor(name = "...")]` macro 只挂在 Actor struct 上，生成 `ACTOR_NAME` 常量与注册实现；consumer 手写 `impl Actor<S>`（`new(ActorRuntime<S>)`、`on_message`、可选 lifecycle hooks）。Actor Type 名称不随 Rust 类型名推导。
+- client 侧按名字索引：`runtime.actor("room", actor_id)` 返回通用 `ActorRef`（无类型参数），`open()` 建立持久双向 `Session`。
+- Actor message future 从开始到结束独占 Active Actor；即使在 `.await` 外部 IO 时也不处理下一条消息。当前不支持 Actor reentrancy，consumer 需要自行避免无限等待和循环 Actor 调用。
+- Actor Ref 是稳定地址句柄，不是 Active Actor 的强引用。获取、持有或 clone Actor Ref 不启动 Actor；`open()` 主动激活并注册 Session，`on_session_opened` 在激活完成后调用（可"连接即推送"）。
+- Actor Ref 只持有 runtime 的弱引用，不延长 runtime 生命周期。runtime 已关闭后，已有 Session 的 `send` 返回 `RuntimeStopped`。
 - 当前使用 Rust `tracing` 产生结构化 spans/events，但 library 不安装全局 subscriber。至少记录 Actor Type、Actor ID、lifecycle 阶段与错误类别；不记录 command 参数或返回值。当前不提供 metrics registry、管理端口或自定义 observer trait。
 - Actor Type 不注册自定义 factory；约定提供同步 `new(actor_id, Arc<AppState>)` 构造初始内存状态，runtime 在 lazy activation 时直接调用。需要异步执行的初始化放入 activation lifecycle。
 - `new` 接收 runtime 的 `ActorId` 与共享 App State；consumer 自行解析业务 ID，并选择保存完整 App State 或提取依赖。
-- runtime 为每次 `#[command]` invocation 创建无生命周期、非泛型的 `CommandContext`，当前仅公开 `actor_id()` 与 `actor_address()`。
+- runtime 为每次 Action 处理创建 `MessageContext`，公开 `actor_id()`、`actor_address()`、`session()` 与 `send()`（定向当前 Session）。
 - `CommandContext` 不实现 `Clone`，也不提供 runtime handle、自身 Actor Ref 或跨 Actor 调用能力。Actor 间协调由 consumer 在 runtime 外部完成。
-- 当前不向 Actor 暴露自身 Actor Ref。非重入 method 若 await 自己的下一条 command 会死锁；Actor 内复用通过普通私有方法完成，延迟调用由外部 consumer 调度。
+- Actor 通过构造注入的 `ActorRuntime` 暴露自身身份与 `broadcast` 能力；Actor 无法 await 自己的下一条消息（非重入），延迟调用由外部 consumer 调度。
 - 每个 CoActor runtime 绑定一个 consumer 定义的强类型 `AppState`，由全部 Actor Type 共用。consumer 自行把数据库 client、HTTP client 与配置组合进该类型；当前不使用 `TypeId -> Any` service locator，也不允许缺失依赖在运行时才暴露。
 - `AppState` 必须满足 `Send + Sync + 'static`，因为同一实例会被多个 Active Actor task 并发借用。
 - runtime builder 接收 `AppState` 值并以 `Arc<AppState>` 持有；lazy activation 时 clone 同一 Arc 给 Actor 构造器。
-- lifecycle 不接收 context；`#[command]` 显式接收 `&CommandContext`，macro 在 generated Actor Ref method 中隐藏该参数。
-- Actor macro 从 `new` 的 `Arc<AppState>` 参数推断 App State 类型；注册到不同 state 类型的 runtime 时编译失败。
+- lifecycle 与 `on_message` 接收 `&MessageContext`（标识当前 Actor + 当前 Session 出站句柄）；`ActorRuntime` 在构造时注入，AppState 通过 `runtime.app_state()` 获取。
+- `impl Actor<S>` 的 S 与 `Runtime<S>` 的 AppState 一致时注册才编译通过。
 - Actor Type 稳定名称必须在 Actor macro attribute 中显式声明，例如 `#[coactor::actor(name = "room")]`；不从 Rust struct 名或 `type_name` 推导，缺失时编译失败。Rust 类型重命名不改变 Actor Address。
 - mailbox capacity 具有 runtime 默认值，Actor Type 注册时可以覆盖；同一 Actor Type 的所有 Actor ID 使用同一容量，当前不支持逐 Actor ID 动态配置。
-- Actor macro 只把显式标记 `#[command]` 的方法加入公共 Actor API；其他同步或异步方法保持 consumer 内部实现。macro 据此区分 constructor、lifecycle、command 与辅助方法。
-- `#[command]` 只能标记显式 `pub async fn`，generated Actor Ref method 同为 public；macro 不隐式扩大私有方法的可见性。
-- macro 为每个 Actor Type 生成专用 Ref 类型，例如 `RoomActorRef`，并把 command 生成为 inherent async methods；不要求 consumer 导入 extension trait。内部可以包装通用 erased ref。
-- local mode 的 Active Actor 唯一性只在单个 CoActor runtime 实例内成立；cluster mode 通过 Node Lease 与 Actor Owner Record 协调 remote-enabled command 的 Owner。普通 `#[command]` 不参与跨节点路由，不能用来建立分布式唯一性。
-- remote-enabled command 当前以 Rust method 名作为 command 名，并要求单个 `prost::Message + Default` request，以及满足相同 decode 约束的 success reply 与 handler error；consumer 负责 method rename 和业务 schema 的 rolling-upgrade 兼容。
+- 所有 Action/Event 均携带 Session ID 路由；cluster mode 下消息经 ownership 解析投递到 Owner，Node 间使用 bidi gRPC stream 多路复用。跨节点 failover 会打断 Session，caller 需重新 `open()`。
+- 当前消息为字节负载，业务协议（编码、schema 兼容）由 consumer 负责；后续阶段可能引入类型化 Action/Event 与序列化约束。
 - 项目仍处于早期 API 探索阶段，暂不决定 `SendError` 是否标记 `#[non_exhaustive]`，也不为尚未稳定的公开 API 承诺向后兼容；在进入稳定发布前统一评估 enum 扩展策略。
 - 最小 `CounterActor` vertical slice 验证 macro method API、Actor Ref、按 ID lazy activation、单 Actor 串行、不同 ID 隔离、bounded mailbox、idle passivation 后空状态重启、lifecycle、panic 与 graceful shutdown；不引入 room tick 或 document operation 模型。
 - runtime 提供可配置的 `max_active_actors`。达到上限后不再启动新 Actor，并返回 `RuntimeAtCapacity`；已有 Active Actor 继续接收 command，runtime 不主动驱逐实例。passivation 或停止释放容量，当前不提供 Actor Type quota。

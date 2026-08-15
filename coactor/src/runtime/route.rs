@@ -1,14 +1,15 @@
 use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 
-use super::command::{Command, CommandSender, RuntimeError};
 use super::core::RuntimeInner;
+use super::message::{MailboxMessage, MailboxSender};
+use super::session::SessionRegistry;
 use crate::ActorAddress;
 
-pub struct Route<S> {
+pub struct Route {
     pub(crate) generation: u64,
     pub(crate) state: RouteState,
     pub(crate) _capacity: OwnedSemaphorePermit,
-    pub(crate) task: Spawned<S>,
+    pub(crate) task: Spawned,
 }
 
 pub enum RouteState {
@@ -16,26 +17,20 @@ pub enum RouteState {
     Deactivating,
 }
 
-pub struct Spawned<S> {
-    pub(crate) sender: CommandSender<S>,
+pub struct Spawned {
+    pub(crate) sender: MailboxSender,
     pub(crate) shutdown: watch::Sender<bool>,
     pub(crate) abort: tokio::task::AbortHandle,
     pub(crate) completed: watch::Receiver<bool>,
 }
 
-pub fn try_send<S: 'static>(
-    sender: &CommandSender<S>,
-    command: Command<S>,
-) -> Result<(), RuntimeError> {
-    sender.try_send(command).map_err(|error| match error {
-        mpsc::error::TrySendError::Full(command) => {
-            command.fail(RuntimeError::MailboxFull);
-            RuntimeError::MailboxFull
-        }
-        mpsc::error::TrySendError::Closed(command) => {
-            command.fail(RuntimeError::ActorStopped);
-            RuntimeError::ActorStopped
-        }
+pub fn try_send(
+    sender: &MailboxSender,
+    message: MailboxMessage,
+) -> Result<(), crate::SendError> {
+    sender.try_send(message).map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => crate::SendError::MailboxFull,
+        mpsc::error::TrySendError::Closed(_) => crate::SendError::ActorStopped,
     })
 }
 
@@ -49,11 +44,11 @@ pub fn remove_route<S>(runtime: &RuntimeInner<S>, address: &ActorAddress, genera
     }
 }
 
-pub fn begin_deactivation<S>(
-    runtime: &RuntimeInner<S>,
+pub fn begin_deactivation(
+    runtime: &RuntimeInner<impl Send + Sync + 'static>,
     address: &ActorAddress,
     generation: u64,
-    sender: &CommandSender<S>,
+    sender: &MailboxSender,
 ) -> bool {
     let mut actors = runtime.actors.lock();
     let Some(route) = actors.get_mut(address) else {
@@ -64,4 +59,8 @@ pub fn begin_deactivation<S>(
     }
     route.state = RouteState::Deactivating;
     true
+}
+
+pub fn has_live_sessions(registry: &SessionRegistry, address: &ActorAddress) -> bool {
+    registry.session_count(address) > 0
 }

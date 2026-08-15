@@ -3,11 +3,13 @@ use std::sync::atomic::Ordering;
 
 use super::core::{FENCED, RUNNING, RuntimeInner, SHUTTING_DOWN, STOPPED};
 use crate::cluster::{NodeLease, wall_time_millis};
+use crate::{ActorAddress, SendError};
 
 impl<S> RuntimeInner<S>
 where
     S: Send + Sync + 'static,
 {
+    #[allow(dead_code)]
     pub(crate) fn has_authority(&self) -> bool {
         self.status.load(Ordering::Acquire) != FENCED
             && self
@@ -73,6 +75,10 @@ where
             tokio::task::yield_now().await;
             self.actors.lock().clear();
         }
+        self.terminate_all_sessions(SendError::RuntimeShuttingDown).await;
+        self.channels.lock().clear();
+        self.abort_inbound_tasks();
+        self.pending_opens.lock().clear();
         self.status.store(STOPPED, Ordering::Release);
         tracing::debug!(
             lifecycle = "shutdown",
@@ -104,5 +110,16 @@ where
             }
         }
         self.actors.lock().clear();
+        self.terminate_all_sessions(SendError::NodeFenced).await;
+        self.channels.lock().clear();
+        self.abort_inbound_tasks();
+        self.pending_opens.lock().clear();
+    }
+
+    async fn terminate_all_sessions(&self, error: SendError) {
+        let addresses: Vec<ActorAddress> = self.sessions.by_actor_addresses();
+        for address in addresses {
+            self.sessions.terminate_all(&address, error.clone()).await;
+        }
     }
 }

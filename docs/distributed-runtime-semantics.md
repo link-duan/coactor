@@ -6,10 +6,9 @@
 
 - CoActor 保持嵌入 consumer 进程的 Rust library，不要求独立 control plane。
 - consumer 必须显式选择 local 或 cluster mode；cluster mode 必须完整配置 distributed dependencies，不能静默退化为 local mode。
-- caller 继续只按 Actor Address 使用 typed Actor Ref；标记为 `#[coactor::command(remote)]` 的 command 对 Node location 透明。
-- remote-enabled command 必须只有一个实现 `prost::Message + Default` 的 request；success reply 与声明的 handler error 也必须满足相同的 wire decode 约束。普通 `#[coactor::command]` 只走本地 dispatch。
-- Node 间使用 Tonic gRPC 的通用 Invoke boundary；wire envelope 由 runtime 管理，业务 payload schema 由 consumer 管理。
-- consumer 负责业务 Protobuf schema 与 method rename 的 rolling-upgrade 兼容。
+- caller 继续只按 Actor Address 使用通用 `ActorRef`（按名字索引）；Session 的 Action/Event 对 Node location 透明。
+- 消息为字节负载，业务协议与 schema 兼容由 consumer 管理；Node 间使用 bidi gRPC stream（`Exchange(stream Envelope)`）多路复用，wire envelope 由 runtime 管理。
+- 每条 Action 仍按消息执行 ownership 解析；Session 是逻辑路由标签，不绑定物理连接。
 
 ## Node authority
 
@@ -17,8 +16,8 @@
 - Node Lease 包含 session、advertised endpoint、protocol version、expiry 与 advisory capacity sample。
 - 默认 lease TTL 为 10 秒，每 TTL/3 续租；ownership 单操作默认 15 秒 deadline，peer connect 默认 3 秒。
 - absolute expiry 使用本地 wall clock，本地 self-fence 使用同次操作锚定的 monotonic deadline；部署必须维持正常 NTP，CoActor 不保证任意 clock skew 下没有短暂 Owner overlap。
-- Owner runtime 在本地 command admission 与成功 reply 前检查 Node authority；lease renewal task 在 authority 失效后 fence runtime 并终止 Active Actor tasks。consumer side effect 不获得逐次 mutation fencing。
-- Node Lease 失效后，runtime fence 本节点的 Active Actor execution：本地 admission 被拒绝、未完成的本地/Owner 调用失败、全部 Active Actor 停止，并通过可 await 的 supervision boundary 报告 termination；library 不退出宿主进程。当前 ingress 对 foreign Owner 的纯转发不属于该 fail-stop 保证，consumer 应在收到 supervision 结果后停止使用该 Node。
+- Owner runtime 在本地 Action admission 与 Event 发送前检查 Node authority；lease renewal task 在 authority 失效后 fence runtime 并终止 Active Actor tasks。consumer side effect 不获得逐次 mutation fencing。
+- Node Lease 失效后，runtime fence 本节点的 Active Actor execution：本地 admission 被拒绝、全部 Active Actor 停止、Session 终止，并通过可 await 的 supervision boundary 报告 termination；library 不退出宿主进程。当前 ingress 对 foreign Owner 的纯转发不属于该 fail-stop 保证，consumer 应在收到 supervision 结果后停止使用该 Node。
 
 ## Actor ownership and routing
 
@@ -29,36 +28,37 @@
 - CAS conditional rejection 表示竞争者改变了 record，调用重新解析 Owner。
 - CAS completion ambiguous 时必须 read-back 精确 Node Session 与 Ownership Epoch，最多协调三轮；不能把写超时直接当成失败并重新 claim。
 - foreign Owner 的 Node Lease 明确缺失或过期时才允许 takeover；lease 读取失败不得推断 Owner 已死。
-- never-connected 与明确 remote-not-owner 可以各安全刷新路由一次；请求可能已到达 peer 后的失败不自动重放，并返回结构化 outcome-unknown error。
-- incompatible runtime protocol、未注册 Actor Type 或未知 command 必须返回明确的远程协议错误。
+- incompatible runtime protocol、未注册 Actor Type 必须返回明确的远程协议错误。
+- 到某 Node 的连接断开时，失效所有指向该 Node 的解析缓存（`invalidate_endpoint`），使后续消息重新解析到新的 Owner。
 
 ## Capacity and passivation
 
 - Node Lease 发布 sampled-at、active/max 与 pressured/draining 等 advisory capacity；它不替代目标 Node 的本地 admission。
-- ingress 本地满时确定性选择一个 live、non-pressured candidate；目标拒绝后最多改选一次，仍失败则返回 runtime capacity error。
-- remote Owner 的 mailbox 满载仍返回与本地一致的 mailbox overload error，transport 不建立额外 command queue。
-- idle passivation 先完成 deactivation 并彻底停止 Active Actor，再 CAS release Actor Owner Record 为 unowned；release 未确认前不得在别处重新激活。
-- graceful shutdown 停止 admission、drain 已接纳 command、执行 shutdown deactivation，最后条件释放当前 Node Lease；Actor Owner Record 保留供更高 epoch takeover。
+- 本地/远程 mailbox 满载均返回与本地一致的 `MailboxFull`，transport 不建立额外消息 queue。
+- idle passivation 仅在无存活 Session 时触发（与 local 语义一致）；先完成 deactivation 并彻底停止 Active Actor，再 CAS release Actor Owner Record 为 unowned；release 未确认前不得在别处重新激活。
+- graceful shutdown 停止 admission、drain 已接纳消息、终止 Session、执行 shutdown deactivation，最后条件释放当前 Node Lease；Actor Owner Record 保留供更高 epoch takeover。
 
 ## Availability Failover
 
 - Owner Node Lease 明确过期或缺失后，新 Node 可以用旧 Actor Owner Record ETag CAS 到 epoch + 1。
 - 新 Owner 通过正常 constructor 与 activation lifecycle 从空 CoActor 状态启动。
+- **failover 显式打断旧 Session**：旧 Owner 的 Session 记录随其消亡，caller 的接收流终止，必须重新 `open()` 才能在新 Owner 上建立会话。`on_session_opened` 不重放（ADR-0005）。
+- 惰性检测：caller 下次 `send()` 时 resolve 到的 Owner 与 Session 建立时不同，即返回可感知的错误（如 `RemoteUnavailable`）；连接断开会使解析缓存失效并强制重新解析。旧 Owner 静默死亡且 caller 无后续活动时，终止可能延迟到下一次活动。
 - consumer 可以在 activation 中读取自身数据库重建状态，但其一致性、幂等与 fencing 不属于 CoActor 保证。
 - 该能力称为 Availability Failover，不称为 Recovery；本 slice 不提供 Actor Store、Restore Cut 或 durable state。
 
-## Reply and failure semantics
+## Event and failure semantics
 
-- Handler Reply 只表示 handler 本地完成且 reply 时仍通过本地 Node authority check；它不是 Durable ACK，也不证明状态能在 failover 后恢复。
-- 每次 reply 不执行 S3 Actor Owner Record reread。
+- Event 只表示 handler 本地完成且发送时仍通过本地 Node authority check；它不是 Durable ACK，也不证明状态能在 failover 后恢复。
+- 每次 Event 发送不执行 S3 Actor Owner Record reread。
 - consumer 外部数据库写、HTTP 调用和其他 side effect 不受 CoActor fencing；需要时由 consumer 使用 epoch、CAS、transaction 或 idempotency 控制。
-- public call error 使用 `SendError` 的 `OwnershipUnavailable`、`NodeFenced`、`RemoteUnavailable`、`RemoteProtocol`、`RuntimeAtCapacity` 与 `OutcomeUnknown` 等结构化分类，不暴露 Tonic 或 AWS SDK 具体错误类型。
-- caller 可以使用 consumer runtime 的普通 timeout 放弃等待；这不会撤销已被本地或远端 mailbox 接纳的 command，本 slice 也不传播 per-call wire deadline。
+- public API error 使用 `SendError` 的 `MailboxFull`、`ActivationFailed`、`ActorDeactivating`、`RuntimeAtCapacity`、`RuntimeShuttingDown`、`ActorStopped`、`RuntimeStopped`、`NodeFenced`、`RemoteUnavailable`、`OwnershipUnavailable` 与 `RemoteProtocol` 等结构化分类，不暴露 Tonic 或 AWS SDK 具体错误类型。
+- caller 可以使用 consumer runtime 的普通 timeout 放弃等待；这不会撤销已被本地或远端 mailbox 接纳的 Action，本 slice 也不传播 per-call wire deadline。
 
 ## Verification boundary
 
 - ownership protocol 通过 crate-private backend seam 做确定性测试；fake 可控制 ETag、CAS race、clock、response loss、ambiguous completion 与 lease expiry，该 seam 不是 consumer API。
-- 最高层验收以多个真实 CoActor runtime、loopback gRPC endpoint 与共享 ownership storage 实现运行 typed Actor Ref 调用。
+- 最高层验收以多个真实 CoActor runtime、loopback bidi gRPC endpoint 与共享 ownership storage 运行跨节点 Session 消息。
 - AWS adapter 使用本地 HTTP contract server 验证 conditional headers、ETag、错误分类与 SDK retry 行为。
 - S3-compatible local endpoint 可用于集成验证，但兼容实现不替代真实 AWS qualification。
-- real AWS qualification suite 默认不运行，是首次生产发布条件。在其通过前只能表述为“面向 AWS S3 语义设计”。
+- real AWS qualification suite 默认不运行，是首次生产发布条件。在其通过前只能表述为"面向 AWS S3 语义设计"。

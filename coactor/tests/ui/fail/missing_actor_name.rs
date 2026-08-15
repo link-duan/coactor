@@ -1,16 +1,18 @@
-use std::sync::Arc;
-use coactor::{ActorId, CommandContext, actor};
+use coactor::{Actor, ActorRuntime, MessageContext, actor};
 
-struct MissingName;
+struct NoNameActor;
 
 #[actor]
-impl MissingName {
-    pub fn new(_actor_id: ActorId, _state: Arc<()>) -> Self {
+struct ActorWithoutName;
+
+impl Actor<()> for ActorWithoutName {
+    fn new(_runtime: ActorRuntime<()>) -> Self {
         Self
     }
 
-    #[coactor::command]
-    pub async fn call(&mut self, _context: &CommandContext) {}
+    async fn on_message(&mut self, _ctx: &MessageContext, _msg: &[u8]) {}
 }
 
-fn main() {}
+fn main() {
+    let _ = NoNameActor;
+}

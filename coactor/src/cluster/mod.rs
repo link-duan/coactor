@@ -17,6 +17,6 @@ pub(crate) use authority::{
     VersionedNodeLease, confirm_node_lease, wall_time_millis,
 };
 pub(crate) use node::{ClusterTasks, NodeAuthority, PeerTask, RenewalTask, spawn_peer};
-pub(crate) use routing::{ClusterRouter, LocalResolution, ResolvedOwner};
+pub(crate) use routing::{ClusterRouter, ResolvedOwner};
 pub(crate) use s3::S3OwnershipBackend;
-pub(crate) use transport::invoke_peer;
+pub(crate) use transport::connect_channel;

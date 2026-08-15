@@ -1,39 +1,23 @@
-use std::sync::Arc;
-
-use coactor::{ActorId, CommandContext, RuntimeBuilder, actor};
-
-struct Counter(i64);
+use coactor::{Actor, ActorRuntime, MessageContext, RuntimeBuilder, actor};
 
 #[actor(name = "counter")]
-impl Counter {
-    pub fn new(_actor_id: ActorId, _state: Arc<()>) -> Self {
-        Self(0)
+struct CounterActor {
+    value: i64,
+}
+
+impl Actor<()> for CounterActor {
+    fn new(_runtime: ActorRuntime<()>) -> Self {
+        Self { value: 0 }
     }
 
-    pub async fn on_activate(
-        &mut self,
-    ) -> Result<(), &'static str> {
-        Ok(())
-    }
-
-    pub async fn on_deactivate(
-        &mut self,
-        _reason: coactor::DeactivationReason,
-    ) {
-    }
-
-    #[coactor::command]
-    pub async fn add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
-        self.0 += amount;
-        self.0
-    }
-
-    #[coactor::command]
-    pub async fn checked(&mut self, _context: &CommandContext) -> Result<i64, &'static str> {
-        Ok(self.0)
+    async fn on_message(&mut self, ctx: &MessageContext, msg: &[u8]) {
+        if let Ok(amount) = std::str::from_utf8(msg).unwrap().parse::<i64>() {
+            self.value += amount;
+            let _ = ctx.send(self.value.to_be_bytes().to_vec()).await;
+        }
     }
 }
 
 fn main() {
-    let _builder = RuntimeBuilder::local(()).register::<Counter>();
+    let _builder = RuntimeBuilder::local(()).register::<CounterActor>();
 }

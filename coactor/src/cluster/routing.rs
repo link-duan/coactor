@@ -4,14 +4,15 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::wall_time_millis;
 use crate::{
-    __macro::RuntimeError, ActorAddress, ActorOwner, ActorOwnerRecord, LeaseMutation,
-    NodeSessionId, OwnershipBackend,
+    ActorAddress, ActorOwner, ActorOwnerRecord, LeaseMutation, NodeSessionId, OwnershipBackend,
+    SendError,
 };
 
 pub(crate) struct ClusterRouter {
     storage: Arc<dyn OwnershipBackend>,
     node_id: String,
     session_id: NodeSessionId,
+    local_endpoint: String,
     operation_timeout: Duration,
     pub(crate) peer_connect_timeout: Duration,
     resolutions: tokio::sync::Mutex<HashMap<ActorAddress, Arc<tokio::sync::Mutex<()>>>>,
@@ -23,6 +24,7 @@ impl ClusterRouter {
         storage: Arc<dyn OwnershipBackend>,
         node_id: String,
         session_id: NodeSessionId,
+        local_endpoint: String,
         operation_timeout: Duration,
         peer_connect_timeout: Duration,
     ) -> Arc<Self> {
@@ -30,11 +32,16 @@ impl ClusterRouter {
             storage,
             node_id,
             session_id,
+            local_endpoint,
             operation_timeout,
             peer_connect_timeout,
             resolutions: tokio::sync::Mutex::new(HashMap::new()),
             resolved: tokio::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn local_node_endpoint(&self) -> String {
+        self.local_endpoint.clone()
     }
 
     async fn resolution_lock(&self, address: &ActorAddress) -> Arc<tokio::sync::Mutex<()>> {
@@ -65,7 +72,7 @@ impl ClusterRouter {
         &self,
         address: &ActorAddress,
         capacity: &Arc<Semaphore>,
-    ) -> Result<ResolvedOwner, RuntimeError> {
+    ) -> Result<ResolvedOwner, SendError> {
         let lock = self.resolution_lock(address).await;
         let guard = lock.lock_owned().await;
         if let Some(cached) = self.resolved.lock().await.get(address).cloned() {
@@ -82,7 +89,7 @@ impl ClusterRouter {
                     protocol_version,
                 },
                 CachedOwner::ReleasePending => {
-                    return Err(RuntimeError::OwnershipUnavailable);
+                    return Err(SendError::OwnershipUnavailable);
                 }
             });
         }
@@ -92,8 +99,8 @@ impl ClusterRouter {
                 self.storage.read_actor_owner(address),
             )
             .await
-            .map_err(|_| RuntimeError::OwnershipUnavailable)?
-            .map_err(|_| RuntimeError::OwnershipUnavailable)?;
+            .map_err(|_| SendError::OwnershipUnavailable)?
+            .map_err(|_| SendError::OwnershipUnavailable)?;
             if let Some(current) = current.as_ref() {
                 if self.is_local_owner(&current.record) {
                     self.resolved
@@ -111,8 +118,8 @@ impl ClusterRouter {
                         self.storage.read_node_lease(&owner.session_id),
                     )
                     .await
-                    .map_err(|_| RuntimeError::OwnershipUnavailable)?
-                    .map_err(|_| RuntimeError::OwnershipUnavailable)?;
+                    .map_err(|_| SendError::OwnershipUnavailable)?
+                    .map_err(|_| SendError::OwnershipUnavailable)?;
                     if let Some(lease) = lease {
                         if lease.lease.expires_at_unix_ms > wall_time_millis() {
                             let endpoint = format!("http://{}", lease.lease.advertised_address);
@@ -148,15 +155,15 @@ impl ClusterRouter {
             let reservation = capacity
                 .clone()
                 .try_acquire_owned()
-                .map_err(|_| RuntimeError::RuntimeAtCapacity)?;
+                .map_err(|_| SendError::RuntimeAtCapacity)?;
             let mutation = tokio::time::timeout(
                 self.operation_timeout,
                 self.storage
                     .claim_actor_owner(address, expected.clone(), etag),
             )
             .await
-            .map_err(|_| RuntimeError::OwnershipUnavailable)?
-            .map_err(|_| RuntimeError::OwnershipUnavailable)?;
+            .map_err(|_| SendError::OwnershipUnavailable)?
+            .map_err(|_| SendError::OwnershipUnavailable)?;
             match mutation {
                 LeaseMutation::Applied { .. } => {
                     self.resolved
@@ -200,35 +207,31 @@ impl ClusterRouter {
                     if should_reresolve {
                         continue;
                     }
-                    return Err(RuntimeError::OwnershipUnavailable);
+                    return Err(SendError::OwnershipUnavailable);
                 }
             }
         }
-        Err(RuntimeError::OwnershipUnavailable)
+        Err(SendError::OwnershipUnavailable)
     }
 
-    pub(crate) async fn resolve_local(
-        &self,
-        address: &ActorAddress,
-        capacity: &Arc<Semaphore>,
-    ) -> Result<LocalResolution, RuntimeError> {
-        match self.resolve(address, capacity).await? {
-            ResolvedOwner::Local { reservation, guard } => Ok(LocalResolution {
-                reservation,
-                guard: Some(guard),
-            }),
-            ResolvedOwner::Remote { .. } => Err(RuntimeError::NotOwner),
-        }
-    }
-
+    #[allow(dead_code)]
     pub(crate) async fn invalidate(&self, address: &ActorAddress) {
         self.resolved.lock().await.remove(address);
+    }
+
+    /// 到某 Node 的连接断开时，失效所有指向该 Node 的解析缓存（failover 惰性检测依赖）。
+    pub(crate) async fn invalidate_endpoint(&self, endpoint: &str) {
+        let mut resolved = self.resolved.lock().await;
+        resolved.retain(|_, owner| match owner {
+            CachedOwner::Remote { endpoint: cached, .. } => cached != endpoint,
+            _ => true,
+        });
     }
 
     pub(crate) async fn release_local_owner(
         &self,
         address: &ActorAddress,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<(), SendError> {
         let lock = self.resolution_lock(address).await;
         let _guard = lock.lock_owned().await;
         self.resolved
@@ -240,19 +243,19 @@ impl ClusterRouter {
             self.storage.read_actor_owner(address),
         )
         .await
-        .map_err(|_| RuntimeError::OwnershipUnavailable)?
-        .map_err(|_| RuntimeError::OwnershipUnavailable)?
-        .ok_or(RuntimeError::OwnershipUnavailable)?;
+        .map_err(|_| SendError::OwnershipUnavailable)?
+        .map_err(|_| SendError::OwnershipUnavailable)?
+        .ok_or(SendError::OwnershipUnavailable)?;
         if !self.is_local_owner(&current.record) {
-            return Err(RuntimeError::OwnershipUnavailable);
+            return Err(SendError::OwnershipUnavailable);
         }
         let released = tokio::time::timeout(
             self.operation_timeout,
             self.storage.release_actor_owner(address, &current),
         )
         .await
-        .map_err(|_| RuntimeError::OwnershipUnavailable)?
-        .map_err(|_| RuntimeError::OwnershipUnavailable)?;
+        .map_err(|_| SendError::OwnershipUnavailable)?
+        .map_err(|_| SendError::OwnershipUnavailable)?;
         let confirmed = match released {
             LeaseMutation::Applied { .. } => true,
             LeaseMutation::ConditionalRejected | LeaseMutation::Ambiguous(_) => {
@@ -278,20 +281,21 @@ impl ClusterRouter {
             }
         };
         if !confirmed {
-            return Err(RuntimeError::OwnershipUnavailable);
+            return Err(SendError::OwnershipUnavailable);
         }
         self.resolved.lock().await.remove(address);
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn placement_candidates(
         &self,
         protocol_version: u32,
-    ) -> Result<Vec<(String, u32)>, RuntimeError> {
+    ) -> Result<Vec<(String, u32)>, SendError> {
         let leases = tokio::time::timeout(self.operation_timeout, self.storage.list_node_leases())
             .await
-            .map_err(|_| RuntimeError::OwnershipUnavailable)?
-            .map_err(|_| RuntimeError::OwnershipUnavailable)?;
+            .map_err(|_| SendError::OwnershipUnavailable)?
+            .map_err(|_| SendError::OwnershipUnavailable)?;
         let now = wall_time_millis();
         let mut candidates: Vec<_> = leases
             .into_iter()
@@ -329,21 +333,18 @@ pub(crate) enum ResolvedOwner {
         reservation: Option<OwnedSemaphorePermit>,
         guard: tokio::sync::OwnedMutexGuard<()>,
     },
+    #[allow(dead_code)]
     Remote {
         endpoint: String,
         protocol_version: u32,
     },
 }
 
-pub(crate) struct LocalResolution {
-    pub(crate) reservation: Option<OwnedSemaphorePermit>,
-    pub(crate) guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-}
-
 #[derive(Clone)]
 enum CachedOwner {
     Local,
     ReleasePending,
+    #[allow(dead_code)]
     Remote {
         endpoint: String,
         protocol_version: u32,

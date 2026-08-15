@@ -369,6 +369,7 @@ where
             self.storage.clone(),
             self.config.node_id.clone(),
             session_id,
+            format!("http://{}", self.config.advertised_address),
             self.config.lease_timing.operation_timeout,
             self.config.lease_timing.peer_connect_timeout,
         );

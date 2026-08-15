@@ -3,16 +3,17 @@ use std::{any::Any, sync::Arc};
 use futures_util::FutureExt;
 use tokio::sync::{mpsc, watch};
 
-use super::command::{Command, CommandOutcome, RuntimeError};
+use super::actor::MessageOutcome;
 use super::core::RuntimeInner;
-use super::route::{Spawned, begin_deactivation, remove_route};
-use crate::{ActorAddress, CommandContext, DeactivationReason};
+use super::message::{Handle, MailboxMessage, SessionHook};
+use super::route::{Spawned, begin_deactivation, has_live_sessions, remove_route};
+use crate::{ActorAddress, DeactivationReason, SendError};
 
 pub fn spawn_actor<S>(
     runtime: Arc<RuntimeInner<S>>,
     address: ActorAddress,
     generation: u64,
-) -> Spawned<S>
+) -> Spawned
 where
     S: Send + Sync + 'static,
 {
@@ -23,17 +24,22 @@ where
     let mailbox_capacity = registration
         .mailbox_capacity
         .expect("mailbox capacity was not configured");
-    let create = registration.create;
-    let activate = registration.activate;
-    let deactivate = registration.deactivate;
     let idle_timeout = registration
         .idle_timeout
         .expect("idle timeout was not configured");
-    let mut actor = create(address.actor_id().clone(), runtime.state.clone());
-    let (sender, mut receiver) = mpsc::channel::<Command<S>>(mailbox_capacity);
+    let actor_runtime = runtime.make_actor_runtime(&address);
+    let mut actor = (registration.create)(actor_runtime);
+    let activate = registration.activate;
+    let deactivate = registration.deactivate;
+    let handle = registration.handle;
+    let session_opened = registration.session_opened;
+    let session_closed = registration.session_closed;
+
+    let (sender, mut receiver) = mpsc::channel::<MailboxMessage>(mailbox_capacity);
     let task_sender = sender.clone();
     let (shutdown, mut shutdown_receiver) = watch::channel(false);
     let (completion_sender, completed) = watch::channel(false);
+
     let task = tokio::spawn(async move {
         let _task_guard = ActorTaskGuard {
             runtime: runtime.clone(),
@@ -41,26 +47,11 @@ where
             generation,
             completion: completion_sender,
         };
-        tracing::debug!(
-            actor_type = address.actor_type(),
-            actor_id = ?address.actor_id(),
-            lifecycle = "activation",
-            error_category = "None",
-            "Actor activation started"
-        );
         match std::panic::AssertUnwindSafe(activate(actor.as_mut()))
             .catch_unwind()
             .await
         {
-            Ok(Ok(())) => {
-                tracing::debug!(
-                    actor_type = address.actor_type(),
-                    actor_id = ?address.actor_id(),
-                    lifecycle = "activation",
-                    error_category = "None",
-                    "Actor activation completed"
-                );
-            }
+            Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::error!(
                     actor_type = address.actor_type(),
@@ -72,9 +63,11 @@ where
                 );
                 receiver.close();
                 remove_route(&runtime, &address, generation);
-                while let Ok(command) = receiver.try_recv() {
-                    command.fail(RuntimeError::ActivationFailed);
-                }
+                fail_pending(&mut receiver, SendError::ActivationFailed);
+                runtime
+                    .sessions
+                    .terminate_all(&address, SendError::ActivationFailed)
+                    .await;
                 return;
             }
             Err(_) => {
@@ -87,30 +80,31 @@ where
                 );
                 receiver.close();
                 remove_route(&runtime, &address, generation);
-                while let Ok(command) = receiver.try_recv() {
-                    command.fail(RuntimeError::ActorStopped);
-                }
+                fail_pending(&mut receiver, SendError::ActorStopped);
+                runtime
+                    .sessions
+                    .terminate_all(&address, SendError::ActorStopped)
+                    .await;
                 return;
             }
         }
+
         loop {
-            let command = tokio::select! {
+            let message = tokio::select! {
                 biased;
                 changed = shutdown_receiver.changed() => {
                     if changed.is_ok() && *shutdown_receiver.borrow() {
                         receiver.close();
-                        while let Some(command) = receiver.recv().await {
-                            if !execute_command(
-                                command,
-                                actor.as_mut(),
-                                &runtime,
-                                &address,
-                                generation,
-                                &mut receiver,
-                            ).await {
+                        while let Some(message) = receiver.recv().await {
+                            tracing::debug!(actor_type = address.actor_type(), "drain message");
+                            if !execute_message(&runtime, actor.as_mut(), &address, &handle, &session_opened, &session_closed, message).await {
+                                runtime.sessions.terminate_all(&address, SendError::ActorStopped).await;
                                 return;
                             }
                         }
+                        tracing::debug!(actor_type = address.actor_type(), "drain complete; terminating sessions");
+                        runtime.sessions.terminate_all(&address, SendError::RuntimeShuttingDown).await;
+                        tracing::debug!(actor_type = address.actor_type(), "sessions terminated");
                         tracing::debug!(
                             actor_type = address.actor_type(),
                             actor_id = ?address.actor_id(),
@@ -150,12 +144,15 @@ where
                 }
                 received = tokio::time::timeout(idle_timeout, receiver.recv()) => {
                     match received {
-                        Ok(Some(command)) => command,
+                        Ok(Some(message)) => message,
                         Ok(None) => {
                             remove_route(&runtime, &address, generation);
                             return;
                         }
                         Err(_) => {
+                            if has_live_sessions(&runtime.sessions, &address) {
+                                continue;
+                            }
                             if !begin_deactivation(&runtime, &address, generation, &task_sender) {
                                 continue;
                             }
@@ -219,16 +216,21 @@ where
                     }
                 }
             };
-            if !execute_command(
-                command,
-                actor.as_mut(),
+            if !execute_message(
                 &runtime,
+                actor.as_mut(),
                 &address,
-                generation,
-                &mut receiver,
+                &handle,
+                &session_opened,
+                &session_closed,
+                message,
             )
             .await
             {
+                runtime
+                    .sessions
+                    .terminate_all(&address, SendError::ActorStopped)
+                    .await;
                 return;
             }
         }
@@ -255,48 +257,65 @@ impl<S> Drop for ActorTaskGuard<S> {
     }
 }
 
-async fn execute_command<S>(
-    command: Command<S>,
-    actor: &mut (dyn Any + Send),
+async fn execute_message<S>(
     runtime: &RuntimeInner<S>,
+    actor: &mut (dyn Any + Send),
     address: &ActorAddress,
-    generation: u64,
-    receiver: &mut mpsc::Receiver<Command<S>>,
+    handle: &Handle,
+    session_opened: &SessionHook,
+    session_closed: &SessionHook,
+    message: MailboxMessage,
 ) -> bool
 where
     S: Send + Sync + 'static,
 {
-    let context = CommandContext {
-        address: address.clone(),
-    };
-    let CommandOutcome::Panicked(fail_current) = command.execute(actor, context).await else {
-        if runtime
-            .authority
-            .as_ref()
-            .is_some_and(|authority| !authority.is_valid())
-        {
-            receiver.close();
-            remove_route(runtime, address, generation);
-            while let Ok(command) = receiver.try_recv() {
-                command.fail(RuntimeError::NodeFenced);
+    match message {
+        MailboxMessage::Action { session_id, payload } => {
+            let ctx = runtime.make_message_context(address, session_id);
+            match std::panic::AssertUnwindSafe(handle(actor, &ctx, &payload))
+                .catch_unwind()
+                .await
+            {
+                Ok(MessageOutcome::Completed) => true,
+                Ok(MessageOutcome::Panicked) => false,
+                Err(_) => false,
             }
-            return false;
         }
-        return true;
-    };
-
-    tracing::error!(
-        actor_type = address.actor_type(),
-        actor_id = ?address.actor_id(),
-        lifecycle = "command",
-        error_category = "ActorStopped",
-        "Actor command handler panicked"
-    );
-    receiver.close();
-    remove_route(runtime, address, generation);
-    while let Ok(command) = receiver.try_recv() {
-        command.fail(RuntimeError::ActorStopped);
+        MailboxMessage::SessionOpened {
+            session_id, complete, ..
+        } => {
+            let ctx = runtime.make_message_context(address, session_id);
+            match std::panic::AssertUnwindSafe(session_opened(actor, &ctx))
+                .catch_unwind()
+                .await
+            {
+                Ok(()) => {
+                    let _ = complete.send(Ok(()));
+                    true
+                }
+                Err(_) => {
+                    let _ = complete.send(Err(SendError::ActorStopped));
+                    false
+                }
+            }
+        }
+        MailboxMessage::SessionClosed { session_id } => {
+            let ctx = runtime.make_message_context(address, session_id);
+            match std::panic::AssertUnwindSafe(session_closed(actor, &ctx))
+                .catch_unwind()
+                .await
+            {
+                Ok(()) => true,
+                Err(_) => false,
+            }
+        }
     }
-    fail_current();
-    false
+}
+
+fn fail_pending(receiver: &mut mpsc::Receiver<MailboxMessage>, error: SendError) {
+    while let Ok(message) = receiver.try_recv() {
+        if let MailboxMessage::SessionOpened { complete, .. } = message {
+            let _ = complete.send(Err(error.clone()));
+        }
+    }
 }

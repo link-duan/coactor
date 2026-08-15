@@ -12,6 +12,8 @@ use crate::{
 };
 #[cfg(test)]
 use crate::{ClusterRuntimeConfig, OwnershipBackend};
+use crate::runtime::core::ActorRef;
+use crate::runtime::session::SessionRegistry;
 
 pub struct RuntimeBuilder<S> {
     state: S,
@@ -179,6 +181,7 @@ where
                 state: Arc::new(self.state),
                 registrations,
                 actors: Mutex::new(HashMap::new()),
+                sessions: SessionRegistry::new(),
                 capacity: Arc::new(Semaphore::new(self.max_active_actors)),
                 max_active_actors: self.max_active_actors,
                 deactivation_timeout: self.deactivation_timeout,
@@ -188,6 +191,9 @@ where
                 peer_protocol_version: self.peer_protocol_version,
                 authority,
                 cluster,
+                channels: Mutex::new(HashMap::new()),
+                inbound_tasks: Mutex::new(Vec::new()),
+                pending_opens: Mutex::new(HashMap::new()),
             }),
             cluster: None,
         })
@@ -203,17 +209,15 @@ impl<S> Runtime<S>
 where
     S: Send + Sync + 'static,
 {
-    pub fn actor_ref<A>(&self, actor_id: ActorId) -> Result<A::Ref, ActorRefError>
-    where
-        A: __macro::ActorType<S>,
-    {
-        if !self.inner.registrations.contains_key(A::NAME) {
-            return Err(ActorRefError::ActorTypeNotRegistered(A::NAME));
+    /// 按 Actor Type 名字 + Actor ID 获取通用地址句柄；未注册名字立即报错。
+    pub fn actor(&self, actor_type: &str, actor_id: ActorId) -> Result<ActorRef<S>, ActorRefError> {
+        if !self.inner.registrations.contains_key(actor_type) {
+            return Err(ActorRefError::ActorTypeNotRegistered(actor_type.to_owned()));
         }
-        Ok(A::make_ref(__macro::ActorRef {
+        Ok(ActorRef {
             runtime: Arc::downgrade(&self.inner),
-            address: ActorAddress::new(A::NAME, actor_id),
-        }))
+            address: ActorAddress::new(actor_type, actor_id),
+        })
     }
 
     pub(crate) fn spawn_peer(&self, listener: tokio::net::TcpListener) -> PeerTask {
@@ -248,16 +252,19 @@ where
     }
 }
 
-pub(crate) mod command;
+pub(crate) mod actor;
 pub(crate) mod core;
 pub(crate) mod lifecycle;
+pub(crate) mod message;
 pub(crate) mod route;
+pub(crate) mod session;
 pub(crate) mod shutdown;
 
 #[cfg(test)]
 pub(crate) mod testing {
     use super::RuntimeBuilder;
 
+    #[allow(dead_code)]
     pub fn with_peer_protocol_version<S>(
         mut builder: RuntimeBuilder<S>,
         version: u32,

@@ -67,6 +67,8 @@ impl NodeAuthority {
 
 pub struct PeerTask {
     pub shutdown: oneshot::Sender<()>,
+    /// shutdown 触发后立即终止 serve（不等外部连接），runtime 已终止全部 session。
+    pub force: oneshot::Sender<()>,
     pub task: tokio::task::JoinHandle<()>,
 }
 
@@ -100,6 +102,7 @@ impl ClusterTasks {
                     .await;
             }
         }
+        let _ = self.peer.force.send(());
         let _ = self.peer.task.await;
     }
 }
@@ -109,16 +112,26 @@ where
     S: Send + Sync + 'static,
 {
     let (shutdown, shutdown_receiver) = oneshot::channel();
+    let (force, force_receiver) = oneshot::channel();
     let service = PeerService { runtime };
     let task = tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
+        let serve = tonic::transport::Server::builder()
             .add_service(peer_protocol::peer_server::PeerServer::new(service))
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 let _ = shutdown_receiver.await;
-            })
-            .await;
+            });
+        tokio::select! {
+            result = serve => {
+                let _ = result;
+            }
+            _ = force_receiver => {}
+        }
     });
-    PeerTask { shutdown, task }
+    PeerTask {
+        shutdown,
+        force,
+        task,
+    }
 }
 
 pub fn spawn_lease_renewal<S>(

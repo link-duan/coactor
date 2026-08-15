@@ -21,7 +21,7 @@ Actor Type 与 Actor ID 的稳定组合，是 runtime 用于寻址 Actor 的完�
 _Avoid_: Actor ID, Entity ID, local handle
 
 **Actor Ref**:
-macro 为每个 Actor Type 生成的专用类型安全稳定地址句柄，例如 `RoomActorRef`；每个 command 是其 inherent async method。它只弱引用 runtime，持有或 clone 不会保持 runtime/Actor 存活，也不会阻止 passivation。
+macro 为每个 Actor Type 生成的专用稳定地址句柄，例如 `RoomActorRef`；它通过 `open()` 建立与 Actor 的 Session。它只弱引用 runtime，持有或 clone 不会保持 runtime/Actor 存活，也不会阻止 passivation。
 _Avoid_: Actor Address, untyped byte channel
 
 **Active Actor**:
@@ -29,15 +29,31 @@ _Avoid_: Actor Address, untyped byte channel
 _Avoid_: Actor, Entity, Tokio task
 
 **Actor Stopped**:
-Active Actor 因 handler panic 或异常 task 终止而无法继续处理已接纳 command 的失败结果；后续 command 可以创建新的空状态实例。
+Active Actor 因 handler panic 或异常 task 终止而无法继续处理已接纳 Action 的失败结果；后续 Action 可以创建新的空状态实例。
 _Avoid_: Passivation, deactivation
 
-**Command**:
-caller 对 Actor method 的一次 request-response 调用；macro 将方法调用转换为内部消息，每个 command 必须产生业务结果或可观察的 runtime error。
-_Avoid_: Event, fire-and-forget message
+**Action**:
+caller 通过 Session 向 Actor 发送的入站消息，字节负载，无 reply 语义；Actor 处理 Action 不产生同步结果，任何输出都以 Event 形式推送。
+_Avoid_: Command, request, method call
+
+**Event**:
+Actor 通过 Session Handle 推送给 caller 的出站消息，字节负载；Actor 可随时推送，不要求对应一次 Action。它不证明对应 mutation 已持久化，crash 后可能丢失。
+_Avoid_: Reply, response, Durable ACK
+
+**Session**:
+caller 与 Actor 之间的一次持久双向通道；所有 Action 都经 Session 入站，Event 经 Session 出站。它由 Actor Ref 的 `open()` 建立，其存活规则由 runtime 生命周期定义。
+_Avoid_: Connection handle, command channel
+
+**Session Handle**:
+Actor 侧持有的、可 clone 的 Session 出站句柄；Actor 通过它向对应 caller 推送 Event，可存入 Actor 状态用于广播。
+_Avoid_: Reply channel, caller reference
+
+**Session ID**:
+Session 的唯一标识，由 caller 建立 Session 时生成；Action 与 Event 消息用它寻址，也是运行时 Session 记录与路由的标签。
+_Avoid_: Connection ID, message ID
 
 **Send Error**:
-Actor method 调用的统一失败类型，既包含 mailbox、lifecycle 与 Actor 停止等 runtime failure，也以 `HandlerError(E)` 承载方法声明的业务错误。
+Action 投递与 Event 推送的统一失败类型，包含 mailbox、lifecycle 与 Actor 停止等 runtime failure；业务错误不属于 Send Error，由 Event 表达。
 _Avoid_: Nested runtime and handler Results
 
 **Passivation**:
@@ -45,7 +61,7 @@ Active Actor 在满足安全条件后退出；它不删除 Actor 的逻辑身份
 _Avoid_: Deletion, shutdown
 
 **Deactivating**:
-Active Actor 已开始执行 deactivation lifecycle、不可再恢复服务的临时状态；路由保留到 lifecycle 结束，新 command 返回可重试错误。
+Active Actor 已开始执行 deactivation lifecycle、不可再恢复服务的临时状态；路由保留到 lifecycle 结束，新 Action 返回可重试错误。
 _Avoid_: Idle, passivation candidate
 
 **Ownership Epoch**:
@@ -53,7 +69,7 @@ ownership CAS 产生的单调 Owner 世代；它区分同一 Actor Address 的�
 _Avoid_: Process generation, activation number
 
 **Owner**:
-当前被授权为某个 Actor Address 处理命令的 runtime 节点；授权必须与 Ownership Epoch 一起判断。
+当前被授权为某个 Actor Address 处理 Action 的 runtime 节点；授权必须与 Ownership Epoch 一起判断。
 _Avoid_: Active Actor location, registry entry
 
 **Fencing**:
@@ -65,12 +81,10 @@ _Avoid_: Heartbeat alone, process shutdown alone
 _Avoid_: Graceful shutdown, lease renewal
 
 **Durable ACK Gate**:
-在持久化证明覆盖本次 mutation 之前扣留 durable success response 的边界。CoActor 当前不提供 durable ACK，因此普通 Handler Reply 不经过该边界。
-_Avoid_: Handler Reply, enqueue ACK
+在持久化证明覆盖本次 mutation 之前扣留 durable success response 的边界。CoActor 当前不提供 durable ACK，因此普通 Event 不经过该边界。
+_Avoid_: Event, enqueue ACK
 
-**Handler Reply**:
-Actor 完成本地 command handling 后返回的结果；它不证明对应 mutation 已持久化，crash 后可能丢失。
-_Avoid_: Durable ACK, commit receipt
+
 
 **Restore Cut**:
 新 Owner 获得 Ownership Epoch 后，从小于新 epoch 的最大现存 state epoch 第一次成功读取时固定的确定版本，由 source epoch、Actor Store revision 与 object ETag 标识。
@@ -86,10 +100,10 @@ _Avoid_: Recovery, restart
 
 **Actor Lifecycle Method**:
 由 runtime 在确定生命周期阶段调用并等待、由 consumer 异步实现的 Actor 方法；consumer 可在其中执行 restore 或持久化。
-_Avoid_: Command handler, arbitrary callback
+_Avoid_: Action handler, arbitrary callback
 
-**Command Context**:
-runtime 为一次 Command invocation 提供的最小只读运行环境；它只标识当前 Actor，不是 Actor 的业务状态，也不提供跨 Actor 调用。
+**Message Context**:
+runtime 为一次 Action 处理提供的最小只读运行环境；它标识当前 Actor，并携带当前 Session 的出站句柄，供 Actor 推送 Event。它不是 Actor 的业务状态，也不提供跨 Actor 调用。
 _Avoid_: Actor Context, Actor state, global variable
 
 **App State**:
@@ -109,11 +123,11 @@ _Avoid_: Global KV, raw object-store client
 _Avoid_: In-memory state, one S3 object per KV key
 
 **Actor Store Revision**:
-Actor Store 每次成功提交本地 KV 写事务后由 runtime/KV 层递增的状态版本；它不对应 command 或单个 key。
-_Avoid_: Command sequence, ownership epoch
+Actor Store 每次成功提交本地 KV 写事务后由 runtime/KV 层递增的状态版本；它不对应 Action 或单个 key。
+_Avoid_: Action sequence, ownership epoch
 
 **Persistence Fault**:
-Actor Store 在有界重试后仍无法持久化的单 Actor 停止服务状态；Active Actor 保留本地文件并拒绝所有新 command，等待恢复或运维处置。
+Actor Store 在有界重试后仍无法持久化的单 Actor 停止服务状态；Active Actor 保留本地文件并拒绝所有新 Action，等待恢复或运维处置。
 _Avoid_: Ownership loss, node-wide fence
 
 **Restore Fault**:
@@ -125,7 +139,7 @@ _Avoid_: Empty state, first activation
 _Avoid_: Ownership Provider, Actor registry, service discovery
 
 **Node**:
-嵌入 CoActor runtime 并通过网络接收或转发 Command 的 consumer 进程运行位置；一个 Node 的长期运维身份与单次运行会话必须区分。
+嵌入 CoActor runtime 并通过网络接收或转发 Action 的 consumer 进程运行位置；一个 Node 的长期运维身份与单次运行会话必须区分。
 _Avoid_: Actor Owner, Runtime handle, Pod
 
 **Node ID**:
@@ -150,8 +164,8 @@ _Avoid_: Recovery, Migration, restart
 
 **Ownership Fault**:
 runtime 无法取得、确认或继续持有服务权时产生的分布式 lifecycle failure；它不得被当作普通业务错误或持久化故障。
-_Avoid_: Handler Error, Persistence Fault, mailbox overload
+_Avoid_: Actor Stopped, Persistence Fault, mailbox overload
 
 **Consumer**:
-通过 CoActor Rust library 注册 Actor Type、接收命令并提供 Actor 业务逻辑的宿主应用。
+通过 CoActor Rust library 注册 Actor Type、发送 Action、接收 Event 并提供 Actor 业务逻辑的宿主应用。
 _Avoid_: Actor, runtime node

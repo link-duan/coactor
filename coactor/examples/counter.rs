@@ -1,27 +1,28 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
-use coactor::{ActorId, CommandContext, RuntimeBuilder, actor};
+use coactor::{Actor, ActorId, ActorRuntime, MessageContext, RuntimeBuilder, actor};
 
 #[derive(Clone)]
 struct AppState {
     increment_scale: i64,
 }
 
+#[actor(name = "counter")]
 struct CounterActor {
-    state: Arc<AppState>,
+    runtime: ActorRuntime<AppState>,
     value: i64,
 }
 
-#[actor(name = "counter")]
-impl CounterActor {
-    pub fn new(_actor_id: ActorId, state: Arc<AppState>) -> Self {
-        Self { state, value: 0 }
+impl Actor<AppState> for CounterActor {
+    fn new(runtime: ActorRuntime<AppState>) -> Self {
+        Self { runtime, value: 0 }
     }
 
-    #[coactor::command]
-    pub async fn add(&mut self, _context: &CommandContext, amount: i64) -> i64 {
-        self.value += amount * self.state.increment_scale;
-        self.value
+    async fn on_message(&mut self, ctx: &MessageContext, msg: &[u8]) {
+        // 最小字节协议：前 8 字节 big-endian i64 为增量。
+        let amount = i64::from_be_bytes(msg.try_into().expect("8-byte action"));
+        self.value += amount * self.runtime.app_state().increment_scale;
+        let _ = ctx.send(self.value.to_be_bytes().to_vec()).await;
     }
 }
 
@@ -39,17 +40,23 @@ async fn main() {
         .expect("valid CoActor configuration");
 
     let counter = runtime
-        .actor_ref::<CounterActor>(ActorId::from("example-counter"))
+        .actor(CounterActor::ACTOR_NAME, ActorId::from("example-counter"))
         .expect("CounterActor was registered");
 
-    println!(
-        "{}",
-        counter.add(3).await.expect("Counter command succeeds")
-    );
-    println!(
-        "{}",
-        counter.add(4).await.expect("Counter command succeeds")
-    );
+    let mut session = counter.open().await.expect("Session opens");
+    session
+        .send(3i64.to_be_bytes().to_vec())
+        .await
+        .expect("Action accepted");
+    let value = session.recv().await.expect("Session alive");
+    println!("add(3) = {}", i64::from_be_bytes(value.unwrap().try_into().unwrap()));
+
+    session
+        .send(4i64.to_be_bytes().to_vec())
+        .await
+        .expect("Action accepted");
+    let value = session.recv().await.expect("Session alive");
+    println!("add(4) = {}", i64::from_be_bytes(value.unwrap().try_into().unwrap()));
 
     runtime.shutdown().await;
 }

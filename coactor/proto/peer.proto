@@ -3,23 +3,59 @@ syntax = "proto3";
 package coactor.peer.v1;
 
 service Peer {
-  rpc Invoke(InvokeRequest) returns (InvokeResponse);
+  // Node 之间多路复用的双向消息通道：一个节点对建立一条流，按 session_id 路由。
+  rpc Exchange(stream Envelope) returns (stream Envelope);
 }
 
-message InvokeRequest {
+message Envelope {
   uint32 protocol_version = 1;
   string actor_type = 2;
   bytes actor_id = 3;
-  string command = 4;
-  bytes payload = 5;
+  bytes session_id = 4;
+  string from_node = 5;
+  oneof kind {
+    ActionMessage action = 6;
+    SessionOpen session_open = 7;
+    SessionClose session_close = 8;
+    EventMessage event = 9;
+    SessionError session_error = 10;
+    SessionOpenedAck session_opened_ack = 11;
+  }
 }
 
-message InvokeResponse {
+message ActionMessage {
+  bytes payload = 1;
+}
+
+message EventMessage {
+  bytes payload = 1;
+}
+
+message SessionOpen {
+  // caller 节点的可连接端点，作为 Event 回传路径。
+  string caller_endpoint = 1;
+}
+
+message SessionClose {
+  CloseReason reason = 1;
+}
+
+message SessionError {
+  RuntimeFailure failure = 1;
+}
+
+message SessionOpenedAck {
   oneof outcome {
-    bytes success = 1;
-    bytes handler_error = 2;
-    RuntimeFailure runtime_failure = 3;
+    bytes ok = 1;
+    RuntimeFailure failure = 2;
   }
+}
+
+enum CloseReason {
+  CLOSE_REASON_UNSPECIFIED = 0;
+  CALLER_DROPPED = 1;
+  RUNTIME_SHUTDOWN = 2;
+  ACTOR_TERMINATED = 3;
 }
 
 enum RuntimeFailure {
@@ -33,10 +69,9 @@ enum RuntimeFailure {
   RUNTIME_STOPPED = 7;
   PROTOCOL_MISMATCH = 8;
   ACTOR_TYPE_NOT_REGISTERED = 9;
-  COMMAND_NOT_REGISTERED = 10;
-  MALFORMED_PAYLOAD = 11;
-  REMOTE_UNAVAILABLE = 12;
-  NODE_FENCED = 13;
-  OWNERSHIP_UNAVAILABLE = 14;
-  NOT_OWNER = 16;
+  MALFORMED_PAYLOAD = 10;
+  REMOTE_UNAVAILABLE = 11;
+  NODE_FENCED = 12;
+  OWNERSHIP_UNAVAILABLE = 13;
+  NOT_OWNER = 14;
 }

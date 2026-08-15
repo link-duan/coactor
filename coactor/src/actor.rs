@@ -1,4 +1,4 @@
-use std::{convert::Infallible, fmt, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
@@ -59,20 +59,6 @@ impl ActorAddress {
     }
 }
 
-pub struct CommandContext {
-    pub(crate) address: ActorAddress,
-}
-
-impl CommandContext {
-    pub fn actor_id(&self) -> &ActorId {
-        self.address.actor_id()
-    }
-
-    pub fn actor_address(&self) -> &ActorAddress {
-        &self.address
-    }
-}
-
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum StartError {
     #[error("Actor Type `{0}` was registered more than once")]
@@ -100,7 +86,7 @@ pub enum StartError {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ActorRefError {
     #[error("Actor Type `{0}` is not registered")]
-    ActorTypeNotRegistered(&'static str),
+    ActorTypeNotRegistered(String),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,10 +117,8 @@ pub enum DeactivationReason {
     Shutdown,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum SendError<E = Infallible> {
-    #[error("handler failed: {0:?}")]
-    HandlerError(E),
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum SendError {
     #[error("the Active Actor mailbox is full")]
     MailboxFull,
     #[error("the Active Actor failed to activate")]
@@ -155,8 +139,6 @@ pub enum SendError<E = Infallible> {
     RemoteUnavailable,
     #[error("distributed ownership is unavailable")]
     OwnershipUnavailable,
-    #[error("the remote command outcome is unknown")]
-    OutcomeUnknown,
     #[error("the remote runtime rejected the protocol: {0}")]
     RemoteProtocol(RemoteProtocolError),
 }
@@ -167,14 +149,42 @@ pub enum RemoteProtocolError {
     VersionMismatch,
     #[error("Actor Type is not registered")]
     ActorTypeNotRegistered,
-    #[error("command is not registered")]
-    CommandNotRegistered,
-    #[error("malformed request payload")]
-    MalformedRequest,
-    #[error("malformed success payload")]
-    MalformedSuccess,
-    #[error("malformed handler error payload")]
-    MalformedHandlerError,
-    #[error("unexpected handler error payload")]
-    UnexpectedHandlerError,
+    #[error("malformed session message")]
+    MalformedMessage,
+}
+
+impl SendError {
+    pub(crate) fn to_wire(&self) -> i32 {
+        use crate::peer_protocol::RuntimeFailure;
+        (match self {
+            Self::MailboxFull => RuntimeFailure::MailboxFull,
+            Self::ActivationFailed => RuntimeFailure::ActivationFailed,
+            Self::ActorDeactivating => RuntimeFailure::ActorDeactivating,
+            Self::RuntimeAtCapacity => RuntimeFailure::RuntimeAtCapacity,
+            Self::RuntimeShuttingDown => RuntimeFailure::RuntimeShuttingDown,
+            Self::ActorStopped => RuntimeFailure::ActorStopped,
+            Self::RuntimeStopped => RuntimeFailure::RuntimeStopped,
+            Self::NodeFenced => RuntimeFailure::NodeFenced,
+            Self::RemoteUnavailable => RuntimeFailure::RemoteUnavailable,
+            Self::OwnershipUnavailable => RuntimeFailure::OwnershipUnavailable,
+            Self::RemoteProtocol(_) => RuntimeFailure::ProtocolMismatch,
+        }) as i32
+    }
+
+    pub(crate) fn from_wire(value: i32) -> Self {
+        use crate::peer_protocol::RuntimeFailure;
+        match RuntimeFailure::try_from(value).unwrap_or(RuntimeFailure::Unspecified) {
+            RuntimeFailure::MailboxFull => Self::MailboxFull,
+            RuntimeFailure::ActivationFailed => Self::ActivationFailed,
+            RuntimeFailure::ActorDeactivating => Self::ActorDeactivating,
+            RuntimeFailure::RuntimeAtCapacity => Self::RuntimeAtCapacity,
+            RuntimeFailure::RuntimeShuttingDown => Self::RuntimeShuttingDown,
+            RuntimeFailure::ActorStopped => Self::ActorStopped,
+            RuntimeFailure::RuntimeStopped => Self::RuntimeStopped,
+            RuntimeFailure::NodeFenced => Self::NodeFenced,
+            RuntimeFailure::RemoteUnavailable => Self::RemoteUnavailable,
+            RuntimeFailure::OwnershipUnavailable => Self::OwnershipUnavailable,
+            _ => Self::RemoteProtocol(RemoteProtocolError::VersionMismatch),
+        }
+    }
 }
