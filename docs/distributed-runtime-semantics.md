@@ -29,12 +29,12 @@
 - CAS completion ambiguous 时必须 read-back 精确 Node Session 与 Ownership Epoch，最多协调三轮；不能把写超时直接当成失败并重新 claim。
 - foreign Owner 的 Node Lease 明确缺失或过期时才允许 takeover；lease 读取失败不得推断 Owner 已死。
 - incompatible runtime protocol、未注册 Actor Type 必须返回明确的远程协议错误。
-- 到某 Node 的连接断开时，失效所有指向该 Node 的解析缓存（`invalidate_endpoint`），使后续消息重新解析到新的 Owner。
+- resolve 不做本地缓存：每次会话建立都新鲜读取 Owner Record 与 Node Lease（解析缓存已随每消息时代移除），杜绝陈旧所有权决策。
 
 ## Capacity and passivation
 
 - Node Lease 发布 sampled-at、active/max 与 pressured/draining 等 advisory capacity；它不替代目标 Node 的本地 admission。
-- 本地/远程 mailbox 满载均返回与本地一致的 `MailboxFull`，transport 不建立额外消息 queue。
+- 网关模型下 caller 的 `send()` 只返回传输投递状态；server 侧拒绝（`MailboxFull`、`ActorStopped` 等）经 `SessionError` 异步通知接收流，不终止 Session。
 - idle passivation 仅在无存活 Session 时触发（与 local 语义一致）；先完成 deactivation 并彻底停止 Active Actor，再 CAS release Actor Owner Record 为 unowned；release 未确认前不得在别处重新激活。
 - graceful shutdown 停止 admission、drain 已接纳消息、终止 Session、执行 shutdown deactivation，最后条件释放当前 Node Lease；Actor Owner Record 保留供更高 epoch takeover。
 
@@ -43,7 +43,7 @@
 - Owner Node Lease 明确过期或缺失后，新 Node 可以用旧 Actor Owner Record ETag CAS 到 epoch + 1。
 - 新 Owner 通过正常 constructor 与 activation lifecycle 从空 CoActor 状态启动。
 - **failover 显式打断旧 Session**：旧 Owner 的 Session 记录随其消亡，caller 的接收流终止，必须重新 `open()` 才能在新 Owner 上建立会话。`on_session_opened` 不重放（ADR-0005）。
-- 惰性检测：caller 下次 `send()` 时 resolve 到的 Owner 与 Session 建立时不同，即返回可感知的错误（如 `RemoteUnavailable`）；连接断开会使解析缓存失效并强制重新解析。旧 Owner 静默死亡且 caller 无后续活动时，终止可能延迟到下一次活动。
+- 惰性检测：Owner 失效时网关（Server）在转发中感知（`notify_channel_closed` 清理指向该 Owner 的 relay 并回传 `SessionError`）；网关自身失效时 caller 的下一次 `send()` 在连接层返回可感知错误。旧 Owner 静默死亡且无后续活动时，终止可能延迟到下一次活动。
 - consumer 可以在 activation 中读取自身数据库重建状态，但其一致性、幂等与 fencing 不属于 CoActor 保证。
 - 该能力称为 Availability Failover，不称为 Recovery；本 slice 不提供 Actor Store、Restore Cut 或 durable state。
 

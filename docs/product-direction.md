@@ -4,6 +4,8 @@
 
 ## Confirmed
 
+> 注：早期确认的 "command / Handler Reply" 表述与当前的 Session 双向消息模型不一致——已交付语义以 ADR-0005（Action/Event 字节消息）与 ADR-0008（Server/Client 拆分、网关转发）为准；下文正文中的 "command" 均指 Action。
+
 - CoActor 必须提供 Rust library。
 - consumer 通过该 library 注册 Actor Type、接收命令并提供 Actor 业务逻辑。
 - 首期方案不能依赖一个尚未决定的独立 platform、service 或 binary 才能使用。
@@ -16,7 +18,7 @@
 - 这些能力按单机生命周期、双节点 ownership/fencing、durable Recovery、Migration 逐步验证。
 - 单机 Active Actor registry、进程存活和 handler reply 不得表述为全局 ownership、durable delivery 或 durable ACK。
 - distributed runtime 采用纯嵌入式 Node，不要求独立 CoActor control-plane、service 或 binary。
-- cluster mode 以 typed Actor Ref 为入口；`#[coactor::command(remote)]` 对 Node location 透明，Node 间使用 gRPC 与 Protobuf payload，consumer 负责业务 schema 兼容。
+- cluster mode 的调用入口是通用 `ActorRef`（按名字索引、无类型参数）与持久双向 `Session`（ADR-0005/0007）；消息为字节负载，跨 Node 经 transport seam（gRPC/inmem），consumer 负责业务编码与 schema 兼容。
 - distributed ownership 采用 Node Lease 与 Actor Owner Record 两层模型：Node Lease 证明 Node Session 资格，Actor Owner Record 通过 CAS 绑定 Actor Address、Node Session 与 Ownership Epoch。
 - cluster mode 的公开 API 绑定内置 S3 Ownership Authority，不向 consumer 暴露可替换 provider；crate-private backend seam 只服务协议隔离和 deterministic tests。
 - 当前 distributed runtime 不提供 CoActor 状态持久化或 Recovery；Owner 失效后由新 Owner 从空状态启动，该能力称为 Availability Failover。
@@ -100,7 +102,7 @@
 - Action 成功进入 mailbox 后，caller 取消或 drop future 不会撤回消息；Active Actor 仍按顺序执行。当前不提供 mailbox message cancellation。
 - 所有 Actor Type 必须在 runtime 启动前注册；名称在一个 runtime 内唯一，重复注册导致构建失败。runtime 启动后 registry 冻结，当前不支持动态注册或热替换 factory、handler 与配置。
 - `#[coactor::actor]` macro 只挂在 Actor struct 上，生成类型擦除 dispatch 实现（不声明名称）；consumer 手写 `impl Actor<S>`（`new(ActorRuntime<S>)`、`on_message`、可选 lifecycle hooks）。Actor Type 名称不随 Rust 类型名推导。
-- client 侧按名字索引：`runtime.actor("room", actor_id)` 返回通用 `ActorRef`（无类型参数），`open()` 建立持久双向 `Session`。
+- client 侧按名字索引：`Client::actor("room", actor_id)` 返回通用 `ActorRef`（无类型参数、纯字符串 API），`open()` 建立持久双向 `Session`。
 - Actor message future 从开始到结束独占 Active Actor；即使在 `.await` 外部 IO 时也不处理下一条消息。当前不支持 Actor reentrancy，consumer 需要自行避免无限等待和循环 Actor 调用。
 - Actor Ref 是稳定地址句柄，不是 Active Actor 的强引用。获取、持有或 clone Actor Ref 不启动 Actor；`open()` 主动激活并注册 Session，`on_session_opened` 在激活完成后调用（可"连接即推送"）。
 - Actor Ref 只持有 runtime 的弱引用，不延长 runtime 生命周期。runtime 已关闭后，已有 Session 的 `send` 返回 `RuntimeStopped`。
@@ -127,13 +129,13 @@
 - Actor 为 `Send + 'static`；command 参数、成功返回值及 handler future 为 `Send + 'static`；业务错误为 `Debug + Send + 'static`。不要求 Actor `Sync`，也不支持 `LocalSet` 或 `!Send` Actor。
 - activation lifecycle 的具体 consumer error 只记录到日志/tracing；caller 收到无 payload 的 `SendError::ActivationFailed`。method error 类型不额外携带 lifecycle error 泛型。
 - Actor macro 生成类型描述，但 consumer 必须通过 runtime builder 显式 `register::<ActorType>()`；当前不使用自动扫描或 link-time inventory。builder 在启动前验证重复 Actor Type 名称。
-- consumer 侧调用 `runtime.actor_ref::<ActorType>(actor_id)` 时立即验证类型已注册；未注册返回 `ActorTypeNotRegistered`，不会创建延迟失败的 Ref，也不会启动 Actor。
-- lazy activation 期间复用 Active Actor 的同一个 bounded mailbox；触发启动的首条 command 和后续 command 都计入容量，不建立额外等待队列。满载返回 `MailboxFull`；activation 成功后按接纳顺序处理，失败则全部返回 `ActivationFailed`。
+- caller 侧 `Client::actor(name, actor_id)` 是纯字符串 API（无类型参数、无本地注册表 eager 校验）；未注册名字的错误推迟到 `open()`（本地 dispatch 或远程 `ActorTypeNotRegistered`）。
+- lazy activation 期间复用 Active Actor 的同一个 bounded mailbox；触发启动的首条 Action 和后续 Action 都计入容量，不建立额外等待队列。满载时 server 侧拒绝并经 `SessionError` 异步通知（`MailboxFull`）；activation 成功后按接纳顺序处理，失败则全部返回 `ActivationFailed`。
 - 当前不提供内置 call/reply timeout 或 per-call options。consumer 使用 `tokio::time::timeout` 控制等待；timeout 只放弃 reply，不取消已经进入 mailbox 的 command。
-- activation 与 deactivation lifecycle 都是可选 hook；未实现时分别视为立即成功和立即完成。简单 Actor 只需提供 `new(actor_id, Arc<AppState>)` 与 `#[command]` methods，runtime 的 lifecycle 顺序语义不变。
+- activation 与 deactivation lifecycle 都是可选 hook；未实现时分别视为立即成功和立即完成。简单 Actor 只需实现 `Actor` trait 的 `new(ActorRuntime)` 与 `on_message`，runtime 的 lifecycle 顺序语义不变。
 - lifecycle hook 使用固定可选方法名 `on_activate` 与 `on_deactivate`，不增加 `#[activate]`/`#[deactivate]` attribute。macro 校验 context、reason 与返回类型签名。
 - `DeactivationReason` 当前只包含 `Idle` 与 `Shutdown`；不提前加入 migration、ownership loss 或 persistence fault 等尚未实现的原因。
-- runtime 不要求所有 command 使用通用字节协议；只有 `#[command(remote)]` 进入 Protobuf/gRPC wire boundary。
+- 所有 Action/Event 均为字节负载；wire 编码（prost）只存在于 transport seam 的 gRPC 实现内部，inmem 直传结构体。
 
 ## Open
 

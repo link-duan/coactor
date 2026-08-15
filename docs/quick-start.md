@@ -103,7 +103,7 @@ cargo run -p coactor --example counter
 | `shutdown_timeout` | 30s | global deadline for draining and deactivating on shutdown |
 
 ```rust
-let server = ServerBuilder::local(state)
+let server = coactor::test_support::TestServerBuilder::new(state)
     .register_with::<CounterActor>(ActorTypeConfig::new().mailbox_capacity(128))
     .start()
     .await?;
@@ -111,38 +111,50 @@ let server = ServerBuilder::local(state)
 
 ## Run a cluster node
 
-Cluster mode adds location-transparent routing: an S3-backed ownership authority decides which node owns each Actor Address, and Session messages are forwarded over multiplexed bidi gRPC streams.
+Cluster mode runs an embedded Server node per process: an S3-backed ownership authority decides which node owns each Actor Address, and the Server acts as a gateway — it claims unowned actors (or forwards sessions to the current Owner, with placement and bounded retry). Callers connect through a `Client`, which discovers gateway nodes, keeps a pool, and opens Sessions through one of them.
 
 ```rust,no_run
 use coactor::{
-    ServerBuilder,
-    cluster::{ClusterConfig, S3OwnershipConfig},
+    ClientBuilder, ClientConfig, Endpoint, ServerBuilder, StaticListDiscovery,
+    cluster::{ServerConfig, S3OwnershipConfig},
 };
 
 # async fn start() -> Result<(), coactor::StartError> {
+// Server 节点（宿主 + 网关）
 let ownership = S3OwnershipConfig::local(
     "coactor",
     "development",
     "http://127.0.0.1:9000",
 );
-let cluster = ClusterConfig::new(
-    "node-a",
-    "0.0.0.0:7000".parse().unwrap(),
-    "127.0.0.1:7000".parse().unwrap(),
-    ownership,
-);
-let server = ServerBuilder::cluster((), cluster).start().await?;
-# runtime.shutdown().await;
+let server = ServerBuilder::cluster(
+    (),
+    ServerConfig::new(
+        "node-a",
+        "0.0.0.0:7000".parse().unwrap(),
+        "127.0.0.1:7000".parse().unwrap(),
+        ownership,
+    ),
+)
+.start()
+.await?;
+
+// Client（调用方）：发现网关节点 → 连接池 → 会话经网关中继
+let client = ClientBuilder::new(ClientConfig {
+    discovery: StaticListDiscovery::new(vec![Endpoint::new(
+        "http://127.0.0.1:7000",
+    )]),
+})
+.start();
 # Ok(())
 # }
 ```
 
-For production, construct `S3OwnershipConfig` with the deployment's bucket, prefix, region, credentials provider, and request timeout. Each node needs a unique advertised address and a stable operational Node ID; every runtime start creates a distinct Node Session internally.
+For production, construct `S3OwnershipConfig` with the deployment's bucket, prefix, region, credentials provider, and request timeout; use `DnsDiscovery` (e.g. a K8s headless service name) instead of `StaticListDiscovery`. Each node needs a unique advertised address and a stable operational Node ID; every runtime start creates a distinct Node Session internally.
 
 ## Semantics you should know
 
 - **Events are not durable.** A successful `send` only means the message was accepted in-process. It is not an acknowledgment that state was persisted, and passivation, panic, or process termination discards the Actor's in-memory state.
 - **A live Session blocks passivation.** Idle passivation fires only when the Actor has no remaining live Session. A caller that never closes its Session pins the Actor and its capacity — that responsibility belongs to the consumer.
 - **Failover breaks Sessions.** When an Owner fails, the new Owner starts from empty state; existing Sessions must be re-established with a fresh `open()`. A stale Session's next send returns a perceivable error.
-- **Always await `Runtime::shutdown`.** Dropping a runtime without graceful shutdown has no drain or cleanup guarantee. Shutdown stops new admissions, drains accepted messages, terminates Sessions, runs deactivation, and returns `RuntimeShuttingDown` for new calls.
+- **Always await `Server::shutdown` / `Client::shutdown`.** Dropping a runtime without graceful shutdown has no drain or cleanup guarantee. Shutdown stops new admissions, drains accepted messages, terminates Sessions, runs deactivation, and returns `RuntimeShuttingDown` for new calls.
 - **Actor Refs are weak.** Retaining or cloning a Ref does not prevent passivation or keep the runtime alive; after the runtime stops, `open()` returns `RuntimeStopped`.

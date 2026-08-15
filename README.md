@@ -92,13 +92,13 @@ pub trait Actor<S>: Send + 'static {
 - **串行非重入**：同一 Actor 一次处理一条消息（含 `.await` 期间）；不同 Actor 并行
 - **懒激活 + open 主动激活**：`open()` 激活 Actor → 注册 Session → `on_session_opened`（可"连接即推送"）
 - **passivation 仅当无存活 Session**：有 Session 的 Actor 不会被 idle passivation
-- **failover 打断 Session**：Owner 失效后 Session 终止，caller 需重新 `open()`（空状态激活）
-- **fire-and-forget**：`send` 同步返回投递状态；进入 mailbox 后不再确认（at-most-once）
-- **背压**：mailbox 与出站接收流均 bounded，满载返回 `MailboxFull`
+- **failover 打断 Session**：Owner 或网关失效后 Session 终止，caller 需重新 `open()`（空状态激活）
+- **fire-and-forget**：`send` 返回传输投递状态；进入网关通道后不再确认（at-most-once），server 侧拒绝经 `SessionError` 异步通知
+- **背压**：mailbox 与出站接收流均 bounded，满载时 server 侧拒绝（`MailboxFull`）经 `SessionError` 通知
 
 ## Cluster 模式
 
-每进程嵌入 runtime（peer node），S3 提供 Node Lease 与 Actor Owner Record 的 ownership 权威；消息经 ownership 解析路由到 Owner（Node 间 bidi gRPC stream 多路复用），对 caller 位置透明。
+每进程嵌入 Server（宿主 + 网关），S3 提供 Node Lease 与 Actor Owner Record 的 ownership 权威；Client 经 Service Discovery 发现网关、维护连接池，会话经网关中继——网关就地认领未拥有 Actor 或按放置策略转发给 Owner（Node 间经 transport seam，gRPC 或 inmem）。
 
 ```rust
 let server = ServerBuilder::cluster((), ServerConfig::new(
@@ -106,9 +106,14 @@ let server = ServerBuilder::cluster((), ServerConfig::new(
     "127.0.0.1:7000".parse().unwrap(),
     S3OwnershipConfig::local("coactor", "development", "http://127.0.0.1:9000"),
 ))
-.register::<CounterActor>()
+.register::<CounterActor>("counter")
 .start()
 .await?;
+let client = ClientBuilder::new(ClientConfig {
+    discovery: StaticListDiscovery::new(vec![Endpoint::new("http://127.0.0.1:7000")]),
+})
+.start();
+let session = client.actor("counter", ActorId::from("example-counter")).open().await?;
 ```
 
 详细语义见 `docs/runtime-semantics.md`、`docs/distributed-runtime-semantics.md`。

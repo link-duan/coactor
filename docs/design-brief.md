@@ -10,15 +10,16 @@ The current runtime deliberately separates availability from durability. It can 
 
 ```text
 consumer application
-    │ runtime.actor("room", id).open() → Session
-    ▼
-runtime facade
-    ├── local registry, admission, Session registry, mailbox and lifecycle
-    └── cluster routing
-        ├── bidi gRPC peer stream (node-pair multiplexed)
-        └── S3 Ownership Authority
-            ├── Node Lease
-            └── Actor Owner Record + Ownership Epoch
+    │ Client.actor("room", id).open() → Session      │ Server 侧：Actor 宿主
+    ▼                                                ▼
+Client (调用方)                                Server (宿主 + 网关)
+    ├── Service Discovery → 网关池 → 会话经网关中继     ├── registry, mailbox, lifecycle
+    └── transport seam (connect 半部)                └── 网关放置/转发 + ownership
+        │                                            ├── transport seam (accept 半部)
+        └──────── 双向 Envelope 流（gRPC / inmem）─────┘
+                            S3 Ownership Authority
+                                ├── Node Lease
+                                └── Actor Owner Record + Ownership Epoch
 ```
 
 - `ServerBuilder::local`（测试便利，经 `test_support::TestServer`）与 `ServerBuilder::cluster`（分布式）分别选择运行形态；两者都经 `start()` 异步启动。`Client` 是独立于 `Server` 的调用方入口（ADR-0008）。
@@ -27,7 +28,9 @@ runtime facade
 - A local Active Actor owns a bounded mailbox and executes one message at a time, including across handler `.await` points.
 - Passivation fires only when no live Session remains for the Actor; failover explicitly breaks Sessions (callers re-`open()`), detected lazily on the next send.
 - Cluster mode uses Node Leases for runtime authority and Actor Owner Records for per-address routing and monotonically fenced takeover.
-- The public cluster API uses the built-in S3 authority. The backend abstraction is crate-private and exists for deterministic protocol tests.
+- Gateways resolve ownership on session ingress: claim unowned/stale actors (placement strategy, bounded retry) or forward sessions to the current Owner over a per-session relay; Owner or gateway failure explicitly breaks the Session (ADR-0008).
+- The public cluster API uses the built-in S3 authority. The transport and backend abstractions are crate-private seams: grpc + inmem transport, S3 backend with deterministic fakes.
+- Callers never touch the authority: Client discovers gateways (Service Discovery), keeps a pool, and opens Sessions through a gateway; transport-level open failures fail over to another pool node.
 
 ## Delivered guarantees
 

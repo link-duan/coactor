@@ -2,7 +2,7 @@
 status: accepted
 ---
 
-> 注：Actor Type 名称已移出 macro（ADR-0008）；本 ADR 保留的仍是当前宏形态（无属性、仅生成 dispatch 实现）。
+> 注：Actor Type 名称已移出 macro（ADR-0008）；本 ADR 正文描述的是命名 macro 时代（`#[actor(name = "...")]` + `ACTOR_NAME`），现宏形态为 `#[actor]` 无属性、仅生成类型擦除 dispatch 实现，名称由 `register::<A>(name)` 显式传入。
 
 # Actor trait 形态：struct 挂 macro + 原生 async fn + 按名字索引
 

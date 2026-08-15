@@ -222,6 +222,14 @@ impl<S: Send + Sync + 'static> TestServerBuilder<S> {
         self
     }
 
+    pub fn register_with<A>(mut self, name: &'static str, config: crate::ActorTypeConfig) -> Self
+    where
+        A: __macro::ActorType<S>,
+    {
+        self.builder = self.builder.register_with::<A>(name, config);
+        self
+    }
+
     pub fn mailbox_capacity(mut self, capacity: usize) -> Self {
         self.builder = self.builder.mailbox_capacity(capacity);
         self
