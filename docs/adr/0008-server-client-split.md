@@ -26,4 +26,4 @@ status: accepted
 
 - 会话失效边界扩展：除 owner 失效外，网关失效也会打断会话（Client 在连接层感知并重开）；ADR-0005 的"failover 显式打断 Session、caller 重开"语义保持，检测点部分迁移到网关。
 - ADR-0006 的 bidi Envelope 流与 node-pair 多路复用保留（成为 transport seam 的契约）；caller 到 owner 的直连改为 caller → 网关 → owner。
-- 开放决策：均衡算法（Client 池与 Server 放置）、非 K8s 发现的正式内置方案。
+- 开放决策：Client 池均衡与正式非 K8s 发现方案（Server 放置已由 ADR-0009 关闭）。
