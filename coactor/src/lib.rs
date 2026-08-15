@@ -6,11 +6,12 @@ pub mod cluster;
 pub(crate) use cluster::ServerRuntimeConfig;
 pub(crate) use cluster::{
     ActorOwner, ActorOwnerRecord, AmbiguousMutation, PlacementStrategy, ServerConfig, ServerStarter,
-    LeaseMutation,
-    LeaseTiming, NodeLease, NodeSessionId, OwnershipBackend, OwnershipBackendError,
+    LeaseMutation, LeaseTiming, NodeLease, NodeSessionId, OwnershipBackend, OwnershipBackendError,
     ServerSupervision, ServerTermination, ServerTerminationReason, S3OwnershipBackend,
     S3OwnershipConfig, VersionedActorOwnerRecord, VersionedNodeLease,
 };
+#[cfg(test)]
+pub(crate) use cluster::PlacementCtx;
 
 pub use coactor_macros::actor;
 

@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::placement::Candidate;
 use super::wall_time_millis;
 use crate::{
     ActorAddress, ActorOwner, ActorOwnerRecord, LeaseMutation, NodeSessionId, OwnershipBackend,
@@ -13,21 +14,31 @@ pub(crate) struct ClusterRouter {
     node_id: String,
     session_id: NodeSessionId,
     operation_timeout: Duration,
+    /// 惰性 TTL 缓存：放置决策用的 lease 快照（TTL = lease renewal interval）。
+    lease_cache: tokio::sync::Mutex<Option<(Vec<Candidate>, u64)>>,
+    cache_ttl: Duration,
     resolutions: tokio::sync::Mutex<HashMap<ActorAddress, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ClusterRouter {
+    pub(crate) fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     pub(crate) fn new(
         storage: Arc<dyn OwnershipBackend>,
         node_id: String,
         session_id: NodeSessionId,
         operation_timeout: Duration,
+        cache_ttl: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
             storage,
             node_id,
             session_id,
             operation_timeout,
+            lease_cache: tokio::sync::Mutex::new(None),
+            cache_ttl,
             resolutions: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
@@ -257,17 +268,26 @@ impl ClusterRouter {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    /// 放置候选：硬过滤后的其他节点（有效 lease / 协议匹配 / 非满 / 非压力 / 非排空），
+    /// 带惰性 TTL 缓存（TTL = lease renewal interval）；排序与采样交给策略。
     pub(crate) async fn placement_candidates(
         &self,
         protocol_version: u32,
-    ) -> Result<Vec<(String, u32)>, SendError> {
+    ) -> Result<Vec<Candidate>, SendError> {
+        let now = wall_time_millis();
+        {
+            let cache = self.lease_cache.lock().await;
+            if let Some((candidates, fetched_at)) = cache.as_ref() {
+                if now.saturating_sub(*fetched_at) < self.cache_ttl.as_millis() as u64 {
+                    return Ok(candidates.clone());
+                }
+            }
+        }
         let leases = tokio::time::timeout(self.operation_timeout, self.storage.list_node_leases())
             .await
             .map_err(|_| SendError::OwnershipUnavailable)?
             .map_err(|_| SendError::OwnershipUnavailable)?;
-        let now = wall_time_millis();
-        let mut candidates: Vec<_> = leases
+        let candidates: Vec<Candidate> = leases
             .into_iter()
             .map(|versioned| versioned.lease)
             .filter(|lease| {
@@ -278,23 +298,14 @@ impl ClusterRouter {
                     && !lease.draining
                     && lease.active_actor_count < lease.max_actor_count
             })
-            .collect();
-        candidates.sort_by(|left, right| {
-            left.active_actor_count
-                .cmp(&right.active_actor_count)
-                .then_with(|| left.node_id.cmp(&right.node_id))
-                .then_with(|| left.session_id.as_str().cmp(right.session_id.as_str()))
-        });
-        Ok(candidates
-            .into_iter()
-            .take(2)
-            .map(|lease| {
-                (
-                    format!("http://{}", lease.advertised_address),
-                    lease.protocol_version,
-                )
+            .map(|lease| Candidate {
+                endpoint: crate::transport::Endpoint::new(lease.advertised_address),
+                active_actor_count: lease.active_actor_count,
+                max_actor_count: lease.max_actor_count,
             })
-            .collect())
+            .collect();
+        *self.lease_cache.lock().await = Some((candidates.clone(), now));
+        Ok(candidates)
     }
 }
 

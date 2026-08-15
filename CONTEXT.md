@@ -154,6 +154,10 @@ _Avoid_: Node ID, hostname, Pod name
 共享 ownership authority 中证明某个 Node Session 在有界时间内仍具备运行资格的记录；失去该资格会触发整个 runtime self-fence。
 _Avoid_: Actor Owner Record, heartbeat alone
 
+**Load Ratio**:
+Node 当前负载的排序指标，由当前活跃 Actor 数与上限之比（active/max）表示，用于 placement 决策的相对比较；它区分节点容量差异，避免以绝对数量或剩余容量误导决策。
+_Avoid_: active actor count alone, remaining capacity
+
 **Actor Owner Record**:
 共享 ownership authority 中把一个 Actor Address 绑定到 Node Session 与 Ownership Epoch 的记录；它决定路由和 takeover，不表示 Active Actor 当前一定驻留内存。
 _Avoid_: Node Lease, local route, service discovery entry
@@ -181,3 +185,15 @@ _Avoid_: Runtime, caller handle
 **Service Discovery**:
 Client 获取候选 Server 节点列表的公开机制，返回 `Vec<Endpoint>` 供连接池建池；内置 `dns`（DNS 名多 A 记录，覆盖 K8s headless service）与 `static-list` 两个实现。它不是正确性边界，发现错误可重发现恢复。
 _Avoid_: Actor Owner Record, registry entry
+
+**Placement**:
+网关对未拥有或 stale 的 Actor 决定 Owner 节点的决策过程；基于候选节点的 Load Ratio 快照与随机化（p2c），一次性决策经 ownership claim 固定，直到 failover。它不持续再平衡。
+_Avoid_: Load balancing, routing
+
+**Placement Burst**:
+短时间内大量未拥有 Actor 同时需要放置决策（例如直播开播时上千新 room 同时 open）；它是放置倾斜的主要触发场景，由 p2c 随机化与 In-flight Placement 记账共同缓解。
+_Avoid_: Traffic spike, hot start
+
+**In-flight Placement**:
+网关已决定放置到某节点、但该节点 Lease 尚未反映的本地记账计数；它参与预测 Load Ratio 计算，防止同一网关内并发放置的 herd。
+_Avoid_: Pending claim, reservation

@@ -15,7 +15,7 @@ use super::lifecycle::spawn_actor;
 use super::message::{MailboxMessage, Registration};
 use super::route::{Route, RouteState, try_send};
 use super::session::{EventSink, SessionId, SessionRegistry};
-use crate::cluster::{ClusterRouter, NodeAuthority, OwnerStatus, ResolvedOwner};
+use crate::cluster::{ClusterRouter, NodeAuthority, OwnerStatus, PlacementCtx, ResolvedOwner};
 use crate::transport::{ClientTransport, Endpoint, PeerSender};
 use crate::{ActorAddress, ActorId, SendError};
 
@@ -469,19 +469,24 @@ where
     }
 
     /// 网关放置：未拥有/stale 的 Actor 按策略候选逐个尝试转发；候选耗尽报
-    /// `RuntimeAtCapacity`（不做自兜底）。
+    /// `RuntimeAtCapacity`（不做自兜底）。策略接收 runtime 硬过滤后的候选快照。
     pub(crate) async fn place_session(
         self: &Arc<Self>,
         address: &ActorAddress,
         session_id: SessionId,
         client: Arc<dyn PeerSender>,
     ) -> Result<Result<(), SendError>, SendError> {
-        let candidates = self.placement.candidates(address).await;
+        let Some(cluster) = &self.cluster else {
+            return Ok(Err(SendError::RuntimeAtCapacity));
+        };
+        let ctx = PlacementCtx {
+            candidates: cluster
+                .placement_candidates(self.peer_protocol_version)
+                .await?,
+        };
+        let candidates = self.placement.candidates(address, &ctx).await;
         if candidates.is_empty() {
-            // 默认：就地认领（resolve 含 claim）；竞态下被他者认领则转发给真 owner。
-            let Some(cluster) = &self.cluster else {
-                return Ok(Err(SendError::RuntimeAtCapacity));
-            };
+            // 无其他可用节点：就地认领（resolve 含 claim）；竞态下被他者认领则转发给真 owner。
             return match cluster.resolve(address, &self.capacity).await {
                 Ok(ResolvedOwner::Local { reservation, guard }) => {
                     self.open_local_session(
@@ -514,8 +519,11 @@ where
                 Ok(Err(SendError::ActorTypeNotRegistered(_))) => {
                     return Ok(Err(SendError::ActorTypeNotRegistered(String::new())));
                 }
-                // 满/其他 ack 失败或传输不可达：剔除该候选，试下一个。
-                Ok(Err(_)) | Err(_) => continue,
+                // 满/其他 ack 失败或传输不可达：扣回 in-flight 记账，剔除该候选，试下一个。
+                Ok(Err(_)) | Err(_) => {
+                    self.placement.on_placement_failed(&candidate);
+                    continue;
+                }
             }
         }
         Ok(Err(SendError::RuntimeAtCapacity))
@@ -580,6 +588,9 @@ where
             address,
             session_id,
             String::new(),
+            self.cluster
+                .as_ref()
+                .map_or(String::new(), |cluster| cluster.node_id().to_owned()),
             self.peer_protocol_version,
         );
         if channel.try_send(envelope).is_err() {
@@ -714,7 +725,30 @@ where
                                         .await
                                     }
                                     Ok(OwnerStatus::Unowned) => {
-                                        self.place_session(&address, session_id, sender).await
+                                        if envelope.from_node.is_empty() {
+                                            // 来自 client：网关做放置决策。
+                                            self.place_session(&address, session_id, sender)
+                                                .await
+                                        } else {
+                                            // 转发来的会话：目标节点就地认领
+                                            // （resolve 含 claim），不二次转发（防环）。
+                                            match cluster.resolve(&address, &self.capacity).await {
+                                                Ok(ResolvedOwner::Local {
+                                                    reservation,
+                                                    guard,
+                                                }) => {
+                                                    self.open_local_session(
+                                                        &address,
+                                                        session_id,
+                                                        EventSink::Remote { sender },
+                                                        reservation,
+                                                        Some(guard),
+                                                    )
+                                                    .await
+                                                }
+                                                _ => Ok(Err(SendError::NotOwner)),
+                                            }
+                                        }
                                     }
                                     Err(error) => Ok(Err(error)),
                                 }
@@ -845,6 +879,7 @@ fn envelope_session_open(
     address: &ActorAddress,
     session_id: SessionId,
     caller_endpoint: String,
+    from_node: String,
     protocol_version: u32,
 ) -> crate::peer_protocol::Envelope {
     crate::peer_protocol::Envelope {
@@ -852,7 +887,7 @@ fn envelope_session_open(
         actor_type: address.actor_type().to_owned(),
         actor_id: address.actor_id().as_bytes().to_vec(),
         session_id: session_id.as_bytes(),
-        from_node: String::new(),
+        from_node,
         kind: Some(crate::peer_protocol::envelope::Kind::SessionOpen(
             crate::peer_protocol::SessionOpen { caller_endpoint },
         )),

@@ -416,6 +416,7 @@ where
             self.config.node_id.clone(),
             session_id,
             self.config.lease_timing.operation_timeout,
+            self.config.lease_timing.renewal_interval,
         );
         let builder = self
             .builder

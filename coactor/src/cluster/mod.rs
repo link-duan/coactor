@@ -17,6 +17,6 @@ pub(crate) use authority::{
     VersionedNodeLease, confirm_node_lease, wall_time_millis,
 };
 pub(crate) use node::{ClusterTasks, NodeAuthority, PeerTask, RenewalTask, spawn_peer};
-pub(crate) use placement::{PlacementStrategy, default_placement};
+pub(crate) use placement::{PlacementCtx, PlacementStrategy, default_placement};
 pub(crate) use routing::{ClusterRouter, OwnerStatus, ResolvedOwner};
 pub(crate) use s3::S3OwnershipBackend;

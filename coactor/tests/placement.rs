@@ -11,7 +11,7 @@ use crate::transport::inmem::{InmemRegistry, InmemTransport};
 use crate::transport::Endpoint;
 use crate::{
     Actor, ActorAddress, ActorId, ActorOwner, ActorOwnerRecord, ActorRuntime, MessageContext,
-    OwnershipBackend, PlacementStrategy, Server, ServerBuilder, SendError, actor,
+    OwnershipBackend, PlacementCtx, PlacementStrategy, Server, ServerBuilder, SendError, actor,
 };
 
 #[derive(Default, Clone)]
@@ -41,9 +41,33 @@ struct FixedPlacement(Vec<Endpoint>);
 
 #[async_trait]
 impl PlacementStrategy for FixedPlacement {
-    async fn candidates(&self, _address: &ActorAddress) -> Vec<Endpoint> {
+    async fn candidates(&self, _address: &ActorAddress, _ctx: &PlacementCtx) -> Vec<Endpoint> {
         self.0.clone()
     }
+}
+
+/// 预置节点 lease 的负载快照（active/max/pressured），供默认 p2c 策略决策。
+async fn preset_lease(
+    storage: &Arc<dyn OwnershipBackend>,
+    node_id: &str,
+    active: usize,
+    max: usize,
+    pressured: bool,
+) {
+    let leases = storage.list_node_leases().await.unwrap();
+    let entry = leases
+        .iter()
+        .find(|entry| entry.lease.node_id == node_id)
+        .expect("node lease");
+    let mut lease = entry.lease.clone();
+    lease.active_actor_count = active;
+    lease.max_actor_count = max;
+    lease.pressured = pressured;
+    let mutation = storage
+        .renew_node_lease(lease, &entry.etag)
+        .await
+        .unwrap();
+    assert!(matches!(mutation, crate::LeaseMutation::Applied { .. }));
 }
 
 async fn server_with_placement(
@@ -374,10 +398,12 @@ async fn placement_forwards_unowned_actor_to_strategy_target() {
 async fn placement_skips_full_candidate() {
     let storage = Arc::new(TestOwnershipBackend::default());
     let registry = InmemRegistry::new();
-    // B 容量 1 且已占用；C 正常
+    // B 容量 1 且已占用；C 正常。B 注入空策略：busy 会话就地认领占用容量
+    // （默认 p2c 会把 busy 转发走，无法占满 B）。
     let server_b = start_cluster_inmem(
         ServerBuilder::local(AppState)
             .max_active_actors(1)
+            .with_placement_strategy(Arc::new(FixedPlacement(Vec::new())))
             .register::<EchoActor>("placement-echo"),
         storage.clone(),
         "B",
@@ -441,10 +467,11 @@ async fn placement_skips_full_candidate() {
 async fn placement_reports_capacity_exhausted_when_all_full() {
     let storage = Arc::new(TestOwnershipBackend::default());
     let registry = InmemRegistry::new();
-    // B、C 容量均为 1 且各有一个占用会话
+    // B、C 容量均为 1 且各有一个占用会话（注入空策略：占用会话就地认领）。
     let server_b = start_cluster_inmem(
         ServerBuilder::local(AppState)
             .max_active_actors(1)
+            .with_placement_strategy(Arc::new(FixedPlacement(Vec::new())))
             .register::<EchoActor>("placement-echo"),
         storage.clone(),
         "B",
@@ -454,6 +481,7 @@ async fn placement_reports_capacity_exhausted_when_all_full() {
     let server_c = start_cluster_inmem(
         ServerBuilder::local(AppState)
             .max_active_actors(1)
+            .with_placement_strategy(Arc::new(FixedPlacement(Vec::new())))
             .register::<EchoActor>("placement-echo"),
         storage.clone(),
         "C",
@@ -497,4 +525,215 @@ async fn placement_reports_capacity_exhausted_when_all_full() {
     server_a.shutdown().await;
     server_c.shutdown().await;
     server_b.shutdown().await;
+}
+
+/// 默认策略（p2c）：预置 B 高负载（95/100）、C 空闲（0/10000）→ 新 Actor 放置到 C。
+#[tokio::test]
+async fn default_placement_picks_less_loaded_node() {
+    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let registry = InmemRegistry::new();
+    let server_b = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "B",
+        registry.clone(),
+    )
+    .await;
+    let server_c = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "C",
+        registry.clone(),
+    )
+    .await;
+    let server_a = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "A",
+        registry.clone(),
+    )
+    .await;
+    preset_lease(&storage, "B", 95, 100, false).await;
+    preset_lease(&storage, "C", 0, 10_000, false).await;
+
+    let client = inmem_client(registry.clone(), "node-A");
+    let mut session = client
+        .actor("placement-echo", ActorId::from("load-1"))
+        .open()
+        .await
+        .expect("open via A");
+    assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
+    let record = storage
+        .read_actor_owner(&ActorAddress::new(
+            "placement-echo",
+            ActorId::from("load-1"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .record;
+    assert_eq!(record.owner.as_ref().unwrap().node_id, "C", "低 Load Ratio 节点优先");
+
+    client.shutdown().await;
+    server_a.shutdown().await;
+    server_c.shutdown().await;
+    server_b.shutdown().await;
+}
+
+/// 默认策略：pressured 节点被硬过滤 → 放置到正常节点。
+#[tokio::test]
+async fn default_placement_skips_pressured_node() {
+    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let registry = InmemRegistry::new();
+    let server_b = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "B",
+        registry.clone(),
+    )
+    .await;
+    let server_c = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "C",
+        registry.clone(),
+    )
+    .await;
+    let server_a = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "A",
+        registry.clone(),
+    )
+    .await;
+    preset_lease(&storage, "B", 100, 100, true).await;
+    preset_lease(&storage, "C", 0, 10_000, false).await;
+
+    let client = inmem_client(registry.clone(), "node-A");
+    let mut session = client
+        .actor("placement-echo", ActorId::from("pressure-1"))
+        .open()
+        .await
+        .expect("open via A");
+    assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
+    let record = storage
+        .read_actor_owner(&ActorAddress::new(
+            "placement-echo",
+            ActorId::from("pressure-1"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .record;
+    assert_eq!(record.owner.as_ref().unwrap().node_id, "C", "pressured 节点被过滤");
+
+    client.shutdown().await;
+    server_a.shutdown().await;
+    server_c.shutdown().await;
+    server_b.shutdown().await;
+}
+
+/// 默认策略（p2c + in-flight 记账）：等负载并发放置（Placement Burst）分散到多节点。
+#[tokio::test]
+async fn default_placement_burst_spreads_across_nodes() {
+    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let registry = InmemRegistry::new();
+    let server_b = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "B",
+        registry.clone(),
+    )
+    .await;
+    let server_c = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "C",
+        registry.clone(),
+    )
+    .await;
+    let server_a = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "A",
+        registry.clone(),
+    )
+    .await;
+
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let registry = registry.clone();
+        tasks.push(tokio::spawn(async move {
+            let client = inmem_client(registry, "node-A");
+            let actor_id = ActorId::from(format!("burst-{i}").as_str());
+            let mut session = client
+                .actor("placement-echo", actor_id)
+                .open()
+                .await
+                .expect("open via A");
+            session.recv().await;
+        }));
+    }
+    for task in tasks {
+        task.await.expect("burst task");
+    }
+
+    let mut owners_b = 0usize;
+    let mut owners_c = 0usize;
+    for i in 0..20 {
+        let record = storage
+            .read_actor_owner(&ActorAddress::new(
+                "placement-echo",
+                ActorId::from(format!("burst-{i}").as_str()),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .record;
+        match record.owner.as_ref().unwrap().node_id.as_str() {
+            "B" => owners_b += 1,
+            "C" => owners_c += 1,
+            other => panic!("unexpected owner {other}"),
+        }
+    }
+    assert!(owners_b >= 1 && owners_c >= 1, "burst 分散到 B({owners_b}) 与 C({owners_c})");
+
+    server_a.shutdown().await;
+    server_c.shutdown().await;
+    server_b.shutdown().await;
+}
+
+/// 单节点集群：无其他可用节点 → 就地认领（默认行为与 LocalPlacement 一致）。
+#[tokio::test]
+async fn default_placement_claims_locally_when_alone() {
+    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let registry = InmemRegistry::new();
+    let server_a = start_cluster_inmem(
+        ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
+        storage.clone(),
+        "A",
+        registry.clone(),
+    )
+    .await;
+
+    let client = inmem_client(registry.clone(), "node-A");
+    let mut session = client
+        .actor("placement-echo", ActorId::from("solo-1"))
+        .open()
+        .await
+        .expect("open via A");
+    assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
+    let record = storage
+        .read_actor_owner(&ActorAddress::new(
+            "placement-echo",
+            ActorId::from("solo-1"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .record;
+    assert_eq!(record.owner.as_ref().unwrap().node_id, "A", "单节点就地认领");
+
+    client.shutdown().await;
+    server_a.shutdown().await;
 }
