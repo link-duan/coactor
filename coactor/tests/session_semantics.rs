@@ -4,8 +4,8 @@ use std::{
 };
 
 use coactor::{
-    Actor, ActorId, ActorRuntime, DeactivationReason, MessageContext, RuntimeBuilder, SendError,
-    actor,
+    Actor, ActorId, ActorRuntime, DeactivationReason, MessageContext, SendError, actor,
+    test_support::TestServerBuilder,
 };
 use tokio::sync::Notify;
 
@@ -24,7 +24,7 @@ fn state() -> AppState {
     }
 }
 
-#[actor(name = "session-test")]
+#[actor]
 struct TestActor {
     runtime: ActorRuntime<AppState>,
     state: Arc<AppState>,
@@ -87,14 +87,12 @@ impl Actor<AppState> for TestActor {
 #[tokio::test]
 async fn session_carries_bidirectional_messages() {
     let state = state();
-    let runtime = RuntimeBuilder::local(state)
-        .register::<TestActor>()
+    let server = TestServerBuilder::new(state)
+        .register::<TestActor>("session-test")
         .start()
         .await
         .expect("runtime builds");
-    let actor = runtime
-        .actor(TestActor::ACTOR_NAME, ActorId::from("bidirectional"))
-        .expect("registered");
+    let actor = server.client().actor("session-test", ActorId::from("bidirectional"));
 
     let mut session = actor.open().await.expect("open succeeds");
     // on_session_opened 立即推送
@@ -110,19 +108,17 @@ async fn session_carries_bidirectional_messages() {
         Some(Ok(2i64.to_be_bytes().to_vec()))
     );
 
-    runtime.shutdown().await;
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn on_session_opened_and_broadcast_reach_all_sessions() {
-    let runtime = RuntimeBuilder::local(state())
-        .register::<TestActor>()
+    let server = TestServerBuilder::new(state())
+        .register::<TestActor>("session-test")
         .start()
         .await
         .expect("runtime builds");
-    let actor = runtime
-        .actor(TestActor::ACTOR_NAME, ActorId::from("broadcast"))
-        .expect("registered");
+    let actor = server.client().actor("session-test", ActorId::from("broadcast"));
 
     let mut first = actor.open().await.expect("first session");
     assert_eq!(first.recv().await, Some(Ok(b"opened".to_vec())));
@@ -133,21 +129,19 @@ async fn on_session_opened_and_broadcast_reach_all_sessions() {
     assert_eq!(first.recv().await, Some(Ok(b"broadcasted".to_vec())));
     assert_eq!(second.recv().await, Some(Ok(b"broadcasted".to_vec())));
 
-    runtime.shutdown().await;
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn live_sessions_block_passivation() {
     let state = state();
-    let runtime = RuntimeBuilder::local(state.clone())
+    let server = TestServerBuilder::new(state.clone())
         .idle_timeout(Duration::from_secs(1))
-        .register::<TestActor>()
+        .register::<TestActor>("session-test")
         .start()
         .await
         .expect("runtime builds");
-    let actor = runtime
-        .actor(TestActor::ACTOR_NAME, ActorId::from("passivation"))
-        .expect("registered");
+    let actor = server.client().actor("session-test", ActorId::from("passivation"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
@@ -162,44 +156,40 @@ async fn live_sessions_block_passivation() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(state.lifecycle.lock().unwrap().contains(&"idle"));
 
-    runtime.shutdown().await;
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn panic_terminates_sessions_with_actor_stopped() {
-    let runtime = RuntimeBuilder::local(state())
-        .register::<TestActor>()
+    let server = TestServerBuilder::new(state())
+        .register::<TestActor>("session-test")
         .start()
         .await
         .expect("runtime builds");
-    let actor = runtime
-        .actor(TestActor::ACTOR_NAME, ActorId::from("panic"))
-        .expect("registered");
+    let actor = server.client().actor("session-test", ActorId::from("panic"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
     session.send(b"panic".to_vec()).await.expect("action accepted");
     assert_eq!(session.recv().await, Some(Err(SendError::ActorStopped)));
 
-    runtime.shutdown().await;
+    server.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn mailbox_full_returns_send_error_without_terminating_session() {
-    let runtime = RuntimeBuilder::local(state())
+    let server = TestServerBuilder::new(state())
         .mailbox_capacity(1)
-        .register::<TestActor>()
+        .register::<TestActor>("session-test")
         .start()
         .await
         .expect("runtime builds");
-    let actor = runtime
-        .actor(TestActor::ACTOR_NAME, ActorId::from("overload"))
-        .expect("registered");
+    let actor = server.client().actor("session-test", ActorId::from("overload"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
 
-    // sleep 占用执行；第二个 add 进 mailbox；第三个满载
+    // sleep 占用执行；第二个 add 进 mailbox；第三个进入传输但被 server 拒绝
     session
         .send(b"sleep".to_vec())
         .await
@@ -210,10 +200,9 @@ async fn mailbox_full_returns_send_error_without_terminating_session() {
         .send(b"add".to_vec())
         .await
         .expect("queued action accepted");
-    assert_eq!(
-        session.send(b"add".to_vec()).await,
-        Err(SendError::MailboxFull)
-    );
+    // 网关模型：send() 只反映传输投递，server 侧拒绝经 SessionError 异步通知
+    assert_eq!(session.send(b"add".to_vec()).await, Ok(()));
+    assert_eq!(session.recv().await, Some(Err(SendError::MailboxFull)));
 
     // 释放 sleep 后 actor 恢复处理
     tokio::time::advance(Duration::from_secs(10)).await;
@@ -222,38 +211,34 @@ async fn mailbox_full_returns_send_error_without_terminating_session() {
         Some(Ok(1i64.to_be_bytes().to_vec()))
     );
 
-    runtime.shutdown().await;
+    server.shutdown().await;
 }
 
 #[tokio::test]
 async fn shutdown_terminates_sessions_with_runtime_shutting_down() {
-    let runtime = RuntimeBuilder::local(state())
-        .register::<TestActor>()
+    let server = TestServerBuilder::new(state())
+        .register::<TestActor>("session-test")
         .start()
         .await
         .expect("runtime builds");
-    let actor = runtime
-        .actor(TestActor::ACTOR_NAME, ActorId::from("shutdown"))
-        .expect("registered");
+    let actor = server.client().actor("session-test", ActorId::from("shutdown"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
 
-    runtime.shutdown().await;
+    server.shutdown().await;
     assert_eq!(session.recv().await, Some(Err(SendError::RuntimeShuttingDown)));
 }
 
 #[tokio::test]
 async fn actions_from_one_session_are_processed_in_order() {
-    let runtime = RuntimeBuilder::local(state())
+    let server = TestServerBuilder::new(state())
         .mailbox_capacity(128)
-        .register::<TestActor>()
+        .register::<TestActor>("session-test")
         .start()
         .await
         .expect("runtime builds");
-    let actor = runtime
-        .actor(TestActor::ACTOR_NAME, ActorId::from("ordering"))
-        .expect("registered");
+    let actor = server.client().actor("session-test", ActorId::from("ordering"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
@@ -267,5 +252,5 @@ async fn actions_from_one_session_are_processed_in_order() {
         );
     }
 
-    runtime.shutdown().await;
+    server.shutdown().await;
 }

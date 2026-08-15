@@ -14,7 +14,7 @@ use super::{
     ClusterRouter,
     node::{NodeAuthority, spawn_lease_renewal},
 };
-use crate::{ActorAddress, Runtime, RuntimeBuilder, S3OwnershipConfig, StartError};
+use crate::{ActorAddress, Server, ServerBuilder, S3OwnershipConfig, StartError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -57,7 +57,7 @@ impl Default for LeaseTiming {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ClusterRuntimeConfig {
+pub(crate) struct ServerRuntimeConfig {
     pub node_id: String,
     pub bind_address: SocketAddr,
     pub advertised_address: SocketAddr,
@@ -65,12 +65,12 @@ pub(crate) struct ClusterRuntimeConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct ClusterConfig {
-    runtime: ClusterRuntimeConfig,
+pub struct ServerConfig {
+    runtime: ServerRuntimeConfig,
     ownership: S3OwnershipConfig,
 }
 
-impl ClusterConfig {
+impl ServerConfig {
     pub fn new(
         node_id: impl Into<String>,
         bind_address: SocketAddr,
@@ -78,7 +78,7 @@ impl ClusterConfig {
         ownership: S3OwnershipConfig,
     ) -> Self {
         Self {
-            runtime: ClusterRuntimeConfig::new(node_id, bind_address, advertised_address),
+            runtime: ServerRuntimeConfig::new(node_id, bind_address, advertised_address),
             ownership,
         }
     }
@@ -88,12 +88,12 @@ impl ClusterConfig {
         self
     }
 
-    pub(crate) fn into_parts(self) -> (ClusterRuntimeConfig, S3OwnershipConfig) {
+    pub(crate) fn into_parts(self) -> (ServerRuntimeConfig, S3OwnershipConfig) {
         (self.runtime, self.ownership)
     }
 }
 
-impl ClusterRuntimeConfig {
+impl ServerRuntimeConfig {
     pub(crate) fn new(
         node_id: impl Into<String>,
         bind_address: SocketAddr,
@@ -259,56 +259,56 @@ pub(crate) trait OwnershipBackend: Send + Sync + 'static {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeTerminationReason {
+pub enum ServerTerminationReason {
     Fenced,
     Shutdown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeTermination {
-    pub reason: RuntimeTerminationReason,
+pub struct ServerTermination {
+    pub reason: ServerTerminationReason,
 }
 
 #[derive(Clone)]
-pub struct RuntimeSupervision {
-    pub(crate) receiver: watch::Receiver<Option<RuntimeTermination>>,
+pub struct ServerSupervision {
+    pub(crate) receiver: watch::Receiver<Option<ServerTermination>>,
 }
 
-impl RuntimeSupervision {
-    pub async fn terminated(mut self) -> RuntimeTermination {
+impl ServerSupervision {
+    pub async fn terminated(mut self) -> ServerTermination {
         loop {
             if let Some(termination) = self.receiver.borrow().clone() {
                 return termination;
             }
             if self.receiver.changed().await.is_err() {
-                return RuntimeTermination {
-                    reason: RuntimeTerminationReason::Shutdown,
+                return ServerTermination {
+                    reason: ServerTerminationReason::Shutdown,
                 };
             }
         }
     }
 }
 
-pub(crate) struct ClusterStarter<S> {
-    pub(crate) builder: RuntimeBuilder<S>,
-    pub(crate) config: ClusterRuntimeConfig,
+pub(crate) struct ServerStarter<S> {
+    pub(crate) builder: ServerBuilder<S>,
+    pub(crate) config: ServerRuntimeConfig,
     pub(crate) storage: Arc<dyn OwnershipBackend>,
 }
 
-impl<S> fmt::Debug for ClusterStarter<S> {
+impl<S> fmt::Debug for ServerStarter<S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ClusterStarter")
+            .debug_struct("ServerStarter")
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
 }
 
-impl<S> ClusterStarter<S>
+impl<S> ServerStarter<S>
 where
     S: Send + Sync + 'static,
 {
-    pub async fn start(self) -> Result<Runtime<S>, StartError> {
+    pub async fn start(self) -> Result<Server<S>, StartError> {
         self.builder.validate()?;
         let listener = tokio::net::TcpListener::bind(self.config.bind_address)
             .await

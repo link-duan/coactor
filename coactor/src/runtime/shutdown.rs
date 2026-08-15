@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::core::{FENCED, RUNNING, RuntimeInner, SHUTTING_DOWN, STOPPED};
+use super::core::{FENCED, RUNNING, ServerInner, SHUTTING_DOWN, STOPPED};
 use crate::cluster::{NodeLease, wall_time_millis};
 use crate::{ActorAddress, SendError};
 
-impl<S> RuntimeInner<S>
+impl<S> ServerInner<S>
 where
     S: Send + Sync + 'static,
 {

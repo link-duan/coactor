@@ -4,13 +4,13 @@ use futures_util::FutureExt;
 use tokio::sync::{mpsc, watch};
 
 use super::actor::MessageOutcome;
-use super::core::RuntimeInner;
+use super::core::ServerInner;
 use super::message::{Handle, MailboxMessage, SessionHook};
 use super::route::{Spawned, begin_deactivation, has_live_sessions, remove_route};
 use crate::{ActorAddress, DeactivationReason, SendError};
 
 pub fn spawn_actor<S>(
-    runtime: Arc<RuntimeInner<S>>,
+    runtime: Arc<ServerInner<S>>,
     address: ActorAddress,
     generation: u64,
 ) -> Spawned
@@ -244,7 +244,7 @@ where
 }
 
 pub struct ActorTaskGuard<S> {
-    runtime: Arc<RuntimeInner<S>>,
+    runtime: Arc<ServerInner<S>>,
     address: ActorAddress,
     generation: u64,
     completion: watch::Sender<bool>,
@@ -258,7 +258,7 @@ impl<S> Drop for ActorTaskGuard<S> {
 }
 
 async fn execute_message<S>(
-    runtime: &RuntimeInner<S>,
+    runtime: &ServerInner<S>,
     actor: &mut (dyn Any + Send),
     address: &ActorAddress,
     handle: &Handle,

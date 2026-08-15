@@ -1,13 +1,13 @@
 use std::{sync::Arc, time::Duration};
 
-use coactor::{Actor, ActorId, ActorRuntime, MessageContext, RuntimeBuilder, actor};
+use coactor::{Actor, ActorId, ActorRuntime, MessageContext, ServerBuilder, actor};
 
 use crate::test_support::{TestOwnershipBackend, start_cluster};
 
 #[derive(Clone, Default)]
 struct AppState {}
 
-#[actor(name = "cluster-echo")]
+#[actor]
 struct EchoActor;
 
 impl Actor<AppState> for EchoActor {
@@ -28,28 +28,24 @@ impl Actor<AppState> for EchoActor {
 async fn sessions_are_location_transparent_across_nodes() {
     let storage = Arc::new(TestOwnershipBackend::default());
     let server = start_cluster(
-        RuntimeBuilder::local(AppState::default()).register::<EchoActor>(),
+        ServerBuilder::local(AppState::default()).register::<EchoActor>("cluster-echo"),
         storage.clone(),
         "server",
     )
     .await;
     // server 先建立 ownership
-    let server_actor = server
-        .actor(EchoActor::ACTOR_NAME, ActorId::from("remote-1"))
-        .expect("registered");
+    let server_actor = server.actor("cluster-echo", ActorId::from("remote-1"));
     let mut server_session = server_actor.open().await.expect("server opens");
     assert_eq!(server_session.recv().await, Some(Ok(b"opened".to_vec())));
 
     // client 从另一节点 open 同一 address：远程激活 + 双向 echo
     let client = start_cluster(
-        RuntimeBuilder::local(AppState::default()).register::<EchoActor>(),
+        ServerBuilder::local(AppState::default()).register::<EchoActor>("cluster-echo"),
         storage,
         "client",
     )
     .await;
-    let client_actor = client
-        .actor(EchoActor::ACTOR_NAME, ActorId::from("remote-1"))
-        .expect("registered");
+    let client_actor = client.actor("cluster-echo", ActorId::from("remote-1"));
     let mut client_session = client_actor.open().await.expect("client opens");
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(5), client_session.recv()).await,
@@ -83,27 +79,23 @@ async fn sessions_are_location_transparent_across_nodes() {
 async fn failover_breaks_sessions_and_requires_reopen() {
     let storage = Arc::new(TestOwnershipBackend::default());
     let server = start_cluster(
-        RuntimeBuilder::local(AppState::default()).register::<EchoActor>(),
+        ServerBuilder::local(AppState::default()).register::<EchoActor>("cluster-echo"),
         storage.clone(),
         "server",
     )
     .await;
-    let server_actor = server
-        .actor(EchoActor::ACTOR_NAME, ActorId::from("remote-2"))
-        .expect("registered");
+    let server_actor = server.actor("cluster-echo", ActorId::from("remote-2"));
     let mut server_session = server_actor.open().await.expect("server opens");
     assert_eq!(server_session.recv().await, Some(Ok(b"opened".to_vec())));
 
     // client 打开同一 address（owner 在 server）
     let client = start_cluster(
-        RuntimeBuilder::local(AppState::default()).register::<EchoActor>(),
+        ServerBuilder::local(AppState::default()).register::<EchoActor>("cluster-echo"),
         storage.clone(),
         "client",
     )
     .await;
-    let client_actor = client
-        .actor(EchoActor::ACTOR_NAME, ActorId::from("remote-2"))
-        .expect("registered");
+    let client_actor = client.actor("cluster-echo", ActorId::from("remote-2"));
     let mut client_session = client_actor.open().await.expect("client opens");
     assert_eq!(client_session.recv().await, Some(Ok(b"opened".to_vec())));
 
@@ -113,14 +105,12 @@ async fn failover_breaks_sessions_and_requires_reopen() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let replacement = start_cluster(
-        RuntimeBuilder::local(AppState::default()).register::<EchoActor>(),
+        ServerBuilder::local(AppState::default()).register::<EchoActor>("cluster-echo"),
         storage,
         "replacement",
     )
     .await;
-    let replacement_actor = replacement
-        .actor(EchoActor::ACTOR_NAME, ActorId::from("remote-2"))
-        .expect("registered");
+    let replacement_actor = replacement.actor("cluster-echo", ActorId::from("remote-2"));
     let mut fresh = replacement_actor.open().await.expect("replacement opens");
     assert_eq!(fresh.recv().await, Some(Ok(b"opened".to_vec())));
     fresh

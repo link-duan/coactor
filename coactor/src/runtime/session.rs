@@ -8,9 +8,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::cluster::ResolvedOwner;
+use crate::transport::PeerSender;
 use crate::{ActorAddress, SendError};
 
-use super::core::RuntimeInner;
+use super::core::ServerInner;
 
 /// 本节点 Session 接收流的容量（出站 Event 背压上界）。
 pub(crate) const SESSION_RECEIVER_CAPACITY: usize = 64;
@@ -41,12 +42,12 @@ pub(crate) enum EventSink {
     Local,
     /// caller 位于远端节点：Event 经该节点对间的 bidi stream 发送端回传。
     Remote {
-        sender: tokio::sync::mpsc::Sender<crate::peer_protocol::Envelope>,
+        sender: Arc<dyn PeerSender>,
     },
 }
 
 /// 本节点的 Session 注册表，供 Event 投递、passivation 计数与关闭清理。
-/// 独立于 `RuntimeInner` 的泛型参数，因此 `SessionHandle` 可以是非泛型的。
+/// 独立于 `ServerInner` 的泛型参数，因此 `SessionHandle` 可以是非泛型的。
 type EventSender = mpsc::Sender<Result<Vec<u8>, SendError>>;
 
 pub(crate) struct SessionRegistry {
@@ -233,7 +234,7 @@ pub struct Session<S>
 where
     S: Send + Sync + 'static,
 {
-    pub(crate) inner: Weak<RuntimeInner<S>>,
+    pub(crate) inner: Weak<ServerInner<S>>,
     pub(crate) address: ActorAddress,
     pub(crate) session_id: SessionId,
     pub(crate) receiver: mpsc::Receiver<Result<Vec<u8>, SendError>>,

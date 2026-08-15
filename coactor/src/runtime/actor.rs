@@ -2,7 +2,7 @@ use std::{fmt, future::Future, pin::Pin, sync::Arc, sync::Weak};
 
 use crate::{ActorAddress, ActorId, DeactivationReason};
 
-use super::core::RuntimeInner;
+use super::core::ServerInner;
 use super::session::SessionHandle;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -12,7 +12,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub struct ActorRuntime<S> {
     pub(crate) address: ActorAddress,
     pub(crate) state: Arc<S>,
-    pub(crate) runtime: Weak<RuntimeInner<S>>,
+    pub(crate) runtime: Weak<ServerInner<S>>,
 }
 
 impl<S> Clone for ActorRuntime<S> {
@@ -142,7 +142,5 @@ pub trait ErasedActor: Send + 'static {
 
 /// runtime 注册一个 Actor Type 所需的能力；由 `#[coactor::actor]` macro 生成实现。
 pub trait ActorType<S>: ErasedActor + Send + 'static {
-    const NAME: &'static str;
-
     fn create(runtime: ActorRuntime<S>) -> Self;
 }

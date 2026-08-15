@@ -2,6 +2,8 @@
 status: accepted
 ---
 
+> 注：Actor Type 名称已移出 macro（ADR-0008）；本 ADR 保留的仍是当前宏形态（无属性、仅生成 dispatch 实现）。
+
 # Actor trait 形态：struct 挂 macro + 原生 async fn + 按名字索引
 
 `#[coactor::actor(name = "...")]` 只挂在 Actor struct 上，生成 `ACTOR_NAME` 常量与注册实现；consumer 手写 `impl Actor<S>`，业务逻辑与生命周期 hook 全部在 trait 中表达。macro 不再扫描 impl block 或方法签名，职责收缩为样板生成与类型擦除的 dispatch 适配（`ActorType::handle`/`session_opened`/`session_closed`）。

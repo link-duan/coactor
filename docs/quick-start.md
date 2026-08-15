@@ -19,14 +19,14 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 ## Define an Actor
 
-`#[actor(name = "...")]` marks the Actor **struct**; the name is the stable Actor Type — it is never derived from the Rust type name. Business logic lives in a hand-written `impl Actor<AppState>` using native `async fn`:
+`#[actor]` marks the Actor **struct** and generates the type-erased dispatch impl; the stable Actor Type name is passed explicitly at registration (`register::<A>(name)`) and is never derived from the Rust type name. Business logic lives in a hand-written `impl Actor<AppState>` using native `async fn`:
 
 ```rust
 use coactor::{Actor, ActorId, ActorRuntime, MessageContext, RuntimeBuilder, actor};
 
 struct AppState;
 
-#[actor(name = "counter")]
+#[actor]
 struct CounterActor {
     runtime: ActorRuntime<AppState>,
     value: i64,
@@ -46,7 +46,7 @@ impl Actor<AppState> for CounterActor {
 }
 ```
 
-注意：`#[actor(name = "...")]` 直接挂在要注册的 struct 上，macro 生成 `ACTOR_NAME` 常量与注册实现。`ActorRuntime` 在构造时注入（`app_state()`、`broadcast()` 等能力）。
+`#[actor]` 直接挂在要注册的 struct 上，生成注册所需的类型擦除 dispatch 实现；Actor Type 名称不在 macro 中声明，由 consumer 在注册时显式传入（`register::<CounterActor>("counter")`），Client/Server 两侧按同一名称约定寻址。`ActorRuntime` 在构造时注入（`app_state()`、`broadcast()` 等能力）。
 
 ## Start a runtime, open a Session, exchange messages
 
@@ -54,15 +54,13 @@ impl Actor<AppState> for CounterActor {
 #[tokio::main]
 async fn main() {
     let runtime = RuntimeBuilder::local(())
-        .register::<CounterActor>()
+        .register::<CounterActor>("counter")
         .start()
         .await
         .unwrap();
 
-    // 按 Actor Type 名字索引（无类型参数），open 建立持久双向 Session
-    let counter = runtime
-        .actor(CounterActor::ACTOR_NAME, coactor::ActorId::from("room-7"))
-        .unwrap();
+    // 按 Actor Type 名字索引（纯字符串 API，无类型参数、无本地注册表校验）
+    let counter = runtime.actor("counter", coactor::ActorId::from("room-7"));
     let mut session = counter.open().await.unwrap();
 
     session.send(2i64.to_be_bytes().to_vec()).await.unwrap(); // Action
@@ -83,7 +81,7 @@ cargo run -p coactor --example counter
 
 | Concept | Meaning |
 |---|---|
-| **Actor Type** | The stable business name from `#[actor(name = "...")]`, unique per runtime and registered before startup. |
+| **Actor Type** | The stable business name passed explicitly to `register::<A>(name)`, unique per runtime; never derived from the Rust type name. |
 | **Actor ID** | A caller-provided byte identity, unique within one Actor Type. |
 | **Actor Address** | `Actor Type + Actor ID`; the stable identity used for routing. |
 | **Action** | Inbound message (bytes) from caller to Actor, fire-and-forget. |

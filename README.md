@@ -21,7 +21,7 @@ use coactor::{Actor, ActorId, ActorRuntime, BoxFuture, MessageContext, RuntimeBu
 #[derive(Clone)]
 struct AppState { increment_scale: i64 }
 
-#[actor(name = "counter")]
+#[actor]
 struct CounterActor { runtime: ActorRuntime<AppState>, value: i64 }
 
 impl Actor<AppState> for CounterActor {
@@ -42,14 +42,13 @@ impl Actor<AppState> for CounterActor {
 #[tokio::main]
 async fn main() {
     let runtime = RuntimeBuilder::local(AppState { increment_scale: 2 })
-        .register::<CounterActor>()
+        .register::<CounterActor>("counter")
         .start()
         .await
         .expect("valid CoActor configuration");
 
-    // 按名字索引（无需类型参数），open 建立持久双向 Session
-    let counter = runtime.actor(CounterActor::ACTOR_NAME, ActorId::from("counter-7"))
-        .expect("registered Actor Type");
+    // 按名字索引（纯字符串 API，无需类型参数），open 建立持久双向 Session
+    let counter = runtime.actor("counter", ActorId::from("counter-7"));
     let mut session = counter.open().await.expect("Session opens");
 
     session.send(3i64.to_be_bytes().to_vec()).await.expect("accepted"); // Action 入站

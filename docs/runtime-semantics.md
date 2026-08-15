@@ -5,10 +5,10 @@
 ## Identity and addressing
 
 - 调用方以稳定的 `ActorType + ActorId` 构造 Actor Address 并寻址。
-- `ActorType` 是显式稳定名称，不使用 Rust 类型名；`#[coactor::actor(name = "...")]` 只挂在 Actor struct 上，macro 生成 `ACTOR_NAME` 常量与注册实现。名称缺失时编译失败，Rust 类型重命名不会自动改变 Actor Address。
+- `ActorType` 是显式稳定名称，不使用 Rust 类型名；`#[coactor::actor]` 只挂在 Actor struct 上，生成类型擦除 dispatch 实现，**不声明名称**。名称由 consumer 注册时显式传入（`register::<A>(name)`），Rust 类型重命名不会自动改变 Actor Address。
 - Actor Type 只在 runtime 启动前注册，名称必须唯一；重复注册使 runtime 构建失败，启动后 registry 冻结。
-- consumer 通过 runtime builder 显式 `register::<ActorType>()`；macro 只生成注册所需类型描述，不执行自动发现。
-- consumer 通过 `runtime.actor(name, actor_id)` 按名字索引获取通用 `ActorRef`（无类型参数）；未注册名字立即返回 `ActorRefError::ActorTypeNotRegistered`。成功获取 Ref 仍不会启动 Active Actor。
+- consumer 通过 runtime builder 显式 `register::<A>(name)`；macro 只生成注册所需类型描述，不执行自动发现。
+- consumer 通过 `runtime.actor(name, actor_id)` 按名字索引获取通用 `ActorRef`（纯字符串 API，无类型参数、无本地注册表 eager 校验）；未注册名字的错误推迟到 `open()`。成功获取 Ref 仍不会启动 Active Actor。
 - `ActorId` 是调用方提供、在同一 Actor Type 内唯一的原始字节。
 - `ActorAddress` 的稳定编码为 `u32 big-endian type length + type bytes + actor ID bytes`。
 - `ActorRef` 只保存稳定寻址信息，不保持 Active Actor 存活。获取或 clone Ref 不会启动 Actor；`open()` 才执行 registry lookup 或 lazy activation。passivation 后已有 Ref 仍可复用。

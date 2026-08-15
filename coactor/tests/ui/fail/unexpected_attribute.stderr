@@ -1,0 +1,7 @@
+error: #[actor] takes no attributes; the Actor Type name is passed to register(name) by the consumer
+ --> tests/ui/fail/unexpected_attribute.rs:4:1
+  |
+4 | #[actor(name = "counter")]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `actor` (in Nightly builds, run with -Z macro-backtrace for more info)

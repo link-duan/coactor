@@ -9,8 +9,8 @@ CoActor 为业务 key 提供按需运行的 Actor 执行边界。本词汇表同
 _Avoid_: Entity, Actor instance, Tokio task
 
 **Actor Type**:
-consumer 通过 Actor macro 显式声明的稳定业务类型名称，例如 `room` 或 `document`；名称不从 Rust 类型名推导，并在一个 runtime 内唯一。
-_Avoid_: Rust type name
+consumer 约定并在注册时显式传入 runtime 的稳定业务类型名称，例如 `room` 或 `document`；名称不从 Rust 类型名推导、不由 macro 生成，并在一个 runtime 内唯一。Client 与 Server 两侧 consumer 通过该名称约定相互寻址。
+_Avoid_: Rust type name, macro 属性
 
 **Actor ID**:
 由业务提供、在同一 Actor Type 内唯一的稳定字节包装，例如 room ID 或 document ID；Actor Type 的 `new` 接收该统一类型，业务解释由 consumer 负责。
@@ -21,7 +21,7 @@ Actor Type 与 Actor ID 的稳定组合，是 runtime 用于寻址 Actor 的完�
 _Avoid_: Actor ID, Entity ID, local handle
 
 **Actor Ref**:
-macro 为每个 Actor Type 生成的专用稳定地址句柄，例如 `RoomActorRef`；它通过 `open()` 建立与 Actor 的 Session。它只弱引用 runtime，持有或 clone 不会保持 runtime/Actor 存活，也不会阻止 passivation。
+Client 按 Actor Type 名称 + Actor ID 返回的通用稳定地址句柄（非泛型，不携带 AppState 类型参数）；它通过 `open()` 建立与 Actor 的 Session。它只弱引用 runtime，持有或 clone 不会保持 runtime/Actor 存活，也不会阻止 passivation。
 _Avoid_: Actor Address, untyped byte channel
 
 **Active Actor**:
@@ -41,7 +41,7 @@ Actor 通过 Session Handle 推送给 caller 的出站消息，字节负载；Ac
 _Avoid_: Reply, response, Durable ACK
 
 **Session**:
-caller 与 Actor 之间的一次持久双向通道；所有 Action 都经 Session 入站，Event 经 Session 出站。它由 Actor Ref 的 `open()` 建立，其存活规则由 runtime 生命周期定义。
+caller 与 Actor 之间的一次持久双向通道；所有 Action 都经 Session 入站，Event 经 Session 出站。它由 Actor Ref 的 `open()` 建立；物理路径可经网关节点中继到 owner，owner 或网关失效都会显式打断它，由 caller 重新 `open()` 恢复。
 _Avoid_: Connection handle, command channel
 
 **Session Handle**:
@@ -169,3 +169,15 @@ _Avoid_: Actor Stopped, Persistence Fault, mailbox overload
 **Consumer**:
 通过 CoActor Rust library 注册 Actor Type、发送 Action、接收 Event 并提供 Actor 业务逻辑的宿主应用。
 _Avoid_: Actor, runtime node
+
+**Server**:
+embed CoActor runtime 并宿主 Actor 的一侧；它注册 Actor Type、维护 ownership 与生命周期、accept 入站传输并负责网关转发与放置，是唯一访问 ownership authority 写入的一方。Server 不提供 caller 能力。
+_Avoid_: Runtime, Node, Host
+
+**Client**:
+embed CoActor runtime 但只发起 Session 的调用方；它通过 Service Discovery 发现 Server 节点、维护连接池，经网关节点中继 Action/Event。Client 不宿主 Actor，不持有 authority 访问。
+_Avoid_: Runtime, caller handle
+
+**Service Discovery**:
+Client 获取候选 Server 节点列表的公开机制，返回 `Vec<Endpoint>` 供连接池建池；内置 `dns`（DNS 名多 A 记录，覆盖 K8s headless service）与 `static-list` 两个实现。它不是正确性边界，发现错误可重发现恢复。
+_Avoid_: Actor Owner Record, registry entry

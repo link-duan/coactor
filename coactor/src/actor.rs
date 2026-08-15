@@ -83,12 +83,6 @@ pub enum StartError {
     OwnershipUnavailable,
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum ActorRefError {
-    #[error("Actor Type `{0}` is not registered")]
-    ActorTypeNotRegistered(String),
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ActorTypeConfig {
     pub(crate) mailbox_capacity: Option<usize>,
@@ -119,6 +113,10 @@ pub enum DeactivationReason {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum SendError {
+    #[error("Actor Type `{0}` is not registered")]
+    ActorTypeNotRegistered(String),
+    #[error("the node does not own this Actor Address")]
+    NotOwner,
     #[error("the Active Actor mailbox is full")]
     MailboxFull,
     #[error("the Active Actor failed to activate")]
@@ -157,6 +155,8 @@ impl SendError {
     pub(crate) fn to_wire(&self) -> i32 {
         use crate::peer_protocol::RuntimeFailure;
         (match self {
+            Self::ActorTypeNotRegistered(_) => RuntimeFailure::ActorTypeNotRegistered,
+            Self::NotOwner => RuntimeFailure::NotOwner,
             Self::MailboxFull => RuntimeFailure::MailboxFull,
             Self::ActivationFailed => RuntimeFailure::ActivationFailed,
             Self::ActorDeactivating => RuntimeFailure::ActorDeactivating,
@@ -174,6 +174,8 @@ impl SendError {
     pub(crate) fn from_wire(value: i32) -> Self {
         use crate::peer_protocol::RuntimeFailure;
         match RuntimeFailure::try_from(value).unwrap_or(RuntimeFailure::Unspecified) {
+            RuntimeFailure::ActorTypeNotRegistered => Self::ActorTypeNotRegistered(String::new()),
+            RuntimeFailure::NotOwner => Self::NotOwner,
             RuntimeFailure::MailboxFull => Self::MailboxFull,
             RuntimeFailure::ActivationFailed => Self::ActivationFailed,
             RuntimeFailure::ActorDeactivating => Self::ActorDeactivating,

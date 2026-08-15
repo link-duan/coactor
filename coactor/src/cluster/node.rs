@@ -8,27 +8,26 @@ use std::{
 
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, watch};
-use tokio_stream::wrappers::TcpListenerStream;
 
-use super::transport::PeerService;
 use super::{confirm_node_lease, wall_time_millis};
 use crate::{
-    __macro::RuntimeInner, LeaseMutation, LeaseTiming, NodeLease, NodeSessionId, OwnershipBackend,
-    RuntimeTermination, RuntimeTerminationReason, peer_protocol,
+    __macro::ServerInner, transport::grpc::GrpcTransport,
+    transport::{Endpoint, ServerTransport}, LeaseMutation, LeaseTiming, NodeLease, NodeSessionId,
+    OwnershipBackend, ServerTermination, ServerTerminationReason,
 };
 
 pub struct NodeAuthority {
     valid: AtomicBool,
     deadline: Mutex<tokio::time::Instant>,
     ttl: Duration,
-    termination: watch::Sender<Option<RuntimeTermination>>,
+    termination: watch::Sender<Option<ServerTermination>>,
 }
 
 impl NodeAuthority {
     pub fn new(
         operation_started: tokio::time::Instant,
         ttl: Duration,
-        termination: watch::Sender<Option<RuntimeTermination>>,
+        termination: watch::Sender<Option<ServerTermination>>,
     ) -> Self {
         Self {
             valid: AtomicBool::new(true),
@@ -58,15 +57,16 @@ impl NodeAuthority {
 
     fn fence(&self) {
         if self.valid.swap(false, Ordering::AcqRel) {
-            let _ = self.termination.send(Some(RuntimeTermination {
-                reason: RuntimeTerminationReason::Fenced,
+            let _ = self.termination.send(Some(ServerTermination {
+                reason: ServerTerminationReason::Fenced,
             }));
         }
     }
 }
 
 pub struct PeerTask {
-    pub shutdown: oneshot::Sender<()>,
+    /// 优雅停止：通知 serve 停止接受新连接（in-flight 流由 runtime 的 inbound task 中止）。
+    pub shutdown: watch::Sender<bool>,
     /// shutdown 触发后立即终止 serve（不等外部连接），runtime 已终止全部 session。
     pub force: oneshot::Sender<()>,
     pub task: tokio::task::JoinHandle<()>,
@@ -87,13 +87,13 @@ struct RenewalExit {
 pub struct ClusterTasks {
     pub peer: PeerTask,
     pub renewal: RenewalTask,
-    pub termination: watch::Receiver<Option<RuntimeTermination>>,
+    pub termination: watch::Receiver<Option<ServerTermination>>,
 }
 
 impl ClusterTasks {
     pub async fn shutdown(self) {
         let _ = self.renewal.shutdown.send(());
-        let _ = self.peer.shutdown.send(());
+        let _ = self.peer.shutdown.send(true);
         if let Ok(exit) = self.renewal.task.await {
             if exit.release {
                 let _ = exit
@@ -107,24 +107,49 @@ impl ClusterTasks {
     }
 }
 
-pub fn spawn_peer<S>(runtime: Arc<RuntimeInner<S>>, listener: tokio::net::TcpListener) -> PeerTask
+pub fn spawn_peer<S>(runtime: Arc<ServerInner<S>>, listener: tokio::net::TcpListener) -> PeerTask
 where
     S: Send + Sync + 'static,
 {
-    let (shutdown, shutdown_receiver) = oneshot::channel();
+    let (shutdown, shutdown_receiver) = watch::channel(false);
     let (force, force_receiver) = oneshot::channel();
-    let service = PeerService { runtime };
+    let connect_timeout = runtime
+        .cluster
+        .as_ref()
+        .map_or(Duration::from_secs(3), |cluster| cluster.peer_connect_timeout);
+    let transport = GrpcTransport::new(connect_timeout);
+    let advertised = runtime
+        .cluster
+        .as_ref()
+        .map_or_else(|| Endpoint::new("local"), |cluster| Endpoint::new(cluster.local_node_endpoint()));
+    let mut listener = transport
+        .listen(&advertised, Some(listener))
+        .expect("peer listener bind");
     let task = tokio::spawn(async move {
-        let serve = tonic::transport::Server::builder()
-            .add_service(peer_protocol::peer_server::PeerServer::new(service))
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                let _ = shutdown_receiver.await;
-            });
-        tokio::select! {
-            result = serve => {
-                let _ = result;
+        let mut shutdown_receiver = shutdown_receiver;
+        let mut force_receiver = force_receiver;
+        loop {
+            tokio::select! {
+                changed = shutdown_receiver.changed() => {
+                    if changed.is_ok() && *shutdown_receiver.borrow() {
+                        listener.shutdown();
+                    }
+                }
+                _ = &mut force_receiver => break,
+                stream = listener.accept() => {
+                    let Some(stream) = stream else { break };
+                    let task_runtime = runtime.clone();
+                    let handle = tokio::spawn(async move {
+                        let mut stream = stream;
+                        while let Some(envelope) = stream.recv().await {
+                            task_runtime
+                                .dispatch_inbound(envelope, Some(stream.sender()))
+                                .await;
+                        }
+                    });
+                    runtime.register_inbound_task(handle.abort_handle());
+                }
             }
-            _ = force_receiver => {}
         }
     });
     PeerTask {
@@ -135,7 +160,7 @@ where
 }
 
 pub fn spawn_lease_renewal<S>(
-    runtime: Arc<RuntimeInner<S>>,
+    runtime: Arc<ServerInner<S>>,
     authority: Arc<NodeAuthority>,
     storage: Arc<dyn OwnershipBackend>,
     mut lease: NodeLease,

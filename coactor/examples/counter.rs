@@ -1,13 +1,15 @@
 use std::time::Duration;
 
-use coactor::{Actor, ActorId, ActorRuntime, MessageContext, RuntimeBuilder, actor};
+use coactor::{
+    Actor, ActorId, ActorRuntime, MessageContext, actor, test_support::TestServerBuilder,
+};
 
 #[derive(Clone)]
 struct AppState {
     increment_scale: i64,
 }
 
-#[actor(name = "counter")]
+#[actor]
 struct CounterActor {
     runtime: ActorRuntime<AppState>,
     value: i64,
@@ -30,18 +32,17 @@ impl Actor<AppState> for CounterActor {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let runtime = RuntimeBuilder::local(AppState { increment_scale: 2 })
+    // 本地测试/示例形态：TestServer 装配 inmem transport，client() 内存直连。
+    // 生产形态为分布式 Server + Client（经 Service Discovery 与网关转发，见 ADR-0008）。
+    let server = TestServerBuilder::new(AppState { increment_scale: 2 })
         .mailbox_capacity(32)
-        .max_active_actors(1_000)
         .idle_timeout(Duration::from_secs(60))
-        .register::<CounterActor>()
+        .register::<CounterActor>("counter")
         .start()
         .await
         .expect("valid CoActor configuration");
 
-    let counter = runtime
-        .actor(CounterActor::ACTOR_NAME, ActorId::from("example-counter"))
-        .expect("CounterActor was registered");
+    let counter = server.client().actor("counter", ActorId::from("example-counter"));
 
     let mut session = counter.open().await.expect("Session opens");
     session
@@ -58,5 +59,5 @@ async fn main() {
     let value = session.recv().await.expect("Session alive");
     println!("add(4) = {}", i64::from_be_bytes(value.unwrap().try_into().unwrap()));
 
-    runtime.shutdown().await;
+    server.shutdown().await;
 }

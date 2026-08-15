@@ -44,12 +44,12 @@ pub struct Registration<S> {
 }
 
 impl<S> Registration<S> {
-    pub fn of<A>() -> Self
+    pub fn of<A>(name: &'static str) -> Self
     where
         A: ActorType<S>,
     {
         Self {
-            name: A::NAME,
+            name,
             create: |runtime| Box::new(A::create(runtime)),
             activate: <A as ErasedActor>::activate,
             deactivate: <A as ErasedActor>::deactivate,

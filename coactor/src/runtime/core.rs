@@ -16,6 +16,8 @@ use super::message::{MailboxMessage, Registration};
 use super::route::{Route, RouteState, try_send};
 use super::session::{EventSink, SESSION_RECEIVER_CAPACITY, Session, SessionId, SessionRegistry};
 use crate::cluster::{ClusterRouter, NodeAuthority, ResolvedOwner};
+use crate::transport::grpc::GrpcTransport;
+use crate::transport::{ClientTransport, Endpoint, PeerSender};
 use crate::{ActorAddress, ActorId, SendError};
 
 pub(crate) const RUNNING: u8 = 0;
@@ -23,7 +25,7 @@ pub(crate) const SHUTTING_DOWN: u8 = 1;
 pub(crate) const STOPPED: u8 = 2;
 pub(crate) const FENCED: u8 = 3;
 
-pub(crate) struct RuntimeInner<S> {
+pub(crate) struct ServerInner<S> {
     pub state: Arc<S>,
     pub registrations: HashMap<&'static str, Registration<S>>,
     pub actors: Mutex<HashMap<ActorAddress, Route>>,
@@ -38,7 +40,7 @@ pub(crate) struct RuntimeInner<S> {
     pub authority: Option<Arc<NodeAuthority>>,
     pub cluster: Option<Arc<ClusterRouter>>,
     /// 到各远端 Node 的 bidi stream 发送端（node-pair 复用）。
-    pub channels: Mutex<HashMap<String, tokio::sync::mpsc::Sender<crate::peer_protocol::Envelope>>>,
+    pub channels: Mutex<HashMap<String, Arc<dyn PeerSender>>>,
     /// 入站连接的接收 task（shutdown 时中止，确保连接关闭）。
     pub inbound_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     /// 远程 SessionOpen 的 ack 等待表。
@@ -46,7 +48,7 @@ pub(crate) struct RuntimeInner<S> {
 }
 
 pub struct ActorRef<S> {
-    pub(crate) runtime: Weak<RuntimeInner<S>>,
+    pub(crate) runtime: Weak<ServerInner<S>>,
     pub(crate) address: ActorAddress,
 }
 
@@ -71,7 +73,7 @@ where
         let (sender, receiver) = mpsc::channel(SESSION_RECEIVER_CAPACITY);
         runtime.sessions.register_local(session_id, sender);
 
-        let cleanup = |runtime: &Arc<RuntimeInner<S>>| {
+        let cleanup = |runtime: &Arc<ServerInner<S>>| {
             runtime.sessions.unregister_local(&session_id);
             runtime.sessions.unregister_actor(&self.address, &session_id);
         };
@@ -152,7 +154,7 @@ where
     }
 }
 
-impl<S> RuntimeInner<S>
+impl<S> ServerInner<S>
 where
     S: Send + Sync + 'static,
 {
@@ -350,6 +352,11 @@ where
         reservation: Option<OwnedSemaphorePermit>,
         guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     ) -> Result<Result<(), SendError>, SendError> {
+        if !self.registrations.contains_key(address.actor_type()) {
+            return Ok(Err(SendError::ActorTypeNotRegistered(
+                address.actor_type().to_owned(),
+            )));
+        }
         if !self.sessions.register_actor(address, session_id, sink.clone()) {
             return Ok(Err(SendError::ActorStopped));
         }
@@ -360,19 +367,6 @@ where
         };
         self.dispatch_message(address, message, reservation, guard)?;
         let outcome = receive.await.map_err(|_| SendError::ActorStopped)?;
-        Ok(outcome)
-    }
-
-    /// owner 侧处理远程 SessionOpen：以入站流的 outbound 作为回传路径 → 注册 → 激活 → `on_session_opened`。
-    pub(crate) async fn dispatch_remote_open(
-        self: &Arc<Self>,
-        address: &ActorAddress,
-        session_id: SessionId,
-        sink: EventSink,
-    ) -> Result<Result<(), SendError>, SendError> {
-        let outcome = self
-            .open_local_session(address, session_id, sink, None, None)
-            .await?;
         Ok(outcome)
     }
 
@@ -423,11 +417,29 @@ where
     pub(crate) async fn ensure_channel(
         self: &Arc<Self>,
         endpoint: &str,
-    ) -> Result<tokio::sync::mpsc::Sender<crate::peer_protocol::Envelope>, SendError> {
+    ) -> Result<Arc<dyn PeerSender>, SendError> {
         if let Some(sender) = self.channels.lock().get(endpoint) {
             return Ok(sender.clone());
         }
-        let sender = crate::cluster::connect_channel(self, endpoint).await?;
+        let connect_timeout = self
+            .cluster
+            .as_ref()
+            .map_or(Duration::from_secs(3), |cluster| cluster.peer_connect_timeout);
+        let transport = GrpcTransport::new(connect_timeout);
+        let stream = transport
+            .connect(&Endpoint::new(endpoint))
+            .await
+            .map_err(|_| SendError::RemoteUnavailable)?;
+        let sender = stream.sender();
+        let runtime = self.clone();
+        let closed_endpoint = endpoint.to_owned();
+        tokio::spawn(async move {
+            let mut stream = stream;
+            while let Some(envelope) = stream.recv().await {
+                runtime.dispatch_inbound(envelope, None).await;
+            }
+            runtime.notify_channel_closed(&closed_endpoint).await;
+        });
         self.channels.lock().insert(endpoint.to_owned(), sender.clone());
         Ok(sender)
     }
@@ -470,7 +482,7 @@ where
     pub(crate) async fn dispatch_inbound(
         self: &Arc<Self>,
         envelope: crate::peer_protocol::Envelope,
-        reply: Option<tokio::sync::mpsc::Sender<crate::peer_protocol::Envelope>>,
+        reply: Option<Arc<dyn PeerSender>>,
     ) {
         use crate::peer_protocol::envelope::Kind;
         let Some(kind) = envelope.kind else {
@@ -486,20 +498,63 @@ where
                 if !version_ok {
                     return;
                 }
-                let _ = self
+                if let Err(error) = self
                     .dispatch_remote_message(&address, session_id, Some(action.payload))
-                    .await;
+                    .await
+                {
+                    // 网关模型：send() 只反映传输投递；server 侧拒绝（MailboxFull 等）
+                    // 经 SessionError 异步通知 caller，不终止 Session。
+                    if let Some(reply) = reply {
+                        let _ = reply.try_send(crate::peer_protocol::Envelope {
+                            protocol_version: 0,
+                            actor_type: String::new(),
+                            actor_id: Vec::new(),
+                            session_id: envelope.session_id,
+                            from_node: String::new(),
+                            kind: Some(crate::peer_protocol::envelope::Kind::SessionError(
+                                crate::peer_protocol::SessionError {
+                                    failure: error.to_wire(),
+                                },
+                            )),
+                        });
+                    }
+                }
             }
             Kind::SessionOpen(_open) => {
                 let result = if version_ok {
                     match reply.clone() {
-                        Some(sender) => self
-                            .dispatch_remote_open(
-                                &address,
-                                session_id,
-                                EventSink::Remote { sender },
-                            )
-                            .await,
+                        Some(sender) => {
+                            // 网关语义：入站会话先 resolve——未拥有/stale 就地 claim（6a），
+                            // 属他人则拒绝（转发为后续阶段）；无 router 的单节点（TestServer）直接宿主。
+                            let outcome = if let Some(cluster) = &self.cluster {
+                                match cluster.resolve(&address, &self.capacity).await {
+                                    Ok(ResolvedOwner::Local { reservation, guard }) => {
+                                        self.open_local_session(
+                                            &address,
+                                            session_id,
+                                            EventSink::Remote { sender },
+                                            reservation,
+                                            Some(guard),
+                                        )
+                                        .await
+                                    }
+                                    Ok(ResolvedOwner::Remote { .. }) => {
+                                        Ok(Err(SendError::NotOwner))
+                                    }
+                                    Err(error) => Ok(Err(error)),
+                                }
+                            } else {
+                                self.open_local_session(
+                                    &address,
+                                    session_id,
+                                    EventSink::Remote { sender },
+                                    None,
+                                    None,
+                                )
+                                .await
+                            };
+                            outcome
+                        }
                         None => Ok(Err(SendError::RemoteUnavailable)),
                     }
                 } else {
@@ -563,7 +618,7 @@ where
     }
 }
 
-impl<S> RuntimeInner<S>
+impl<S> ServerInner<S>
 where
     S: Send + Sync + 'static,
 {

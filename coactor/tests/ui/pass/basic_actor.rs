@@ -1,6 +1,7 @@
-use coactor::{Actor, ActorRuntime, MessageContext, RuntimeBuilder, actor};
+use coactor::{Actor, ActorRuntime, MessageContext, ServerBuilder, actor};
 
-#[actor(name = "counter")]
+// `#[actor]` 无属性；Actor Type 名称由 consumer 在注册时显式传入。
+#[actor]
 struct CounterActor {
     value: i64,
 }
@@ -19,5 +20,5 @@ impl Actor<()> for CounterActor {
 }
 
 fn main() {
-    let _builder = RuntimeBuilder::local(()).register::<CounterActor>();
+    let _builder = ServerBuilder::local(()).register::<CounterActor>("counter");
 }

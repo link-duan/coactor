@@ -1,6 +1,6 @@
 use tokio::sync::{OwnedSemaphorePermit, mpsc, watch};
 
-use super::core::RuntimeInner;
+use super::core::ServerInner;
 use super::message::{MailboxMessage, MailboxSender};
 use super::session::SessionRegistry;
 use crate::ActorAddress;
@@ -34,7 +34,7 @@ pub fn try_send(
     })
 }
 
-pub fn remove_route<S>(runtime: &RuntimeInner<S>, address: &ActorAddress, generation: u64) {
+pub fn remove_route<S>(runtime: &ServerInner<S>, address: &ActorAddress, generation: u64) {
     let mut actors = runtime.actors.lock();
     if actors
         .get(address)
@@ -45,7 +45,7 @@ pub fn remove_route<S>(runtime: &RuntimeInner<S>, address: &ActorAddress, genera
 }
 
 pub fn begin_deactivation(
-    runtime: &RuntimeInner<impl Send + Sync + 'static>,
+    runtime: &ServerInner<impl Send + Sync + 'static>,
     address: &ActorAddress,
     generation: u64,
     sender: &MailboxSender,

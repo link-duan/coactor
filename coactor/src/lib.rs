@@ -3,12 +3,12 @@ extern crate self as coactor;
 pub mod cluster;
 
 #[cfg(test)]
-pub(crate) use cluster::ClusterRuntimeConfig;
+pub(crate) use cluster::ServerRuntimeConfig;
 pub(crate) use cluster::{
-    ActorOwner, ActorOwnerRecord, AmbiguousMutation, ClusterConfig, ClusterStarter, LeaseMutation,
+    ActorOwner, ActorOwnerRecord, AmbiguousMutation, ServerConfig, ServerStarter, LeaseMutation,
     LeaseTiming, NodeLease, NodeSessionId, OwnershipBackend, OwnershipBackendError,
-    RuntimeSupervision, RuntimeTermination, RuntimeTerminationReason, S3OwnershipBackend,
-    S3OwnershipConfig, VersionedActorOwnerRecord, VersionedNodeLease,
+    ServerSupervision, ServerTermination, ServerTerminationReason, S3OwnershipBackend,
+    S3OwnershipConfig, VersionedActorOwnerRecord, VersionedNodeLease, wall_time_millis,
 };
 
 pub use coactor_macros::actor;
@@ -23,15 +23,18 @@ mod peer_protocol {
 #[path = "macro_support.rs"]
 pub mod __macro;
 mod actor;
+mod client;
 mod runtime;
-#[cfg(test)]
-mod test_support;
+mod transport;
+
+pub mod test_support;
 
 pub use actor::*;
+pub use client::{ActorRef, Client, ClientBuilder};
+pub use client::session::Session;
 pub use runtime::actor::{Actor, ActorRuntime, BoxFuture, MessageContext};
-pub use runtime::core::ActorRef;
-pub use runtime::session::{Session, SessionHandle, SessionId};
-pub use runtime::{Runtime, RuntimeBuilder};
+pub use runtime::session::{SessionHandle, SessionId};
+pub use runtime::{Server, ServerBuilder};
 
 #[cfg(test)]
 #[path = "../tests/session_semantics.rs"]

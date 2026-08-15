@@ -3,19 +3,16 @@ use quote::quote;
 use syn::{ItemStruct, parse_macro_input};
 
 pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenStream {
-    if attribute.is_empty() {
-        return compile_error("#[actor] requires an explicit stable name: #[actor(name = \"...\")]");
+    if !attribute.is_empty() {
+        return compile_error(
+            "#[actor] takes no attributes; the Actor Type name is passed to register(name) by the consumer",
+        );
     }
-    let actor_name = parse_macro_input!(attribute as ActorAttribute).name;
     let actor_struct = parse_macro_input!(item as ItemStruct);
     let actor_ident = &actor_struct.ident;
 
     quote! {
         #actor_struct
-
-        impl #actor_ident {
-            pub const ACTOR_NAME: &'static str = #actor_name;
-        }
 
         impl ::coactor::__macro::ErasedActor for #actor_ident {
             fn activate<'a>(
@@ -84,33 +81,12 @@ pub(crate) fn expand_actor(attribute: TokenStream, item: TokenStream) -> TokenSt
         where
             #actor_ident: ::coactor::Actor<S>,
         {
-            const NAME: &'static str = #actor_name;
-
             fn create(runtime: ::coactor::__macro::ActorRuntime<S>) -> Self {
                 <Self as ::coactor::Actor<S>>::new(runtime)
             }
         }
     }
     .into()
-}
-
-pub(crate) struct ActorAttribute {
-    pub(crate) name: syn::LitStr,
-}
-
-impl syn::parse::Parse for ActorAttribute {
-    fn parse(input: syn::parse::ParseStream<'_>) -> syn::Result<Self> {
-        let key: syn::Ident = input.parse()?;
-        if key != "name" {
-            return Err(syn::Error::new(key.span(), "expected `name = \"...\"`"));
-        }
-        input.parse::<syn::Token![=]>()?;
-        let name: syn::LitStr = input.parse()?;
-        if !input.is_empty() {
-            return Err(input.error("unexpected actor attribute input"));
-        }
-        Ok(Self { name })
-    }
 }
 
 pub(crate) fn compile_error(message: &str) -> TokenStream {

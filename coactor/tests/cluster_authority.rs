@@ -7,7 +7,7 @@ use crate::cluster::{
     ClusterRouter, NodeAuthority, NodeLease, NodeSessionId, ResolvedOwner, wall_time_millis,
 };
 use crate::test_support::{TestOwnershipBackend, start_cluster};
-use crate::{Actor, ActorAddress, ActorId, LeaseMutation, OwnershipBackend, RuntimeBuilder};
+use crate::{Actor, ActorAddress, ActorId, LeaseMutation, OwnershipBackend, ServerBuilder};
 
 fn address(id: &str) -> ActorAddress {
     ActorAddress::new("ownership-probe", ActorId::from(id))
@@ -47,7 +47,7 @@ async fn first_resolve_claims_owner_with_epoch_one() {
     let storage = Arc::new(TestOwnershipBackend::default());
     // 需要先有 node lease 供 resolve 检查（owner 是本地时不检查 lease）
     let _ = start_cluster(
-        RuntimeBuilder::local(()).register::<ProbeActor>(),
+        ServerBuilder::local(()).register::<ProbeActor>("ownership-probe"),
         storage.clone(),
         "node-a",
     )
@@ -192,7 +192,7 @@ async fn wall_time_millis_is_monotonic_enough_for_cas_tests() {
     assert!(b >= a);
 }
 
-#[crate::actor(name = "ownership-probe")]
+#[crate::actor]
 struct ProbeActor;
 
 impl crate::Actor<()> for ProbeActor {

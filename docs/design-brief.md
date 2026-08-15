@@ -23,7 +23,7 @@ runtime facade
 
 - `RuntimeBuilder::local` and `RuntimeBuilder::cluster` explicitly select the operating mode; both start asynchronously through `start()`.
 - Actor Refs are stable weak handles obtained by Actor Type name + Actor ID; `open()` establishes a persistent bidirectional Session (Action in, Event out, byte payloads).
-- `#[coactor::actor(name = "...")]` marks the Actor struct; consumers implement the `Actor` trait with native `async fn` methods. `ActorRuntime` injects identity, AppState and `broadcast` at construction; `MessageContext` carries the current Session for directed Event delivery.
+- `#[coactor::actor]` marks the Actor struct and generates the type-erased dispatch impl; the Actor Type name is passed explicitly at registration (`register::<A>(name)`). Consumers implement the `Actor` trait with native `async fn` methods. `ActorRuntime` injects identity, AppState and `broadcast` at construction; `MessageContext` carries the current Session for directed Event delivery.
 - A local Active Actor owns a bounded mailbox and executes one message at a time, including across handler `.await` points.
 - Passivation fires only when no live Session remains for the Actor; failover explicitly breaks Sessions (callers re-`open()`), detected lazily on the next send.
 - Cluster mode uses Node Leases for runtime authority and Actor Owner Records for per-address routing and monotonically fenced takeover.

@@ -99,7 +99,7 @@
 - 当前提供 Session 双向消息：入站 Action 与出站 Event 均为字节负载；Action 是 fire-and-forget（send 同步返回投递状态，进入 mailbox 后不确认，at-most-once），业务错误由 Event 表达。所有入站都经过 Session，不提供无 Session 的单向 tell。
 - Action 成功进入 mailbox 后，caller 取消或 drop future 不会撤回消息；Active Actor 仍按顺序执行。当前不提供 mailbox message cancellation。
 - 所有 Actor Type 必须在 runtime 启动前注册；名称在一个 runtime 内唯一，重复注册导致构建失败。runtime 启动后 registry 冻结，当前不支持动态注册或热替换 factory、handler 与配置。
-- `#[coactor::actor(name = "...")]` macro 只挂在 Actor struct 上，生成 `ACTOR_NAME` 常量与注册实现；consumer 手写 `impl Actor<S>`（`new(ActorRuntime<S>)`、`on_message`、可选 lifecycle hooks）。Actor Type 名称不随 Rust 类型名推导。
+- `#[coactor::actor]` macro 只挂在 Actor struct 上，生成类型擦除 dispatch 实现（不声明名称）；consumer 手写 `impl Actor<S>`（`new(ActorRuntime<S>)`、`on_message`、可选 lifecycle hooks）。Actor Type 名称不随 Rust 类型名推导。
 - client 侧按名字索引：`runtime.actor("room", actor_id)` 返回通用 `ActorRef`（无类型参数），`open()` 建立持久双向 `Session`。
 - Actor message future 从开始到结束独占 Active Actor；即使在 `.await` 外部 IO 时也不处理下一条消息。当前不支持 Actor reentrancy，consumer 需要自行避免无限等待和循环 Actor 调用。
 - Actor Ref 是稳定地址句柄，不是 Active Actor 的强引用。获取、持有或 clone Actor Ref 不启动 Actor；`open()` 主动激活并注册 Session，`on_session_opened` 在激活完成后调用（可"连接即推送"）。
@@ -115,7 +115,7 @@
 - runtime builder 接收 `AppState` 值并以 `Arc<AppState>` 持有；lazy activation 时 clone 同一 Arc 给 Actor 构造器。
 - lifecycle 与 `on_message` 接收 `&MessageContext`（标识当前 Actor + 当前 Session 出站句柄）；`ActorRuntime` 在构造时注入，AppState 通过 `runtime.app_state()` 获取。
 - `impl Actor<S>` 的 S 与 `Runtime<S>` 的 AppState 一致时注册才编译通过。
-- Actor Type 稳定名称必须在 Actor macro attribute 中显式声明，例如 `#[coactor::actor(name = "room")]`；不从 Rust struct 名或 `type_name` 推导，缺失时编译失败。Rust 类型重命名不改变 Actor Address。
+- Actor Type 稳定名称由 consumer 在注册时显式传入（`register::<A>(name)`），例如 `register::<RoomActor>("room")`；不从 Rust struct 名或 `type_name` 推导。Client/Server 两侧按同一名称约定寻址。
 - mailbox capacity 具有 runtime 默认值，Actor Type 注册时可以覆盖；同一 Actor Type 的所有 Actor ID 使用同一容量，当前不支持逐 Actor ID 动态配置。
 - 所有 Action/Event 均携带 Session ID 路由；cluster mode 下消息经 ownership 解析投递到 Owner，Node 间使用 bidi gRPC stream 多路复用。跨节点 failover 会打断 Session，caller 需重新 `open()`。
 - 当前消息为字节负载，业务协议（编码、schema 兼容）由 consumer 负责；后续阶段可能引入类型化 Action/Event 与序列化约束。
