@@ -14,6 +14,8 @@ use super::{
     ClusterRouter,
     node::{NodeAuthority, spawn_lease_renewal},
 };
+use crate::transport::grpc::GrpcTransport;
+use crate::transport::{ClientTransport, Endpoint, ServerTransport};
 use crate::{ActorAddress, Server, ServerBuilder, S3OwnershipConfig, StartError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -56,12 +58,27 @@ impl Default for LeaseTiming {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct ServerRuntimeConfig {
     pub node_id: String,
-    pub bind_address: SocketAddr,
-    pub advertised_address: SocketAddr,
+    /// `None` = inmem（无 socket）。
+    pub bind_address: Option<SocketAddr>,
+    /// 完整 endpoint：gRPC 为 `http://host:port`，inmem 为 registry key。
+    pub advertised_address: String,
     pub lease_timing: LeaseTiming,
+    pub server_transport: Arc<dyn ServerTransport>,
+    pub client_transport: Arc<dyn ClientTransport>,
+}
+
+impl std::fmt::Debug for ServerRuntimeConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServerRuntimeConfig")
+            .field("node_id", &self.node_id)
+            .field("bind_address", &self.bind_address)
+            .field("advertised_address", &self.advertised_address)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -94,16 +111,40 @@ impl ServerConfig {
 }
 
 impl ServerRuntimeConfig {
+    /// gRPC 配置：绑定 socket，advertised 为 `http://host:port`。
     pub(crate) fn new(
         node_id: impl Into<String>,
         bind_address: SocketAddr,
         advertised_address: SocketAddr,
     ) -> Self {
+        let transport = GrpcTransport::new(LeaseTiming::default().peer_connect_timeout);
         Self {
             node_id: node_id.into(),
-            bind_address,
-            advertised_address,
+            bind_address: Some(bind_address),
+            advertised_address: format!("http://{advertised_address}"),
             lease_timing: LeaseTiming::default(),
+            server_transport: Arc::new(transport),
+            client_transport: Arc::new(GrpcTransport::new(
+                LeaseTiming::default().peer_connect_timeout,
+            )),
+        }
+    }
+
+    /// inmem 配置（测试）：无 socket，advertised 为 registry key。
+    #[cfg(test)]
+    pub(crate) fn inmem(
+        node_id: impl Into<String>,
+        endpoint: impl Into<String>,
+        registry: Arc<crate::transport::inmem::InmemRegistry>,
+    ) -> Self {
+        let transport = crate::transport::inmem::InmemTransport::new(registry);
+        Self {
+            node_id: node_id.into(),
+            bind_address: None,
+            advertised_address: endpoint.into(),
+            lease_timing: LeaseTiming::default(),
+            server_transport: Arc::new(transport.clone()),
+            client_transport: Arc::new(transport),
         }
     }
 
@@ -116,7 +157,7 @@ impl ServerRuntimeConfig {
         if self.node_id.trim().is_empty() {
             return Err(StartError::InvalidNodeId);
         }
-        if self.advertised_address.port() == 0 {
+        if self.advertised_address.trim().is_empty() {
             return Err(StartError::InvalidAdvertisedAddress);
         }
         let timing = self.lease_timing;
@@ -132,11 +173,11 @@ impl ServerRuntimeConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct NodeLease {
     pub node_id: String,
     pub session_id: NodeSessionId,
-    pub advertised_address: SocketAddr,
+    pub advertised_address: String,
     pub protocol_version: u32,
     pub expires_at_unix_ms: u64,
     #[serde(default)]
@@ -310,14 +351,19 @@ where
 {
     pub async fn start(self) -> Result<Server<S>, StartError> {
         self.builder.validate()?;
-        let listener = tokio::net::TcpListener::bind(self.config.bind_address)
-            .await
-            .map_err(|_| StartError::BindFailed)?;
+        let listener = match self.config.bind_address {
+            Some(address) => Some(
+                tokio::net::TcpListener::bind(address)
+                    .await
+                    .map_err(|_| StartError::BindFailed)?,
+            ),
+            None => None,
+        };
         let session_id = NodeSessionId::generate();
         let lease = NodeLease {
             node_id: self.config.node_id.clone(),
             session_id: session_id.clone(),
-            advertised_address: self.config.advertised_address,
+            advertised_address: self.config.advertised_address.clone(),
             protocol_version: crate::PEER_PROTOCOL_VERSION,
             expires_at_unix_ms: wall_time_millis()
                 .saturating_add(self.config.lease_timing.ttl.as_millis() as u64),
@@ -369,14 +415,17 @@ where
             self.storage.clone(),
             self.config.node_id.clone(),
             session_id,
-            format!("http://{}", self.config.advertised_address),
             self.config.lease_timing.operation_timeout,
-            self.config.lease_timing.peer_connect_timeout,
         );
-        let runtime = self
+        let builder = self
             .builder
-            .build_with_authority(Some(authority.clone()), Some(cluster))?;
-        let peer = runtime.spawn_peer(listener);
+            .with_client_transport(self.config.client_transport.clone());
+        let runtime = builder.build_with_authority(Some(authority.clone()), Some(cluster))?;
+        let peer = runtime.spawn_peer(
+            self.config.server_transport.clone(),
+            &Endpoint::new(self.config.advertised_address.clone()),
+            listener,
+        );
         let renewal = spawn_lease_renewal(
             runtime.inner.clone(),
             authority,

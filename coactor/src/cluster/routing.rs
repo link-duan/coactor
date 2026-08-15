@@ -12,9 +12,7 @@ pub(crate) struct ClusterRouter {
     storage: Arc<dyn OwnershipBackend>,
     node_id: String,
     session_id: NodeSessionId,
-    local_endpoint: String,
     operation_timeout: Duration,
-    pub(crate) peer_connect_timeout: Duration,
     resolutions: tokio::sync::Mutex<HashMap<ActorAddress, Arc<tokio::sync::Mutex<()>>>>,
     resolved: tokio::sync::Mutex<HashMap<ActorAddress, CachedOwner>>,
 }
@@ -24,24 +22,16 @@ impl ClusterRouter {
         storage: Arc<dyn OwnershipBackend>,
         node_id: String,
         session_id: NodeSessionId,
-        local_endpoint: String,
         operation_timeout: Duration,
-        peer_connect_timeout: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
             storage,
             node_id,
             session_id,
-            local_endpoint,
             operation_timeout,
-            peer_connect_timeout,
             resolutions: tokio::sync::Mutex::new(HashMap::new()),
             resolved: tokio::sync::Mutex::new(HashMap::new()),
         })
-    }
-
-    pub(crate) fn local_node_endpoint(&self) -> String {
-        self.local_endpoint.clone()
     }
 
     async fn resolution_lock(&self, address: &ActorAddress) -> Arc<tokio::sync::Mutex<()>> {
@@ -122,7 +112,7 @@ impl ClusterRouter {
                     .map_err(|_| SendError::OwnershipUnavailable)?;
                     if let Some(lease) = lease {
                         if lease.lease.expires_at_unix_ms > wall_time_millis() {
-                            let endpoint = format!("http://{}", lease.lease.advertised_address);
+                            let endpoint = lease.lease.advertised_address.clone();
                             let protocol_version = lease.lease.protocol_version;
                             self.resolved.lock().await.insert(
                                 address.clone(),

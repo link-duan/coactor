@@ -21,7 +21,7 @@ async fn router(
     let lease = NodeLease {
         node_id: node_id.to_owned(),
         session_id: session_id.clone(),
-        advertised_address: "127.0.0.1:7000".parse().unwrap(),
+        advertised_address: "http://127.0.0.1:7000".to_owned(),
         protocol_version: crate::PEER_PROTOCOL_VERSION,
         expires_at_unix_ms: wall_time_millis() + 60_000,
         sampled_at_unix_ms: wall_time_millis(),
@@ -36,9 +36,7 @@ async fn router(
         storage.clone(),
         node_id.to_owned(),
         session_id,
-        format!("http://{node_id}"),
         Duration::from_secs(5),
-        Duration::from_secs(1),
     )
 }
 

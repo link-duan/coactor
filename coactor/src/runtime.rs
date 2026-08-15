@@ -7,18 +7,19 @@ use crate::cluster::{
     ClusterRouter, ClusterTasks, NodeAuthority, PeerTask, RenewalTask, spawn_peer,
 };
 use crate::{
-    __macro, ActorAddress, ActorId, ActorTypeConfig, ServerConfig, ServerStarter,
-    PEER_PROTOCOL_VERSION, ServerSupervision, ServerTermination, S3OwnershipBackend, StartError,
+    __macro, transport::ClientTransport, ActorTypeConfig, ServerConfig,
+    ServerStarter, PEER_PROTOCOL_VERSION, ServerSupervision, ServerTermination, S3OwnershipBackend,
+    StartError,
 };
 #[cfg(test)]
 use crate::{ServerRuntimeConfig, OwnershipBackend};
-use crate::runtime::core::ActorRef;
 use crate::runtime::session::SessionRegistry;
 
 pub struct ServerBuilder<S> {
     state: S,
     registrations: Vec<__macro::Registration<S>>,
     cluster: Option<ServerConfig>,
+    client_transport: Option<Arc<dyn ClientTransport>>,
     mailbox_capacity: usize,
     max_active_actors: usize,
     idle_timeout: Duration,
@@ -36,6 +37,7 @@ where
             state,
             registrations: Vec::new(),
             cluster: None,
+            client_transport: None,
             mailbox_capacity: 32,
             max_active_actors: 10_000,
             idle_timeout: Duration::from_secs(60),
@@ -57,6 +59,12 @@ where
 
     pub fn mailbox_capacity(mut self, capacity: usize) -> Self {
         self.mailbox_capacity = capacity;
+        self
+    }
+
+    /// 出站连接的 client transport（网关转发用）；由 ServerStarter 装配。
+    pub(crate) fn with_client_transport(mut self, transport: Arc<dyn ClientTransport>) -> Self {
+        self.client_transport = Some(transport);
         self
     }
 
@@ -192,6 +200,8 @@ where
                 channels: Mutex::new(HashMap::new()),
                 inbound_tasks: Mutex::new(Vec::new()),
                 pending_opens: Mutex::new(HashMap::new()),
+                client_transport: self.client_transport,
+                relays: Mutex::new(HashMap::new()),
             }),
             cluster: None,
         })
@@ -207,17 +217,13 @@ impl<S> Server<S>
 where
     S: Send + Sync + 'static,
 {
-    /// 按 Actor Type 名字 + Actor ID 获取通用地址句柄（纯字符串 API，不做本地注册表校验）。
-    /// 未注册/未知名字的错误推迟到 `open()`（本地经 dispatch 校验，远程由 owner 侧返回）。
-    pub fn actor(&self, actor_type: &str, actor_id: ActorId) -> ActorRef<S> {
-        ActorRef {
-            runtime: Arc::downgrade(&self.inner),
-            address: ActorAddress::new(actor_type, actor_id),
-        }
-    }
-
-    pub(crate) fn spawn_peer(&self, listener: tokio::net::TcpListener) -> PeerTask {
-        spawn_peer(self.inner.clone(), listener)
+    pub(crate) fn spawn_peer(
+        &self,
+        transport: Arc<dyn crate::transport::ServerTransport>,
+        advertised: &crate::transport::Endpoint,
+        listener: Option<tokio::net::TcpListener>,
+    ) -> PeerTask {
+        spawn_peer(self.inner.clone(), transport, advertised, listener)
     }
 
     pub(crate) fn with_cluster_tasks(

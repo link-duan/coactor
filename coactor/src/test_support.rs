@@ -161,10 +161,31 @@ impl OwnershipBackend for TestOwnershipBackend {
             .await
             .unwrap()
     }
+
+    /// inmem 集群节点（无 socket）：advertised 为 `node-<id>` registry key。
+    pub(crate) async fn start_cluster_inmem<S>(
+        builder: ServerBuilder<S>,
+        storage: Arc<TestOwnershipBackend>,
+        node_id: &str,
+        registry: Arc<crate::transport::inmem::InmemRegistry>,
+    ) -> Server<S>
+    where
+        S: Send + Sync + 'static,
+    {
+        builder
+            .cluster_with_backend(
+                ServerRuntimeConfig::inmem(node_id, format!("node-{node_id}"), registry),
+                storage,
+            )
+            .unwrap()
+            .start()
+            .await
+            .unwrap()
+    }
 }
 
 #[cfg(test)]
-pub(crate) use cluster_fakes::{TestOwnershipBackend, start_cluster};
+pub(crate) use cluster_fakes::{TestOwnershipBackend, start_cluster, start_cluster_inmem};
 
 // ---------------------------------------------------------------------------
 // TestServer：装配 inmem transport 的本地测试 Server（ADR-0008）。

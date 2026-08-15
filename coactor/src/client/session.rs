@@ -147,8 +147,5 @@ pub(crate) async fn resolve_owner_endpoint(
     if lease.lease.expires_at_unix_ms <= wall_time_millis() {
         return Ok(None);
     }
-    Ok(Some(Endpoint::new(format!(
-        "http://{}",
-        lease.lease.advertised_address
-    ))))
+    Ok(Some(Endpoint::new(lease.lease.advertised_address.clone())))
 }

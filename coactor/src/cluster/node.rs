@@ -11,9 +11,9 @@ use tokio::sync::{oneshot, watch};
 
 use super::{confirm_node_lease, wall_time_millis};
 use crate::{
-    __macro::ServerInner, transport::grpc::GrpcTransport,
-    transport::{Endpoint, ServerTransport}, LeaseMutation, LeaseTiming, NodeLease, NodeSessionId,
-    OwnershipBackend, ServerTermination, ServerTerminationReason,
+    __macro::ServerInner, transport::{Endpoint, ServerTransport}, LeaseMutation,
+    LeaseTiming, NodeLease, NodeSessionId, OwnershipBackend, ServerTermination,
+    ServerTerminationReason,
 };
 
 pub struct NodeAuthority {
@@ -107,23 +107,19 @@ impl ClusterTasks {
     }
 }
 
-pub fn spawn_peer<S>(runtime: Arc<ServerInner<S>>, listener: tokio::net::TcpListener) -> PeerTask
+pub fn spawn_peer<S>(
+    runtime: Arc<ServerInner<S>>,
+    transport: Arc<dyn ServerTransport>,
+    advertised: &Endpoint,
+    listener: Option<tokio::net::TcpListener>,
+) -> PeerTask
 where
     S: Send + Sync + 'static,
 {
     let (shutdown, shutdown_receiver) = watch::channel(false);
     let (force, force_receiver) = oneshot::channel();
-    let connect_timeout = runtime
-        .cluster
-        .as_ref()
-        .map_or(Duration::from_secs(3), |cluster| cluster.peer_connect_timeout);
-    let transport = GrpcTransport::new(connect_timeout);
-    let advertised = runtime
-        .cluster
-        .as_ref()
-        .map_or_else(|| Endpoint::new("local"), |cluster| Endpoint::new(cluster.local_node_endpoint()));
     let mut listener = transport
-        .listen(&advertised, Some(listener))
+        .listen(advertised, listener)
         .expect("peer listener bind");
     let task = tokio::spawn(async move {
         let mut shutdown_receiver = shutdown_receiver;
@@ -141,11 +137,13 @@ where
                     let task_runtime = runtime.clone();
                     let handle = tokio::spawn(async move {
                         let mut stream = stream;
+                        let sender = stream.sender();
                         while let Some(envelope) = stream.recv().await {
                             task_runtime
-                                .dispatch_inbound(envelope, Some(stream.sender()))
+                                .dispatch_inbound(envelope, Some(sender.clone()))
                                 .await;
                         }
+                        task_runtime.close_relays_for_sender(&sender).await;
                     });
                     runtime.register_inbound_task(handle.abort_handle());
                 }

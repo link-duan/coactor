@@ -8,7 +8,7 @@
 - `ActorType` 是显式稳定名称，不使用 Rust 类型名；`#[coactor::actor]` 只挂在 Actor struct 上，生成类型擦除 dispatch 实现，**不声明名称**。名称由 consumer 注册时显式传入（`register::<A>(name)`），Rust 类型重命名不会自动改变 Actor Address。
 - Actor Type 只在 runtime 启动前注册，名称必须唯一；重复注册使 runtime 构建失败，启动后 registry 冻结。
 - consumer 通过 runtime builder 显式 `register::<A>(name)`；macro 只生成注册所需类型描述，不执行自动发现。
-- consumer 通过 `runtime.actor(name, actor_id)` 按名字索引获取通用 `ActorRef`（纯字符串 API，无类型参数、无本地注册表 eager 校验）；未注册名字的错误推迟到 `open()`。成功获取 Ref 仍不会启动 Active Actor。
+- caller 通过 `Client::actor(name, actor_id)` 按名字索引获取通用 `ActorRef`（纯字符串 API，无类型参数、无本地注册表 eager 校验）；未注册名字的错误推迟到 `open()`。成功获取 Ref 仍不会启动 Active Actor。Server 不提供 caller 能力（ADR-0008）。
 - `ActorId` 是调用方提供、在同一 Actor Type 内唯一的原始字节。
 - `ActorAddress` 的稳定编码为 `u32 big-endian type length + type bytes + actor ID bytes`。
 - `ActorRef` 只保存稳定寻址信息，不保持 Active Actor 存活。获取或 clone Ref 不会启动 Actor；`open()` 才执行 registry lookup 或 lazy activation。passivation 后已有 Ref 仍可复用。
@@ -20,10 +20,10 @@
 - Session 是 caller 与 Actor 之间的一次持久双向通道，由 `ActorRef::open()` 建立；所有入站消息（Action）都经过 Session，不提供无 Session 的单向 tell。
 - `open()` 主动激活：`on_activate` 完成 → 注册 Session → `on_session_opened` 完成 → 返回。失败时同步返回对应错误（如 `ActivationFailed`、`MailboxFull`）并清理注册。
 - `on_session_opened` 中可通过 ctx 立即推送（"连接即推送"）。
-- Action 是入站消息，字节负载，fire-and-forget：`Session::send` 同步返回投递状态，进入 mailbox 后不再确认（at-most-once）。
+- Action 是入站消息，字节负载，fire-and-forget（at-most-once）。网关模型下 `Session::send` 同步返回**传输投递**状态（进入节点间通道后不再确认）；server 侧拒绝（如 `MailboxFull`、`ActorStopped`）经 `SessionError` 异步通知到接收流。
 - Event 是出站消息，字节负载，Actor 可随时推送：`MessageContext::send` 定向当前 Session；`ActorRuntime::broadcast` 广播给全部存活 Session（尽力而为，单点失败跳过并记录日志）。
 - 业务错误不属于 `SendError`，由 Event 表达；`SendError` 只表达 runtime 投递失败。
-- 出站接收流 bounded；caller 不消费时 `send` 返回 `MailboxFull`。
+- 出站接收流 bounded；caller 不消费时投递被丢弃（尽力而为）。
 - 同一 Session 的出站 Event 保序（Actor 串行执行 + FIFO 投递）。
 
 ## Active Actor and execution
@@ -64,7 +64,7 @@
 - 每个 Active Actor 的 mailbox 容量固定且大于零。
 - capacity 使用 runtime 默认值，Actor Type 可以覆盖；同一 Actor Type 的全部 Actor ID 使用相同配置。
 - 容量只计算排队中的消息，不包含正在执行的消息。
-- 当前过载策略是立即拒绝：mailbox 满时返回 `MailboxFull`，不等待、不合并、不静默丢弃。
+- 当前过载策略是立即拒绝：mailbox 满时经 `SessionError` 通知 caller（不终止 Session），不等待、不合并、不静默丢弃。
 - 调用方只有在 enqueue 成功后才可认为 Action 已被进程内 runtime 接纳；进程崩溃仍可能丢失已接纳但未持久化的 Action。
 
 ## Idle passivation

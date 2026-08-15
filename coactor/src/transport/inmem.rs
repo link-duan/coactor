@@ -29,6 +29,7 @@ impl InmemRegistry {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct InmemTransport {
     registry: Arc<InmemRegistry>,
 }

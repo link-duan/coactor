@@ -22,7 +22,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 `#[actor]` marks the Actor **struct** and generates the type-erased dispatch impl; the stable Actor Type name is passed explicitly at registration (`register::<A>(name)`) and is never derived from the Rust type name. Business logic lives in a hand-written `impl Actor<AppState>` using native `async fn`:
 
 ```rust
-use coactor::{Actor, ActorId, ActorRuntime, MessageContext, RuntimeBuilder, actor};
+use coactor::{Actor, ActorId, ActorRuntime, MessageContext, ServerBuilder, actor};
 
 struct AppState;
 
@@ -53,21 +53,21 @@ impl Actor<AppState> for CounterActor {
 ```rust
 #[tokio::main]
 async fn main() {
-    let runtime = RuntimeBuilder::local(())
+    let server = coactor::test_support::TestServerBuilder::new(())
         .register::<CounterActor>("counter")
         .start()
         .await
         .unwrap();
 
     // 按 Actor Type 名字索引（纯字符串 API，无类型参数、无本地注册表校验）
-    let counter = runtime.actor("counter", coactor::ActorId::from("room-7"));
+    let counter = server.client().actor("counter", coactor::ActorId::from("room-7"));
     let mut session = counter.open().await.unwrap();
 
     session.send(2i64.to_be_bytes().to_vec()).await.unwrap(); // Action
     let event = session.recv().await.unwrap().unwrap();        // Event
     assert_eq!(i64::from_be_bytes(event.try_into().unwrap()), 2);
 
-    runtime.shutdown().await;
+    server.shutdown().await;
 }
 ```
 
@@ -92,7 +92,7 @@ cargo run -p coactor --example counter
 
 ## Configure the runtime
 
-`RuntimeBuilder` applies runtime-wide defaults; `ActorTypeConfig` overrides them per Actor Type:
+`ServerBuilder` 提供 runtime-wide 默认；`ActorTypeConfig` 按 Actor Type 覆盖：
 
 | Builder method | Default | Meaning |
 |---|---|---|
@@ -103,7 +103,7 @@ cargo run -p coactor --example counter
 | `shutdown_timeout` | 30s | global deadline for draining and deactivating on shutdown |
 
 ```rust
-let runtime = RuntimeBuilder::local(state)
+let server = ServerBuilder::local(state)
     .register_with::<CounterActor>(ActorTypeConfig::new().mailbox_capacity(128))
     .start()
     .await?;
@@ -115,7 +115,7 @@ Cluster mode adds location-transparent routing: an S3-backed ownership authority
 
 ```rust,no_run
 use coactor::{
-    RuntimeBuilder,
+    ServerBuilder,
     cluster::{ClusterConfig, S3OwnershipConfig},
 };
 
@@ -131,7 +131,7 @@ let cluster = ClusterConfig::new(
     "127.0.0.1:7000".parse().unwrap(),
     ownership,
 );
-let runtime = RuntimeBuilder::cluster((), cluster).start().await?;
+let server = ServerBuilder::cluster((), cluster).start().await?;
 # runtime.shutdown().await;
 # Ok(())
 # }

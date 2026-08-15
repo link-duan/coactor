@@ -16,7 +16,10 @@ CoActor 是一个 Rust actor runtime，为稳定业务身份（game room、docum
 ## Quick start
 
 ```rust
-use coactor::{Actor, ActorId, ActorRuntime, BoxFuture, MessageContext, RuntimeBuilder, actor};
+use coactor::{
+    Actor, ActorId, ActorRuntime, BoxFuture, MessageContext, actor,
+    test_support::TestServerBuilder,
+};
 
 #[derive(Clone)]
 struct AppState { increment_scale: i64 }
@@ -41,14 +44,16 @@ impl Actor<AppState> for CounterActor {
 
 #[tokio::main]
 async fn main() {
-    let runtime = RuntimeBuilder::local(AppState { increment_scale: 2 })
+    // 本地示例/测试形态：TestServer 装配 inmem transport，client() 内存直连。
+    // 生产形态为分布式 Server + Client（经 Service Discovery 与网关转发，见 ADR-0008）。
+    let server = TestServerBuilder::new(AppState { increment_scale: 2 })
         .register::<CounterActor>("counter")
         .start()
         .await
         .expect("valid CoActor configuration");
 
     // 按名字索引（纯字符串 API，无需类型参数），open 建立持久双向 Session
-    let counter = runtime.actor("counter", ActorId::from("counter-7"));
+    let counter = server.client().actor("counter", ActorId::from("counter-7"));
     let mut session = counter.open().await.expect("Session opens");
 
     session.send(3i64.to_be_bytes().to_vec()).await.expect("accepted"); // Action 入站
@@ -56,7 +61,7 @@ async fn main() {
         println!("value = {}", i64::from_be_bytes(event.try_into().unwrap()));
     }
 
-    runtime.shutdown().await;
+    server.shutdown().await;
 }
 ```
 
@@ -96,7 +101,7 @@ pub trait Actor<S>: Send + 'static {
 每进程嵌入 runtime（peer node），S3 提供 Node Lease 与 Actor Owner Record 的 ownership 权威；消息经 ownership 解析路由到 Owner（Node 间 bidi gRPC stream 多路复用），对 caller 位置透明。
 
 ```rust
-let runtime = RuntimeBuilder::cluster((), ClusterConfig::new(
+let server = ServerBuilder::cluster((), ServerConfig::new(
     "node-a", "0.0.0.0:7000".parse().unwrap(),
     "127.0.0.1:7000".parse().unwrap(),
     S3OwnershipConfig::local("coactor", "development", "http://127.0.0.1:9000"),

@@ -21,7 +21,7 @@ runtime facade
             └── Actor Owner Record + Ownership Epoch
 ```
 
-- `RuntimeBuilder::local` and `RuntimeBuilder::cluster` explicitly select the operating mode; both start asynchronously through `start()`.
+- `ServerBuilder::local`（测试便利，经 `test_support::TestServer`）与 `ServerBuilder::cluster`（分布式）分别选择运行形态；两者都经 `start()` 异步启动。`Client` 是独立于 `Server` 的调用方入口（ADR-0008）。
 - Actor Refs are stable weak handles obtained by Actor Type name + Actor ID; `open()` establishes a persistent bidirectional Session (Action in, Event out, byte payloads).
 - `#[coactor::actor]` marks the Actor struct and generates the type-erased dispatch impl; the Actor Type name is passed explicitly at registration (`register::<A>(name)`). Consumers implement the `Actor` trait with native `async fn` methods. `ActorRuntime` injects identity, AppState and `broadcast` at construction; `MessageContext` carries the current Session for directed Event delivery.
 - A local Active Actor owns a bounded mailbox and executes one message at a time, including across handler `.await` points.
