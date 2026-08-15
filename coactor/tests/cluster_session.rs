@@ -1,12 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::client::{Client, ClientBuilder, RouteMode};
+use crate::client::discovery::StaticListDiscovery;
+use crate::client::{Client, ClientBuilder};
 use crate::test_support::{TestOwnershipBackend, start_cluster_inmem};
 use crate::transport::inmem::{InmemRegistry, InmemTransport};
 use crate::transport::Endpoint;
 use crate::{
-    Actor, ActorId, ActorRuntime, MessageContext, Server, ServerBuilder, actor,
+    Actor, ActorAddress, ActorId, ActorRuntime, MessageContext, OwnershipBackend, Server,
+    ServerBuilder, actor,
 };
 
 #[derive(Default, Clone)]
@@ -46,9 +48,9 @@ async fn inmem_server(
 }
 
 fn inmem_client(registry: Arc<InmemRegistry>, endpoint: &str) -> Client {
-    ClientBuilder::new(
+    ClientBuilder::with_transport(
         Arc::new(InmemTransport::new(registry)),
-        RouteMode::Direct(Endpoint::new(endpoint)),
+        StaticListDiscovery::new(vec![Endpoint::new(endpoint)]),
     )
     .start()
 }
@@ -92,6 +94,60 @@ async fn sessions_are_location_transparent_across_gateways() {
     client_b.shutdown().await;
     server_b.shutdown().await;
     client_a.shutdown().await;
+    server_a.shutdown().await;
+}
+
+/// 连接池：StaticListDiscovery 多网关 round-robin 按会话分发，各网关独立 claim。
+#[tokio::test]
+async fn client_pool_distributes_sessions_across_gateways() {
+    let storage = Arc::new(TestOwnershipBackend::default());
+    let registry = InmemRegistry::new();
+    let server_a = inmem_server(storage.clone(), "A", registry.clone()).await;
+    let server_b = inmem_server(storage.clone(), "B", registry.clone()).await;
+    let client = ClientBuilder::with_transport(
+        Arc::new(InmemTransport::new(registry.clone())),
+        StaticListDiscovery::new(vec![Endpoint::new("node-A"), Endpoint::new("node-B")]),
+    )
+    .start();
+
+    let mut first = client
+        .actor("cluster-echo", ActorId::from("pool-1"))
+        .open()
+        .await
+        .expect("first session");
+    let mut second = client
+        .actor("cluster-echo", ActorId::from("pool-2"))
+        .open()
+        .await
+        .expect("second session");
+    assert_eq!(first.recv().await, Some(Ok(b"opened".to_vec())));
+    assert_eq!(second.recv().await, Some(Ok(b"opened".to_vec())));
+
+    // round-robin：两个地址分别落在不同网关节点
+    let record_a = storage
+        .read_actor_owner(&ActorAddress::new(
+            "cluster-echo",
+            ActorId::from("pool-1"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .record;
+    let record_b = storage
+        .read_actor_owner(&ActorAddress::new(
+            "cluster-echo",
+            ActorId::from("pool-2"),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .record;
+    let owner_a = record_a.owner.as_ref().unwrap().node_id.clone();
+    let owner_b = record_b.owner.as_ref().unwrap().node_id.clone();
+    assert_ne!(owner_a, owner_b, "sessions should land on different gateways");
+
+    client.shutdown().await;
+    server_b.shutdown().await;
     server_a.shutdown().await;
 }
 

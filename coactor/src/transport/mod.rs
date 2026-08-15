@@ -17,15 +17,15 @@ use std::sync::Arc;
 use crate::peer_protocol::Envelope;
 
 /// 对端节点地址：gRPC 为 `http://host:port`，inmem 为进程内 registry key。
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Endpoint(pub(crate) String);
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Endpoint(pub(crate) String);
 
 impl Endpoint {
-    pub(crate) fn new(value: impl Into<String>) -> Self {
+    pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }

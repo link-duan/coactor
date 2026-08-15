@@ -8,11 +8,9 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use super::{ClientInner, RouteMode, envelope_action};
+use super::{ClientInner, envelope_action};
 use crate::peer_protocol::Envelope;
-use crate::{
-    ActorAddress, OwnershipBackend, SendError, SessionId, transport::Endpoint, wall_time_millis,
-};
+use crate::{ActorAddress, SendError, SessionId, transport::Endpoint};
 
 type EventSender = mpsc::Sender<Result<Vec<u8>, SendError>>;
 
@@ -62,23 +60,14 @@ pub struct Session {
 }
 
 impl Session {
-    /// 入站 fire-and-forget：同步返回投递状态，进入 mailbox 后不再确认。
+    /// 入站 fire-and-forget：同步返回传输投递状态，进入网关通道后不再确认；
+    /// server 侧拒绝（如 MailboxFull）经 SessionError 异步通知。
     pub async fn send(&self, msg: Vec<u8>) -> Result<(), SendError> {
         let client = self.client.upgrade().ok_or(SendError::RuntimeStopped)?;
-        // 惰性 failover 检测：resolve 到的当前 owner 与建立时不同 → 会话已随旧 owner 消亡。
-        let endpoint = match &client.route {
-            RouteMode::Direct(endpoint) => endpoint.clone(),
-            RouteMode::Authority(backend) => {
-                let Some(endpoint) = resolve_owner_endpoint(backend.as_ref(), &self.address).await?
-                else {
-                    return Err(SendError::RemoteUnavailable);
-                };
-                endpoint
-            }
-        };
-        if self.owner_endpoint.as_ref() != Some(&endpoint) {
-            return Err(SendError::RemoteUnavailable);
-        }
+        let endpoint = self
+            .owner_endpoint
+            .clone()
+            .ok_or(SendError::RemoteUnavailable)?;
         let channel = client.ensure_channel(&endpoint).await?;
         channel
             .try_send(envelope_action(&self.address, self.session_id, msg))
@@ -122,30 +111,4 @@ impl Drop for Session {
             });
         });
     }
-}
-
-/// 只读解析 owner 端点；未拥有/stale 返回 `Ok(None)`（调用方按会话失效处理）。
-pub(crate) async fn resolve_owner_endpoint(
-    backend: &dyn OwnershipBackend,
-    address: &ActorAddress,
-) -> Result<Option<Endpoint>, SendError> {
-    let record = backend
-        .read_actor_owner(address)
-        .await
-        .map_err(|_| SendError::OwnershipUnavailable)?;
-    let Some(record) = record else {
-        return Ok(None);
-    };
-    let Some(owner) = &record.record.owner else {
-        return Ok(None);
-    };
-    let lease = backend
-        .read_node_lease(&owner.session_id)
-        .await
-        .map_err(|_| SendError::OwnershipUnavailable)?
-        .ok_or(SendError::OwnershipUnavailable)?;
-    if lease.lease.expires_at_unix_ms <= wall_time_millis() {
-        return Ok(None);
-    }
-    Ok(Some(Endpoint::new(lease.lease.advertised_address.clone())))
 }

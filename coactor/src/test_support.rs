@@ -195,7 +195,8 @@ pub(crate) use cluster_fakes::{TestOwnershipBackend, start_cluster, start_cluste
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::client::{Client, ClientBuilder, RouteMode};
+use crate::client::discovery::StaticListDiscovery;
+use crate::client::{Client, ClientBuilder};
 use crate::transport::inmem::{InmemRegistry, InmemTransport};
 use crate::transport::{Endpoint, ServerTransport};
 use crate::{Server, ServerBuilder, StartError, __macro};
@@ -255,9 +256,9 @@ impl<S: Send + Sync + 'static> TestServerBuilder<S> {
             }
         });
         let client_transport = Arc::new(InmemTransport::new(registry));
-        let client = ClientBuilder::new(
+        let client = ClientBuilder::with_transport(
             client_transport,
-            RouteMode::Direct(Endpoint::new(key)),
+            StaticListDiscovery::new(vec![Endpoint::new(key)]),
         )
         .start();
         Ok(TestServer {

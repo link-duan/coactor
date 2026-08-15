@@ -1,8 +1,10 @@
 //! caller 侧 runtime：只调用不宿主（ADR-0008）。
 //!
-//! `Client` 经 transport（gRPC 或 inmem）向 Server 节点发起 Session，经网关
-//! 中继消息；不持有 AppState、不 claim ownership、无 lease/self-fence。
+//! `Client` 经 Service Discovery 获取候选 Server（网关）节点，维护连接池并按
+//! 会话 round-robin 分配网关；会话经网关中继到 owner。不持有 AppState、不
+//! 参与 ownership（不 claim、不接管）、无 lease/self-fence。
 
+pub mod discovery;
 pub(crate) mod session;
 
 use std::{
@@ -18,41 +20,57 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::peer_protocol::{Envelope, envelope, session_opened_ack};
+use crate::transport::grpc::GrpcTransport;
 use crate::transport::{ClientTransport, Endpoint, PeerSender};
-use crate::{ActorAddress, ActorId, OwnershipBackend, PEER_PROTOCOL_VERSION, SendError};
+use crate::{ActorAddress, ActorId, PEER_PROTOCOL_VERSION, SendError};
 
+use self::discovery::ServiceDiscovery;
 use self::session::Session;
 
 pub(crate) const SESSION_RECEIVER_CAPACITY: usize = 64;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) const RUNNING: u8 = 0;
 pub(crate) const STOPPED: u8 = 1;
 
-/// 路由模式：`Direct` 把全部 Session 发往单一端点（本地测试/单后端）；
-/// `Authority` 经 ownership authority 只读解析 owner（分布式，不 claim）。
-/// Authority 变体由 cluster 测试与分布式 Client 使用。
-#[allow(dead_code)]
-pub(crate) enum RouteMode {
-    Direct(Endpoint),
-    Authority(Arc<dyn OwnershipBackend>),
+/// 公开 Client 配置：服务发现 + （可扩展的池参数）。
+#[derive(Clone)]
+pub struct ClientConfig {
+    pub discovery: Arc<dyn ServiceDiscovery>,
 }
 
 pub struct ClientBuilder {
-    pub(crate) transport: Arc<dyn ClientTransport>,
-    pub(crate) route: RouteMode,
+    transport: Arc<dyn ClientTransport>,
+    discovery: Arc<dyn ServiceDiscovery>,
 }
 
 impl ClientBuilder {
-    pub(crate) fn new(transport: Arc<dyn ClientTransport>, route: RouteMode) -> Self {
-        Self { transport, route }
+    /// 公开构造：gRPC transport + 自定义服务发现。
+    pub fn new(config: ClientConfig) -> Self {
+        Self {
+            transport: Arc::new(GrpcTransport::new(PEER_CONNECT_TIMEOUT)),
+            discovery: config.discovery,
+        }
+    }
+
+    /// crate 内部：注入 transport（inmem 测试路径）。
+    pub(crate) fn with_transport(
+        transport: Arc<dyn ClientTransport>,
+        discovery: Arc<dyn ServiceDiscovery>,
+    ) -> Self {
+        Self {
+            transport,
+            discovery,
+        }
     }
 
     pub fn start(self) -> Client {
         Client {
             inner: Arc::new(ClientInner {
                 transport: self.transport,
-                route: self.route,
+                discovery: self.discovery,
+                pool: Mutex::new(Pool::default()),
                 sessions: session::CallerRegistry::new(),
                 channels: Mutex::new(HashMap::new()),
                 pending_opens: Mutex::new(HashMap::new()),
@@ -67,11 +85,19 @@ pub struct Client {
     pub(crate) inner: Arc<ClientInner>,
 }
 
+/// 网关连接池：最新发现结果 + round-robin 游标。
+#[derive(Default)]
+pub(crate) struct Pool {
+    endpoints: Vec<Endpoint>,
+    next: usize,
+}
+
 pub(crate) struct ClientInner {
     pub(crate) transport: Arc<dyn ClientTransport>,
-    pub(crate) route: RouteMode,
+    pub(crate) discovery: Arc<dyn ServiceDiscovery>,
+    pub(crate) pool: Mutex<Pool>,
     pub(crate) sessions: Arc<session::CallerRegistry>,
-    /// 到各远端 Server 的 bidi stream 发送端（node-pair 复用）。
+    /// 到各网关节点的 bidi stream 发送端（node-pair 复用）。
     pub(crate) channels: Mutex<HashMap<String, Arc<dyn PeerSender>>>,
     /// 远程 SessionOpen 的 ack 等待表。
     pub(crate) pending_opens: Mutex<HashMap<crate::SessionId, oneshot::Sender<Result<(), SendError>>>>,
@@ -89,14 +115,13 @@ impl Client {
     }
 
     pub async fn shutdown(&self) {
-        self.inner
-            .status
-            .store(STOPPED, Ordering::Release);
+        self.inner.status.store(STOPPED, Ordering::Release);
         for handle in self.inner.inbound_tasks.lock().drain(..) {
             handle.abort();
         }
         self.inner.channels.lock().clear();
         self.inner.pending_opens.lock().clear();
+        self.inner.pool.lock().endpoints.clear();
         self.inner.sessions.terminate_all(SendError::RuntimeStopped);
     }
 }
@@ -117,7 +142,7 @@ impl Clone for ActorRef {
 }
 
 impl ActorRef {
-    /// 建立与 Actor 的持久 Session：resolve owner → 经 transport 发 SessionOpen →
+    /// 建立与 Actor 的持久 Session：池中选网关 → 经 transport 发 SessionOpen →
     /// 等 ack → 返回。失败时清理本地注册。
     pub async fn open(&self) -> Result<Session, SendError> {
         let client = self.client.upgrade().ok_or(SendError::RuntimeStopped)?;
@@ -128,14 +153,10 @@ impl ActorRef {
         let (sender, receiver) = mpsc::channel(SESSION_RECEIVER_CAPACITY);
         client.sessions.register_local(session_id, sender);
 
-        let cleanup = || {
-            client.sessions.unregister_local(&session_id);
-        };
-
-        let endpoint = match resolve_owner(&client, &self.address).await {
+        let endpoint = match client.pick_endpoint().await {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                cleanup();
+                client.sessions.unregister_local(&session_id);
                 return Err(error);
             }
         };
@@ -143,7 +164,7 @@ impl ActorRef {
         let channel = match client.ensure_channel(&endpoint).await {
             Ok(channel) => channel,
             Err(error) => {
-                cleanup();
+                client.sessions.unregister_local(&session_id);
                 return Err(error);
             }
         };
@@ -152,7 +173,7 @@ impl ActorRef {
         let envelope = envelope_session_open(&self.address, session_id, PEER_PROTOCOL_VERSION);
         if channel.try_send(envelope).is_err() {
             client.pending_opens.lock().remove(&session_id);
-            cleanup();
+            client.sessions.unregister_local(&session_id);
             return Err(SendError::RemoteUnavailable);
         }
         let outcome = tokio::time::timeout(OPEN_TIMEOUT, ack_rx)
@@ -161,7 +182,7 @@ impl ActorRef {
             .map_err(|_| SendError::RemoteUnavailable)?;
         if let Err(error) = outcome {
             client.pending_opens.lock().remove(&session_id);
-            cleanup();
+            client.sessions.unregister_local(&session_id);
             return Err(error);
         }
 
@@ -180,19 +201,44 @@ impl ActorRef {
     }
 }
 
-/// 解析 owner 端点：`Direct` 恒返回配置端点；`Authority` 只读解析，未拥有/stale
-/// 时返回 `OwnershipUnavailable`（client 永不 claim）。
-async fn resolve_owner(client: &Arc<ClientInner>, address: &ActorAddress) -> Result<Endpoint, SendError> {
-    match &client.route {
-        RouteMode::Direct(endpoint) => Ok(endpoint.clone()),
-        RouteMode::Authority(backend) => session::resolve_owner_endpoint(backend.as_ref(), address)
-            .await?
-            .ok_or(SendError::OwnershipUnavailable),
-    }
-}
-
 impl ClientInner {
-    /// 到远端节点的 bidi 流发送端（node-pair 复用）；建流后 spawn 收包循环。
+    /// 池中按 round-robin 选一个网关端点；池空时先刷新发现。
+    pub(crate) async fn pick_endpoint(&self) -> Result<Endpoint, SendError> {
+        let cached = {
+            let mut pool = self.pool.lock();
+            if pool.endpoints.is_empty() {
+                None
+            } else {
+                let endpoint = pool.endpoints[pool.next % pool.endpoints.len()].clone();
+                pool.next += 1;
+                Some(endpoint)
+            }
+        };
+        if let Some(endpoint) = cached {
+            return Ok(endpoint);
+        }
+        let endpoints = self
+            .discovery
+            .resolve()
+            .await
+            .map_err(|_| SendError::OwnershipUnavailable)?;
+        if endpoints.is_empty() {
+            return Err(SendError::OwnershipUnavailable);
+        }
+        let mut pool = self.pool.lock();
+        pool.endpoints = endpoints;
+        let endpoint = pool.endpoints[pool.next % pool.endpoints.len()].clone();
+        pool.next += 1;
+        Ok(endpoint)
+    }
+
+    /// 网关节点失效：从池中驱逐（下次 open 触发重发现）。
+    pub(crate) fn evict_endpoint(&self, endpoint: &Endpoint) {
+        let mut pool = self.pool.lock();
+        pool.endpoints.retain(|candidate| candidate != endpoint);
+    }
+
+    /// 到网关节点的 bidi 流发送端（node-pair 复用）；建流后 spawn 收包循环。
     pub(crate) async fn ensure_channel(
         self: &Arc<Self>,
         endpoint: &Endpoint,
@@ -215,6 +261,7 @@ impl ClientInner {
                 client.handle_envelope(envelope).await;
             }
             client.channels.lock().remove(&closed_key);
+            client.evict_endpoint(&Endpoint::new(closed_key));
         });
         self.inbound_tasks.lock().push(handle.abort_handle());
         self.channels.lock().insert(key, sender.clone());

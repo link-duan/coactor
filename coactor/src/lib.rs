@@ -8,7 +8,7 @@ pub(crate) use cluster::{
     ActorOwner, ActorOwnerRecord, AmbiguousMutation, ServerConfig, ServerStarter, LeaseMutation,
     LeaseTiming, NodeLease, NodeSessionId, OwnershipBackend, OwnershipBackendError,
     ServerSupervision, ServerTermination, ServerTerminationReason, S3OwnershipBackend,
-    S3OwnershipConfig, VersionedActorOwnerRecord, VersionedNodeLease, wall_time_millis,
+    S3OwnershipConfig, VersionedActorOwnerRecord, VersionedNodeLease,
 };
 
 pub use coactor_macros::actor;
@@ -30,8 +30,10 @@ mod transport;
 pub mod test_support;
 
 pub use actor::*;
-pub use client::{ActorRef, Client, ClientBuilder};
+pub use client::discovery::{DnsDiscovery, StaticListDiscovery, DiscoveryError, ServiceDiscovery};
+pub use client::{ActorRef, Client, ClientBuilder, ClientConfig};
 pub use client::session::Session;
+pub use transport::Endpoint;
 pub use runtime::actor::{Actor, ActorRuntime, BoxFuture, MessageContext};
 pub use runtime::session::{SessionHandle, SessionId};
 pub use runtime::{Server, ServerBuilder};
