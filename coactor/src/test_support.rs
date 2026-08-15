@@ -165,7 +165,7 @@ impl OwnershipBackend for TestOwnershipBackend {
     /// inmem 集群节点（无 socket）：advertised 为 `node-<id>` registry key。
     pub(crate) async fn start_cluster_inmem<S>(
         builder: ServerBuilder<S>,
-        storage: Arc<TestOwnershipBackend>,
+        storage: Arc<dyn crate::OwnershipBackend>,
         node_id: &str,
         registry: Arc<crate::transport::inmem::InmemRegistry>,
     ) -> Server<S>

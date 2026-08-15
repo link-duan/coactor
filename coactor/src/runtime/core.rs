@@ -15,7 +15,7 @@ use super::lifecycle::spawn_actor;
 use super::message::{MailboxMessage, Registration};
 use super::route::{Route, RouteState, try_send};
 use super::session::{EventSink, SessionId, SessionRegistry};
-use crate::cluster::{ClusterRouter, NodeAuthority, ResolvedOwner};
+use crate::cluster::{ClusterRouter, NodeAuthority, OwnerStatus, ResolvedOwner};
 use crate::transport::{ClientTransport, Endpoint, PeerSender};
 use crate::{ActorAddress, ActorId, SendError};
 
@@ -46,6 +46,8 @@ pub(crate) struct ServerInner<S> {
     pub pending_opens: Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<Result<(), SendError>>>>,
     /// 出站连接用的 client transport（网关转发）；None = 本地单节点。
     pub client_transport: Option<Arc<dyn ClientTransport>>,
+    /// 放置策略（未拥有 Actor 的候选选择）。
+    pub placement: Arc<dyn crate::cluster::PlacementStrategy>,
     /// 网关转发的中继表：session_id → (owner 端点, caller 回传 sender)。
     pub relays: Mutex<HashMap<SessionId, Relay>>,
 }
@@ -469,21 +471,111 @@ where
         }
     }
 
+    /// 网关放置：未拥有/stale 的 Actor 按策略候选逐个尝试转发；候选耗尽报
+    /// `RuntimeAtCapacity`（不做自兜底）。
+    pub(crate) async fn place_session(
+        self: &Arc<Self>,
+        address: &ActorAddress,
+        session_id: SessionId,
+        client: Arc<dyn PeerSender>,
+    ) -> Result<Result<(), SendError>, SendError> {
+        let candidates = self.placement.candidates(address).await;
+        if candidates.is_empty() {
+            // 默认：就地认领（resolve 含 claim）；竞态下被他者认领则转发给真 owner。
+            let Some(cluster) = &self.cluster else {
+                return Ok(Err(SendError::RuntimeAtCapacity));
+            };
+            return match cluster.resolve(address, &self.capacity).await {
+                Ok(ResolvedOwner::Local { reservation, guard }) => {
+                    self.open_local_session(
+                        address,
+                        session_id,
+                        EventSink::Remote { sender: client },
+                        reservation,
+                        Some(guard),
+                    )
+                    .await
+                }
+                Ok(ResolvedOwner::Remote { endpoint, .. }) => {
+                    self.forward_to_owner_or_actual(
+                        address,
+                        session_id,
+                        &Endpoint::new(endpoint),
+                        client,
+                    )
+                    .await
+                }
+                Err(error) => Ok(Err(error)),
+            };
+        }
+        for candidate in candidates {
+            match self
+                .forward_to_owner_or_actual(address, session_id, &candidate, client.clone())
+                .await
+            {
+                Ok(Ok(())) => return Ok(Ok(())),
+                Ok(Err(SendError::ActorTypeNotRegistered(_))) => {
+                    return Ok(Err(SendError::ActorTypeNotRegistered(String::new())));
+                }
+                // 满/其他 ack 失败或传输不可达：剔除该候选，试下一个。
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+        Ok(Err(SendError::RuntimeAtCapacity))
+    }
+
+    /// 转发 SessionOpen 给 owner；收到 NotOwner（所有权在读取与转发之间翻转）→
+    /// 重解析真 owner 再转发一次（有界），仍失败则返回错误。
+    async fn forward_to_owner_or_actual(
+        self: &Arc<Self>,
+        address: &ActorAddress,
+        session_id: SessionId,
+        endpoint: &Endpoint,
+        client: Arc<dyn PeerSender>,
+    ) -> Result<Result<(), SendError>, SendError> {
+        let result = self
+            .forward_session_open(address, session_id, endpoint, client.clone())
+            .await;
+        if !matches!(result, Ok(Err(SendError::NotOwner))) {
+            return result;
+        }
+        let Some(cluster) = &self.cluster else {
+            return Ok(Err(SendError::RuntimeAtCapacity));
+        };
+        match cluster.owner_only(address).await {
+            Ok(OwnerStatus::Remote { endpoint }) => {
+                self.forward_session_open(address, session_id, &Endpoint::new(endpoint), client)
+                    .await
+            }
+            Ok(OwnerStatus::Local) => self
+                .open_local_session(
+                    address,
+                    session_id,
+                    EventSink::Remote { sender: client },
+                    None,
+                    None,
+                )
+                .await,
+            Ok(OwnerStatus::Unowned) => Ok(Err(SendError::RuntimeAtCapacity)),
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
     /// 网关：把 SessionOpen 转发给 owner，等 ack 后回传 caller；失败则清理中继。
     pub(crate) async fn forward_session_open(
         self: &Arc<Self>,
         address: &ActorAddress,
         session_id: SessionId,
-        owner: String,
+        owner: &Endpoint,
         client: Arc<dyn PeerSender>,
     ) -> Result<Result<(), SendError>, SendError> {
-        let channel = self.ensure_channel(&owner).await?;
+        let channel = self.ensure_channel(owner.as_str()).await?;
         let (ack_tx, ack_rx) = oneshot::channel();
         self.pending_opens.lock().insert(session_id, ack_tx);
         self.relays.lock().insert(
             session_id,
             Relay {
-                owner: owner.clone(),
+                owner: owner.as_str().to_owned(),
                 client,
             },
         );
@@ -501,10 +593,14 @@ where
         let result = match tokio::time::timeout(Duration::from_secs(3), ack_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => {
+                self.pending_opens.lock().remove(&session_id);
                 self.relays.lock().remove(&session_id);
                 Err(SendError::RemoteUnavailable)
             }
         };
+        if result.is_err() {
+            self.relays.lock().remove(&session_id);
+        }
         Ok(result)
     }
 
@@ -596,28 +692,32 @@ where
                 let result = if version_ok {
                     match reply.clone() {
                         Some(sender) => {
-                            // 网关语义：入站会话先 resolve——未拥有/stale 就地 claim，
-                            // 属他人则建中继转发给 owner；无 router 的单节点（TestServer）直接宿主。
+                            // 网关语义：入站会话先只读判断所有权——已归自己则宿主，
+                            // 归他人则转发给 owner，未拥有/stale 则走放置决策。
+                            // 无 router 的单节点（TestServer）直接宿主。
                             let outcome = if let Some(cluster) = &self.cluster {
-                                match cluster.resolve(&address, &self.capacity).await {
-                                    Ok(ResolvedOwner::Local { reservation, guard }) => {
+                                match cluster.owner_only(&address).await {
+                                    Ok(OwnerStatus::Local) => {
                                         self.open_local_session(
                                             &address,
                                             session_id,
                                             EventSink::Remote { sender },
-                                            reservation,
-                                            Some(guard),
+                                            None,
+                                            None,
                                         )
                                         .await
                                     }
-                                    Ok(ResolvedOwner::Remote { endpoint, .. }) => {
-                                        self.forward_session_open(
+                                    Ok(OwnerStatus::Remote { endpoint }) => {
+                                        self.forward_to_owner_or_actual(
                                             &address,
                                             session_id,
-                                            endpoint,
+                                            &Endpoint::new(endpoint),
                                             sender,
                                         )
                                         .await
+                                    }
+                                    Ok(OwnerStatus::Unowned) => {
+                                        self.place_session(&address, session_id, sender).await
                                     }
                                     Err(error) => Ok(Err(error)),
                                 }

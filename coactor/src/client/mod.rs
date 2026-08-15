@@ -29,6 +29,8 @@ use self::session::Session;
 
 pub(crate) const SESSION_RECEIVER_CAPACITY: usize = 64;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+/// open() 传输层重试次数（共 pick 次数 = retries + 1）。
+const MAX_OPEN_GATEWAY_RETRIES: usize = 1;
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) const RUNNING: u8 = 0;
@@ -152,20 +154,28 @@ impl ActorRef {
         let session_id = crate::SessionId::new();
         let (sender, receiver) = mpsc::channel(SESSION_RECEIVER_CAPACITY);
         client.sessions.register_local(session_id, sender);
+        let mut attempts = 0;
 
-        let endpoint = match client.pick_endpoint().await {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                client.sessions.unregister_local(&session_id);
-                return Err(error);
-            }
-        };
-
-        let channel = match client.ensure_channel(&endpoint).await {
-            Ok(channel) => channel,
-            Err(error) => {
-                client.sessions.unregister_local(&session_id);
-                return Err(error);
+        // 传输层有界重试：网关不可达（connect 失败/超时）→ 驱逐 + 换下一个；
+        // 放置层失败（ack 错误）不重试，原样返回。
+        let (endpoint, channel) = loop {
+            let endpoint = match client.pick_endpoint().await {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    client.sessions.unregister_local(&session_id);
+                    return Err(error);
+                }
+            };
+            match client.ensure_channel(&endpoint).await {
+                Ok(channel) => break (endpoint, channel),
+                Err(SendError::RemoteUnavailable) if attempts < MAX_OPEN_GATEWAY_RETRIES => {
+                    client.evict_endpoint(&endpoint);
+                    attempts += 1;
+                }
+                Err(error) => {
+                    client.sessions.unregister_local(&session_id);
+                    return Err(error);
+                }
             }
         };
         let (ack_tx, ack_rx) = oneshot::channel();

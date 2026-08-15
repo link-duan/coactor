@@ -58,6 +58,44 @@ impl ClusterRouter {
         }
     }
 
+    /// 只读的所有权判断（不 claim、不缓存）：本节点 / 他节点 / 未拥有或 stale。
+    pub(crate) async fn owner_only(&self, address: &ActorAddress) -> Result<OwnerStatus, SendError> {
+        let current = tokio::time::timeout(
+            self.operation_timeout,
+            self.storage.read_actor_owner(address),
+        )
+        .await
+        .map_err(|_| SendError::OwnershipUnavailable)?
+        .map_err(|_| SendError::OwnershipUnavailable)?;
+        let Some(current) = current.as_ref() else {
+            return Ok(OwnerStatus::Unowned);
+        };
+        if self.is_local_owner(&current.record) {
+            return Ok(OwnerStatus::Local);
+        }
+        let Some(owner) = &current.record.owner else {
+            return Ok(OwnerStatus::Unowned);
+        };
+        let lease = tokio::time::timeout(
+            self.operation_timeout,
+            self.storage.read_node_lease(&owner.session_id),
+        )
+        .await
+        .map_err(|_| SendError::OwnershipUnavailable)?
+        .map_err(|_| SendError::OwnershipUnavailable)?;
+        match lease {
+            Some(lease) if lease.lease.expires_at_unix_ms > wall_time_millis() => {
+                Ok(OwnerStatus::Remote {
+                    endpoint: lease.lease.advertised_address,
+                })
+            }
+            _ => {
+                // owner lease 缺失或过期：视为可放置（availability failover 语义）。
+                Ok(OwnerStatus::Unowned)
+            }
+        }
+    }
+
     pub(crate) async fn resolve(
         &self,
         address: &ActorAddress,
@@ -328,6 +366,17 @@ pub(crate) enum ResolvedOwner {
         endpoint: String,
         protocol_version: u32,
     },
+}
+
+/// 只读所有权状态（放置决策用）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerStatus {
+    Local,
+    Remote {
+        endpoint: String,
+    },
+    /// 无 owner 记录，或 owner lease 缺失/过期（可放置）。
+    Unowned,
 }
 
 #[derive(Clone)]

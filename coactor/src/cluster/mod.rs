@@ -1,5 +1,6 @@
 mod authority;
 mod node;
+mod placement;
 mod routing;
 mod s3;
 
@@ -16,5 +17,6 @@ pub(crate) use authority::{
     VersionedNodeLease, confirm_node_lease, wall_time_millis,
 };
 pub(crate) use node::{ClusterTasks, NodeAuthority, PeerTask, RenewalTask, spawn_peer};
-pub(crate) use routing::{ClusterRouter, ResolvedOwner};
+pub(crate) use placement::{PlacementStrategy, default_placement};
+pub(crate) use routing::{ClusterRouter, OwnerStatus, ResolvedOwner};
 pub(crate) use s3::S3OwnershipBackend;

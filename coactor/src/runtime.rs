@@ -7,7 +7,7 @@ use crate::cluster::{
     ClusterRouter, ClusterTasks, NodeAuthority, PeerTask, RenewalTask, spawn_peer,
 };
 use crate::{
-    __macro, transport::ClientTransport, ActorTypeConfig, ServerConfig,
+    __macro, transport::ClientTransport, ActorTypeConfig, PlacementStrategy, ServerConfig,
     ServerStarter, PEER_PROTOCOL_VERSION, ServerSupervision, ServerTermination, S3OwnershipBackend,
     StartError,
 };
@@ -20,6 +20,7 @@ pub struct ServerBuilder<S> {
     registrations: Vec<__macro::Registration<S>>,
     cluster: Option<ServerConfig>,
     client_transport: Option<Arc<dyn ClientTransport>>,
+    placement: Arc<dyn PlacementStrategy>,
     mailbox_capacity: usize,
     max_active_actors: usize,
     idle_timeout: Duration,
@@ -38,6 +39,7 @@ where
             registrations: Vec::new(),
             cluster: None,
             client_transport: None,
+            placement: crate::cluster::default_placement(),
             mailbox_capacity: 32,
             max_active_actors: 10_000,
             idle_timeout: Duration::from_secs(60),
@@ -65,6 +67,13 @@ where
     /// 出站连接的 client transport（网关转发用）；由 ServerStarter 装配。
     pub(crate) fn with_client_transport(mut self, transport: Arc<dyn ClientTransport>) -> Self {
         self.client_transport = Some(transport);
+        self
+    }
+
+    /// 注入放置策略（crate 私有接缝；默认就地认领）。算法接入前的测试入口。
+    #[cfg(test)]
+    pub(crate) fn with_placement_strategy(mut self, placement: Arc<dyn PlacementStrategy>) -> Self {
+        self.placement = placement;
         self
     }
 
@@ -201,6 +210,7 @@ where
                 inbound_tasks: Mutex::new(Vec::new()),
                 pending_opens: Mutex::new(HashMap::new()),
                 client_transport: self.client_transport,
+                placement: self.placement,
                 relays: Mutex::new(HashMap::new()),
             }),
             cluster: None,

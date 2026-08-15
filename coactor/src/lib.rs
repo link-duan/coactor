@@ -5,7 +5,8 @@ pub mod cluster;
 #[cfg(test)]
 pub(crate) use cluster::ServerRuntimeConfig;
 pub(crate) use cluster::{
-    ActorOwner, ActorOwnerRecord, AmbiguousMutation, ServerConfig, ServerStarter, LeaseMutation,
+    ActorOwner, ActorOwnerRecord, AmbiguousMutation, PlacementStrategy, ServerConfig, ServerStarter,
+    LeaseMutation,
     LeaseTiming, NodeLease, NodeSessionId, OwnershipBackend, OwnershipBackendError,
     ServerSupervision, ServerTermination, ServerTerminationReason, S3OwnershipBackend,
     S3OwnershipConfig, VersionedActorOwnerRecord, VersionedNodeLease,
@@ -47,3 +48,6 @@ mod cluster_session_tests;
 #[cfg(test)]
 #[path = "../tests/cluster_authority.rs"]
 mod cluster_authority_tests;
+#[cfg(test)]
+#[path = "../tests/placement.rs"]
+mod placement_tests;
