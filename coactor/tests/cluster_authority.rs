@@ -136,7 +136,6 @@ async fn takeover_requires_expired_or_absent_owner_lease() {
         .release_node_lease(&lease.lease.session_id, &lease.etag)
         .await
         .unwrap();
-    rb.invalidate(&address("a-3")).await;
     match rb
         .resolve(&address("a-3"), &capacity)
         .await
@@ -167,19 +166,6 @@ async fn node_authority_renews_until_deadline_and_fences() {
         elapsed += Duration::from_millis(100);
     }
     assert!(!authority.is_valid(), "authority must expire with the deadline");
-}
-
-#[tokio::test]
-async fn invalidate_endpoint_clears_resolution_cache() {
-    let storage = Arc::new(TestOwnershipBackend::default());
-    let capacity = Arc::new(Semaphore::new(8));
-    let r = router(&storage, "node-a").await;
-    let address = address("a-4");
-    // 先解析（缓存 Local/Remote 条目）
-    let _ = r.resolve(&address, &capacity).await.expect("resolve");
-    r.invalidate_endpoint("http://node-a").await;
-    // 缓存已清，再次 resolve 仍能成功（重新解析）
-    let _ = r.resolve(&address, &capacity).await.expect("re-resolve");
 }
 
 #[tokio::test]

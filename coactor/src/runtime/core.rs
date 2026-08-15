@@ -254,9 +254,6 @@ where
 
     pub(crate) async fn notify_channel_closed(&self, endpoint: &str) {
         self.channels.lock().remove(endpoint);
-        if let Some(cluster) = &self.cluster {
-            cluster.invalidate_endpoint(endpoint).await;
-        }
         // 网关：指向该端点的 relay 会话失效，通知 caller 重开。
         let stale: Vec<(SessionId, Relay)> = self
             .relays

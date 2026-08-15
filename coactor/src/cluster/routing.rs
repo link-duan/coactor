@@ -14,7 +14,6 @@ pub(crate) struct ClusterRouter {
     session_id: NodeSessionId,
     operation_timeout: Duration,
     resolutions: tokio::sync::Mutex<HashMap<ActorAddress, Arc<tokio::sync::Mutex<()>>>>,
-    resolved: tokio::sync::Mutex<HashMap<ActorAddress, CachedOwner>>,
 }
 
 impl ClusterRouter {
@@ -30,7 +29,6 @@ impl ClusterRouter {
             session_id,
             operation_timeout,
             resolutions: tokio::sync::Mutex::new(HashMap::new()),
-            resolved: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -103,24 +101,6 @@ impl ClusterRouter {
     ) -> Result<ResolvedOwner, SendError> {
         let lock = self.resolution_lock(address).await;
         let guard = lock.lock_owned().await;
-        if let Some(cached) = self.resolved.lock().await.get(address).cloned() {
-            return Ok(match cached {
-                CachedOwner::Local => ResolvedOwner::Local {
-                    reservation: None,
-                    guard,
-                },
-                CachedOwner::Remote {
-                    endpoint,
-                    protocol_version,
-                } => ResolvedOwner::Remote {
-                    endpoint,
-                    protocol_version,
-                },
-                CachedOwner::ReleasePending => {
-                    return Err(SendError::OwnershipUnavailable);
-                }
-            });
-        }
         for _ in 0..3 {
             let current = tokio::time::timeout(
                 self.operation_timeout,
@@ -131,10 +111,6 @@ impl ClusterRouter {
             .map_err(|_| SendError::OwnershipUnavailable)?;
             if let Some(current) = current.as_ref() {
                 if self.is_local_owner(&current.record) {
-                    self.resolved
-                        .lock()
-                        .await
-                        .insert(address.clone(), CachedOwner::Local);
                     return Ok(ResolvedOwner::Local {
                         reservation: None,
                         guard,
@@ -152,13 +128,6 @@ impl ClusterRouter {
                         if lease.lease.expires_at_unix_ms > wall_time_millis() {
                             let endpoint = lease.lease.advertised_address.clone();
                             let protocol_version = lease.lease.protocol_version;
-                            self.resolved.lock().await.insert(
-                                address.clone(),
-                                CachedOwner::Remote {
-                                    endpoint: endpoint.clone(),
-                                    protocol_version,
-                                },
-                            );
                             return Ok(ResolvedOwner::Remote {
                                 endpoint,
                                 protocol_version,
@@ -194,10 +163,6 @@ impl ClusterRouter {
             .map_err(|_| SendError::OwnershipUnavailable)?;
             match mutation {
                 LeaseMutation::Applied { .. } => {
-                    self.resolved
-                        .lock()
-                        .await
-                        .insert(address.clone(), CachedOwner::Local);
                     return Ok(ResolvedOwner::Local {
                         reservation: Some(reservation),
                         guard,
@@ -217,10 +182,6 @@ impl ClusterRouter {
                         .await;
                         if let Ok(Ok(Some(confirmed))) = confirmed {
                             if confirmed.record == expected {
-                                self.resolved
-                                    .lock()
-                                    .await
-                                    .insert(address.clone(), CachedOwner::Local);
                                 return Ok(ResolvedOwner::Local {
                                     reservation: Some(reservation),
                                     guard,
@@ -242,30 +203,12 @@ impl ClusterRouter {
         Err(SendError::OwnershipUnavailable)
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn invalidate(&self, address: &ActorAddress) {
-        self.resolved.lock().await.remove(address);
-    }
-
-    /// 到某 Node 的连接断开时，失效所有指向该 Node 的解析缓存（failover 惰性检测依赖）。
-    pub(crate) async fn invalidate_endpoint(&self, endpoint: &str) {
-        let mut resolved = self.resolved.lock().await;
-        resolved.retain(|_, owner| match owner {
-            CachedOwner::Remote { endpoint: cached, .. } => cached != endpoint,
-            _ => true,
-        });
-    }
-
     pub(crate) async fn release_local_owner(
         &self,
         address: &ActorAddress,
     ) -> Result<(), SendError> {
         let lock = self.resolution_lock(address).await;
         let _guard = lock.lock_owned().await;
-        self.resolved
-            .lock()
-            .await
-            .insert(address.clone(), CachedOwner::ReleasePending);
         let current = tokio::time::timeout(
             self.operation_timeout,
             self.storage.read_actor_owner(address),
@@ -311,7 +254,6 @@ impl ClusterRouter {
         if !confirmed {
             return Err(SendError::OwnershipUnavailable);
         }
-        self.resolved.lock().await.remove(address);
         Ok(())
     }
 
@@ -377,15 +319,4 @@ pub(crate) enum OwnerStatus {
     },
     /// 无 owner 记录，或 owner lease 缺失/过期（可放置）。
     Unowned,
-}
-
-#[derive(Clone)]
-enum CachedOwner {
-    Local,
-    ReleasePending,
-    #[allow(dead_code)]
-    Remote {
-        endpoint: String,
-        protocol_version: u32,
-    },
 }
