@@ -17,7 +17,7 @@ use super::route::{Route, RouteState, try_send};
 use super::session::{EventSink, SessionId, SessionRegistry};
 use crate::cluster::{ClusterRouter, NodeAuthority, OwnerStatus, PlacementCtx, ResolvedOwner};
 use crate::transport::{ClientTransport, Endpoint, PeerSender};
-use crate::{ActorAddress, ActorId, SendError};
+use crate::{ActorAddress, SendError};
 
 pub(crate) const RUNNING: u8 = 0;
 pub(crate) const SHUTTING_DOWN: u8 = 1;
@@ -347,7 +347,10 @@ where
         let Some(session_id) = SessionId::from_bytes(&envelope.session_id) else {
             return;
         };
-        let address = ActorAddress::new(envelope.actor_type, ActorId::new(envelope.actor_id));
+        let Some(address) = actor_address_from_envelope(envelope.actor_type, envelope.actor_id)
+        else {
+            return;
+        };
         let version_ok = envelope.protocol_version == self.peer_protocol_version;
         match kind {
             Kind::Action(action) => {
@@ -540,6 +543,57 @@ where
         Ok(Err(SendError::RuntimeAtCapacity))
     }
 
+    async fn place_session_after_owner_rejection(
+        self: &Arc<Self>,
+        address: &ActorAddress,
+        session_id: SessionId,
+        rejected: &Endpoint,
+        client: Arc<dyn PeerSender>,
+    ) -> Result<Result<(), SendError>, SendError> {
+        let Some(cluster) = &self.cluster else {
+            return Ok(Err(SendError::RuntimeAtCapacity));
+        };
+        let ctx = PlacementCtx {
+            candidates: cluster
+                .placement_candidates(self.peer_protocol_version)
+                .await?,
+        };
+        for candidate in self.placement.candidates(address, &ctx).await {
+            if candidate == *rejected {
+                continue;
+            }
+            match self
+                .forward_session_open(address, session_id, &candidate, client.clone())
+                .await
+            {
+                Ok(Ok(())) => return Ok(Ok(())),
+                Ok(Err(SendError::ActorTypeNotRegistered(_))) => {
+                    return Ok(Err(SendError::ActorTypeNotRegistered(String::new())));
+                }
+                Ok(Err(_)) | Err(_) => {
+                    self.placement.on_placement_failed(&candidate);
+                }
+            }
+        }
+        match cluster.resolve(address, &self.capacity).await {
+            Ok(ResolvedOwner::Local { reservation, guard }) => {
+                self.open_local_session(
+                    address,
+                    session_id,
+                    EventSink::Remote { sender: client },
+                    reservation,
+                    Some(guard),
+                )
+                .await
+            }
+            Ok(ResolvedOwner::Remote { endpoint, .. }) => {
+                self.forward_session_open(address, session_id, &Endpoint::new(endpoint), client)
+                    .await
+            }
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
     /// 转发 SessionOpen 给 owner；收到 NotOwner（所有权在读取与转发之间翻转）→
     /// 重解析真 owner 再转发一次（有界），仍失败则返回错误。
     async fn forward_to_owner_or_actual(
@@ -558,6 +612,14 @@ where
         let Some(cluster) = &self.cluster else {
             return Ok(Err(SendError::RuntimeAtCapacity));
         };
+        if cluster
+            .clear_owner_for_fallback(address, endpoint.as_str())
+            .await?
+        {
+            return self
+                .place_session_after_owner_rejection(address, session_id, endpoint, client)
+                .await;
+        }
         match cluster.owner_only(address).await {
             Ok(OwnerStatus::Remote { endpoint }) => {
                 self.forward_session_open(address, session_id, &Endpoint::new(endpoint), client)
@@ -668,7 +730,10 @@ where
         let Some(session_id) = SessionId::from_bytes(&envelope.session_id) else {
             return;
         };
-        let address = ActorAddress::new(envelope.actor_type, ActorId::new(envelope.actor_id));
+        let Some(address) = actor_address_from_envelope(envelope.actor_type, envelope.actor_id)
+        else {
+            return;
+        };
         let version_ok = envelope.protocol_version == self.peer_protocol_version;
         match kind {
             Kind::Action(action) => {
@@ -884,6 +949,14 @@ where
             runtime: Arc::downgrade(self),
         }
     }
+}
+
+fn actor_address_from_envelope(actor_type: String, actor_id: Vec<u8>) -> Option<ActorAddress> {
+    if actor_type.is_empty() && actor_id.is_empty() {
+        return ActorAddress::new("protocol", "message").ok();
+    }
+    let actor_id = String::from_utf8(actor_id).ok()?;
+    ActorAddress::new(actor_type, actor_id).ok()
 }
 
 fn envelope_session_open(

@@ -1,168 +1,103 @@
-# Quick Start
+# Quick start
 
-Production cluster mode runs `Server` and `Client` as separate processes backed by the same S3 Coordination Store. Server hosts Actors and acts as a Gateway; Client reads the Node Directory and opens Sessions through a live Gateway.
-
-## Add dependencies
-
-```toml
-[dependencies]
-coactor = { git = "https://github.com/link-duan/coactor.git" }
-aws-credential-types = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-```
-
-## Define an Actor
+## 定义 Actor
 
 ```rust
-use coactor::{Actor, ActorRuntime, MessageContext, actor};
-
-#[derive(Clone)]
-struct AppState;
+use coactor::{actor, Actor, ActorRuntime, MessageContext};
 
 #[actor]
-struct CounterActor {
-    _runtime: ActorRuntime<AppState>,
-    value: i64,
-}
+struct Counter { count: u64 }
 
-impl Actor<AppState> for CounterActor {
-    fn new(runtime: ActorRuntime<AppState>) -> Self {
-        Self {
-            _runtime: runtime,
-            value: 0,
-        }
-    }
+impl Actor<()> for Counter {
+    fn new(_: ActorRuntime<()>) -> Self { Self { count: 0 } }
 
-    async fn on_message(&mut self, ctx: &MessageContext, msg: &[u8]) {
-        let amount = i64::from_be_bytes(msg.try_into().expect("8-byte Action"));
-        self.value += amount;
-        let _ = ctx.send(self.value.to_be_bytes().to_vec()).await;
+    async fn on_message(&mut self, ctx: &MessageContext, _: &[u8]) {
+        self.count += 1;
+        ctx.send(self.count.to_string().into_bytes()).await.unwrap();
     }
 }
 ```
 
-The Actor Type name is supplied when Server registers the Actor. It is not derived from the Rust type name.
+不需要共享依赖时，State 默认为 `()`。需要数据库 Client、HTTP Client 或配置时，使用 `.with_state(app_state)`；它可以位于 `.actor(...)` 前或后。Actor 通过 `runtime.state()` 获得 `&S`。
 
-## Start a Server
+## 测试
 
 ```rust
-use std::time::Duration;
+use coactor::{ActorAddress, test_support::TestServer};
 
-use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
-use coactor::{CoordinationConfig, ServerBuilder};
-use coactor::cluster::{S3CoordinationConfig, ServerConfig};
-
-#[tokio::main]
-async fn main() {
-    let coordination = S3CoordinationConfig {
-        bucket: "my-coactor".to_owned(),
-        prefix: "production".to_owned(),
-        region: "us-east-1".to_owned(),
-        endpoint_url: None,
-        credentials_provider: SharedCredentialsProvider::new(Credentials::new(
-            "server-access-key",
-            "server-secret-key",
-            None,
-            None,
-            "quick-start",
-        )),
-        request_timeout: Duration::from_secs(5),
-    };
-
-    let server = ServerBuilder::cluster(
-        AppState,
-        ServerConfig::new(
-            "node-a",
-            "0.0.0.0:7000".parse().unwrap(),
-            "10.0.0.12:7000".parse().unwrap(),
-            CoordinationConfig::S3(coordination),
-        ),
-    )
-    .register::<CounterActor>("counter")
+let server = TestServer::builder()
+    .actor::<Counter>("counter")
     .start()
-    .await
-    .unwrap();
+    .await?;
 
-    tokio::signal::ctrl_c().await.unwrap();
-    server.shutdown().await;
-}
+let address = ActorAddress::new("counter", "counter-7")?;
+let mut session = server.client().open(&address).await?;
+session.send(b"increment".to_vec()).await?;
+let event = session.recv().await.unwrap()?;
+
+server.shutdown().await;
 ```
 
-- `0.0.0.0:7000` is the local bind address.
-- `10.0.0.12:7000` is the advertised address published in the Node Directory and must be reachable by other processes.
-- Server credentials need read/write access to Node Leases and Actor Owner Records.
+Actor Type 和 Actor ID 都使用 Kubernetes DNS-label 语法：1–63 个小写字母、数字或内部连字符，且首尾必须是字母或数字。
 
-## Start a Client
+## 生产 Server
 
-Client uses the same bucket and prefix, but should use separate read-only credentials.
+生产 Server 接收具体的 Coordination Store，而不是 backend 配置 enum。内置 S3 Store 接收已配置好的 AWS SDK S3 Client：
 
 ```rust
-use std::time::Duration;
+use coactor::{Server, coordination::backend::s3::S3CoordinationStore};
 
-use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
-use coactor::{
-    ActorId, ClientBuilder, ClientConfig, CoordinationConfig,
-    cluster::S3CoordinationConfig,
-};
+let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+let store = S3CoordinationStore::new(
+    aws_sdk_s3::Client::new(&sdk),
+    "my-bucket",
+    "coactor/prod",
+)?;
 
-#[tokio::main]
-async fn main() {
-    let coordination = S3CoordinationConfig {
-        bucket: "my-coactor".to_owned(),
-        prefix: "production".to_owned(),
-        region: "us-east-1".to_owned(),
-        endpoint_url: None,
-        credentials_provider: SharedCredentialsProvider::new(Credentials::new(
-            "client-readonly-access-key",
-            "client-readonly-secret-key",
-            None,
-            None,
-            "quick-start",
-        )),
-        request_timeout: Duration::from_secs(5),
-    };
-
-    let client = ClientBuilder::new(ClientConfig {
-        coordination: CoordinationConfig::S3(coordination),
-    })
-    .start();
-
-    let mut session = client
-        .actor("counter", ActorId::from("counter-7"))
-        .open()
-        .await
-        .unwrap();
-
-    session.send(3i64.to_be_bytes().to_vec()).await.unwrap();
-    let event = session.recv().await.unwrap().unwrap();
-    println!("value = {}", i64::from_be_bytes(event.try_into().unwrap()));
-
-    client.shutdown().await;
-}
+let server = Server::builder(store)
+    .bind("0.0.0.0:7000".parse()?)
+    .advertised_endpoint("actor-0.actor-headless.default.svc:7000")
+    .node_id("actor-0") // 可选；省略时使用 canonical advertised endpoint
+    .actor::<Counter>("counter")
+    .start()
+    .await?;
 ```
 
-Client does not need a DNS name or static Gateway endpoint list. It builds its Gateway Pool from live Node Sessions in the Node Directory.
+- `bind` 是本进程监听的 `SocketAddr`。
+- `advertised_endpoint` 是其他节点连接到该 Server 的 canonical `host:port`，不包含 `http://`、路径或 TLS 信息；支持 DNS、IPv4 与 bracketed IPv6。
+- `node_id` 是跨进程重启稳定的逻辑节点身份。显式值必须是 Kubernetes DNS label；简单部署可省略并使用 advertised endpoint。
+- 每次 `start` 都生成新的 Node Session ID，用于区分占用同一 Node ID 的不同进程 incarnation。
 
-The credentials above are intentionally simple placeholders. Production deployments should inject short-lived IAM credentials or another appropriate credential provider rather than embedding secrets in source code.
+## Client
 
-## Complete executable
+```rust
+use coactor::{ActorAddress, Client, coordination::backend::s3::S3CoordinationStore};
 
-A complete compile-checked example that reads deployment values from environment variables is available at:
+let directory = S3CoordinationStore::new(
+    aws_sdk_s3::Client::new(&sdk),
+    "my-bucket",
+    "coactor/prod",
+)?;
+let client = Client::builder(directory).build()?;
 
-- [`coactor/examples/cluster_counter.rs`](../coactor/examples/cluster_counter.rs)
+let address = ActorAddress::new("counter", "counter-7")?;
+let mut session = client.open(&address).await?;
+session.send(b"increment".to_vec()).await?;
 
-Run it as separate Server and Client processes:
-
-```console
-cargo run -p coactor --example cluster_counter -- server
-cargo run -p coactor --example cluster_counter -- client
+client.shutdown().await;
 ```
 
-## Runtime semantics to account for
+`Client::builder(...).build()` 是同步操作，不访问 Node Directory。打开 Session 时才请求目录快照；S3 Store 自己负责 refresh interval、缓存、singleflight 与 jitter。
 
-- Action and Event payloads are bytes; the consumer owns encoding and schema compatibility.
-- Events are not durable and do not prove state persistence.
-- A live Session blocks passivation.
-- Owner or Gateway failure breaks the Session; caller must use `open()` again.
-- Availability Failover starts the Actor from empty CoActor state; current cluster mode does not provide Recovery.
-- Always await Server and Client shutdown.
+完整可执行版本见 [`coactor/examples/cluster_counter.rs`](../coactor/examples/cluster_counter.rs)。
+
+## S3 运维
+
+S3 object key 可直接阅读：
+
+```text
+<prefix>/nodes/<node-id>/lease.json
+<prefix>/actors/<actor-type>/<actor-id>/ownership.json
+```
+
+优雅 shutdown 使用当前 storage revision 条件删除 Node Lease，旧进程不能删除 replacement Session 的租约。crash 残留在 lease 过期后不再有效；部署应配置 S3 Lifecycle 清理过期 Node object。启用 Versioning 的 bucket 还应配置 noncurrent-version expiration，避免旧 Node Lease 版本长期累积。

@@ -1,6 +1,6 @@
 use std::{fmt, future::Future, pin::Pin, sync::Arc, sync::Weak};
 
-use crate::{ActorAddress, ActorId, DeactivationReason};
+use crate::{ActorAddress, DeactivationReason};
 
 use super::core::ServerInner;
 use super::session::SessionHandle;
@@ -35,7 +35,7 @@ impl<S> fmt::Debug for ActorRuntime<S> {
 }
 
 impl<S: Send + Sync + 'static> ActorRuntime<S> {
-    pub fn actor_id(&self) -> &ActorId {
+    pub fn actor_id(&self) -> &str {
         self.address.actor_id()
     }
 
@@ -43,7 +43,7 @@ impl<S: Send + Sync + 'static> ActorRuntime<S> {
         &self.address
     }
 
-    pub fn app_state(&self) -> &Arc<S> {
+    pub fn state(&self) -> &S {
         &self.state
     }
 
@@ -63,7 +63,7 @@ pub struct MessageContext {
 }
 
 impl MessageContext {
-    pub fn actor_id(&self) -> &ActorId {
+    pub fn actor_id(&self) -> &str {
         self.address.actor_id()
     }
 

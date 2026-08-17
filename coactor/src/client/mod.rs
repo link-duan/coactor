@@ -1,14 +1,11 @@
-//! caller 侧 runtime：只调用不宿主（ADR-0008、ADR-0010）。
-//!
-//! `Client` 从 Coordination Store 的 Node Directory 获取 live Server 节点，维护
-//! Gateway Pool 并按会话 round-robin 分配网关；会话经网关中继到 Owner。
+//! Caller runtime: opens Sessions through a read-only Node Directory.
 
 pub(crate) mod session;
 
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicU8, Ordering},
     },
     time::Duration,
@@ -22,74 +19,57 @@ use crate::peer_protocol::{Envelope, envelope, session_opened_ack};
 use crate::transport::grpc::GrpcTransport;
 use crate::transport::{ClientTransport, Endpoint, PeerSender};
 use crate::{
-    ActorAddress, ActorId, CoordinationConfig, LeaseTiming, NodeDirectory, PEER_PROTOCOL_VERSION,
-    SendError,
+    ActorAddress, ClientBuildError, NodeDirectory, OpenError, PEER_PROTOCOL_VERSION, SendError,
 };
 
 pub(crate) const SESSION_RECEIVER_CAPACITY: usize = 64;
-const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
-/// open() 传输层重试次数（共 pick 次数 = retries + 1）。
+const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_OPEN_GATEWAY_RETRIES: usize = 1;
-const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub(crate) const RUNNING: u8 = 0;
 pub(crate) const STOPPED: u8 = 1;
 
-/// 公开 Client 配置：Coordination Store 提供只读 Node Directory。
-#[derive(Clone)]
-pub struct ClientConfig {
-    pub coordination: CoordinationConfig,
-}
-
-pub struct ClientBuilder {
+pub struct ClientBuilder<D> {
     transport: Arc<dyn ClientTransport>,
-    directory: Arc<dyn NodeDirectory>,
-    refresh_interval: Duration,
+    directory: D,
+    open_timeout: Duration,
+    peer_connect_timeout: Duration,
 }
 
-impl ClientBuilder {
-    /// 公开构造：gRPC transport + Coordination Store Node Directory。
-    pub fn new(config: ClientConfig) -> Self {
-        let stores = config.coordination.build();
-        Self {
-            transport: Arc::new(GrpcTransport::new(PEER_CONNECT_TIMEOUT)),
-            directory: stores.directory,
-            refresh_interval: LeaseTiming::default().renewal_interval,
-        }
-    }
-
-    /// crate 内部：注入 transport 与 Node Directory（inmem 测试路径）。
-    pub(crate) fn with_transport(
-        transport: Arc<dyn ClientTransport>,
-        directory: Arc<dyn NodeDirectory>,
-    ) -> Self {
-        Self {
-            transport,
+impl Client {
+    pub fn builder<D: NodeDirectory>(directory: D) -> ClientBuilder<D> {
+        ClientBuilder {
+            transport: Arc::new(GrpcTransport::new(DEFAULT_PEER_CONNECT_TIMEOUT)),
             directory,
-            refresh_interval: LeaseTiming::default().renewal_interval,
+            open_timeout: DEFAULT_OPEN_TIMEOUT,
+            peer_connect_timeout: DEFAULT_PEER_CONNECT_TIMEOUT,
         }
     }
+}
 
-    pub fn directory_refresh_interval(mut self, interval: Duration) -> Self {
-        self.refresh_interval = interval;
+impl<D: NodeDirectory> ClientBuilder<D> {
+    pub fn open_timeout(mut self, timeout: Duration) -> Self {
+        self.open_timeout = timeout;
         self
     }
-
-    pub fn start(self) -> Client {
-        Client {
-            inner: Arc::new(ClientInner {
-                transport: self.transport,
-                directory: self.directory,
-                refresh_interval: self.refresh_interval,
-                refresh_lock: AsyncMutex::new(()),
-                pool: Mutex::new(Pool::default()),
-                sessions: session::CallerRegistry::new(),
-                channels: Mutex::new(HashMap::new()),
-                pending_opens: Mutex::new(HashMap::new()),
-                inbound_tasks: Mutex::new(Vec::new()),
-                status: AtomicU8::new(RUNNING),
-            }),
+    pub fn peer_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.peer_connect_timeout = timeout;
+        self.transport = Arc::new(GrpcTransport::new(timeout));
+        self
+    }
+    pub fn build(self) -> Result<Client, ClientBuildError> {
+        if self.open_timeout.is_zero() {
+            return Err(ClientBuildError::InvalidOpenTimeout);
         }
+        if self.peer_connect_timeout.is_zero() {
+            return Err(ClientBuildError::InvalidPeerConnectTimeout);
+        }
+        Ok(Client::from_parts(
+            self.transport,
+            Arc::new(self.directory),
+            self.open_timeout,
+        ))
     }
 }
 
@@ -97,7 +77,6 @@ pub struct Client {
     pub(crate) inner: Arc<ClientInner>,
 }
 
-/// Gateway Pool：最新 Node Directory 结果 + round-robin 游标。
 #[derive(Default)]
 pub(crate) struct Pool {
     endpoints: Vec<Endpoint>,
@@ -108,13 +87,12 @@ pub(crate) struct Pool {
 pub(crate) struct ClientInner {
     pub(crate) transport: Arc<dyn ClientTransport>,
     pub(crate) directory: Arc<dyn NodeDirectory>,
+    pub(crate) open_timeout: Duration,
     pub(crate) refresh_interval: Duration,
     pub(crate) refresh_lock: AsyncMutex<()>,
     pub(crate) pool: Mutex<Pool>,
     pub(crate) sessions: Arc<session::CallerRegistry>,
-    /// 到各网关节点的 bidi stream 发送端（node-pair 复用）。
     pub(crate) channels: Mutex<HashMap<String, Arc<dyn PeerSender>>>,
-    /// 远程 SessionOpen 的 ack 等待表。
     pub(crate) pending_opens:
         Mutex<HashMap<crate::SessionId, oneshot::Sender<Result<(), SendError>>>>,
     pub(crate) inbound_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
@@ -122,62 +100,50 @@ pub(crate) struct ClientInner {
 }
 
 impl Client {
-    /// 按 Actor Type 名字 + Actor ID 获取通用地址句柄（纯字符串 API）。
-    pub fn actor(&self, actor_type: &str, actor_id: ActorId) -> ActorRef {
-        ActorRef {
-            client: Arc::downgrade(&self.inner),
-            address: ActorAddress::new(actor_type, actor_id),
-        }
-    }
-
-    pub async fn shutdown(&self) {
-        self.inner.status.store(STOPPED, Ordering::Release);
-        for handle in self.inner.inbound_tasks.lock().drain(..) {
-            handle.abort();
-        }
-        self.inner.channels.lock().clear();
-        self.inner.pending_opens.lock().clear();
-        self.inner.pool.lock().endpoints.clear();
-        self.inner.sessions.terminate_all(SendError::RuntimeStopped);
-    }
-}
-
-/// 通用稳定地址句柄（非泛型）。
-pub struct ActorRef {
-    pub(crate) client: Weak<ClientInner>,
-    pub(crate) address: ActorAddress,
-}
-
-impl Clone for ActorRef {
-    fn clone(&self) -> Self {
+    pub(crate) fn from_parts(
+        transport: Arc<dyn ClientTransport>,
+        directory: Arc<dyn NodeDirectory>,
+        open_timeout: Duration,
+    ) -> Self {
         Self {
-            client: self.client.clone(),
-            address: self.address.clone(),
+            inner: Arc::new(ClientInner {
+                transport,
+                directory,
+                open_timeout,
+                refresh_interval: Duration::ZERO,
+                refresh_lock: AsyncMutex::new(()),
+                pool: Mutex::new(Pool::default()),
+                sessions: session::CallerRegistry::new(),
+                channels: Mutex::new(HashMap::new()),
+                pending_opens: Mutex::new(HashMap::new()),
+                inbound_tasks: Mutex::new(Vec::new()),
+                status: AtomicU8::new(RUNNING),
+            }),
         }
     }
-}
 
-impl ActorRef {
-    /// 建立与 Actor 的持久 Session：池中选网关 → 经 transport 发 SessionOpen →
-    /// 等 ack → 返回。失败时清理本地注册。
-    pub async fn open(&self) -> Result<Session, SendError> {
-        let client = self.client.upgrade().ok_or(SendError::RuntimeStopped)?;
+    pub(crate) fn with_transport(
+        transport: Arc<dyn ClientTransport>,
+        directory: Arc<dyn NodeDirectory>,
+    ) -> Self {
+        Self::from_parts(transport, directory, DEFAULT_OPEN_TIMEOUT)
+    }
+
+    pub async fn open(&self, address: &ActorAddress) -> Result<Session, OpenError> {
+        let client = self.inner.clone();
         if client.status.load(Ordering::Acquire) != RUNNING {
-            return Err(SendError::RuntimeStopped);
+            return Err(OpenError::RuntimeStopped);
         }
         let session_id = crate::SessionId::new();
         let (sender, receiver) = mpsc::channel(SESSION_RECEIVER_CAPACITY);
         client.sessions.register_local(session_id, sender);
         let mut attempts = 0;
-
-        // 传输层有界重试：网关不可达（connect 失败/超时）→ 驱逐 + 换下一个；
-        // 放置层失败（ack 错误）不重试，原样返回。
         let (endpoint, channel) = loop {
             let endpoint = match client.pick_endpoint().await {
                 Ok(endpoint) => endpoint,
                 Err(error) => {
                     client.sessions.unregister_local(&session_id);
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
             match client.ensure_channel(&endpoint).await {
@@ -188,31 +154,30 @@ impl ActorRef {
                 }
                 Err(error) => {
                     client.sessions.unregister_local(&session_id);
-                    return Err(error);
+                    return Err(error.into());
                 }
             }
         };
         let (ack_tx, ack_rx) = oneshot::channel();
         client.pending_opens.lock().insert(session_id, ack_tx);
-        let envelope = envelope_session_open(&self.address, session_id, PEER_PROTOCOL_VERSION);
+        let envelope = envelope_session_open(address, session_id, PEER_PROTOCOL_VERSION);
         if channel.try_send(envelope).is_err() {
             client.pending_opens.lock().remove(&session_id);
             client.sessions.unregister_local(&session_id);
-            return Err(SendError::RemoteUnavailable);
+            return Err(OpenError::RemoteUnavailable);
         }
-        let outcome = tokio::time::timeout(OPEN_TIMEOUT, ack_rx)
+        let outcome = tokio::time::timeout(client.open_timeout, ack_rx)
             .await
-            .map_err(|_| SendError::RemoteUnavailable)?
-            .map_err(|_| SendError::RemoteUnavailable)?;
+            .map_err(|_| OpenError::RemoteUnavailable)?
+            .map_err(|_| OpenError::RemoteUnavailable)?;
         if let Err(error) = outcome {
             client.pending_opens.lock().remove(&session_id);
             client.sessions.unregister_local(&session_id);
-            return Err(error);
+            return Err(error.into());
         }
-
         Ok(Session {
             client: Arc::downgrade(&client),
-            address: self.address.clone(),
+            address: address.clone(),
             session_id,
             receiver,
             registry: client.sessions.clone(),
@@ -220,8 +185,15 @@ impl ActorRef {
         })
     }
 
-    pub fn actor_address(&self) -> &ActorAddress {
-        &self.address
+    pub async fn shutdown(self) {
+        self.inner.status.store(STOPPED, Ordering::Release);
+        for handle in self.inner.inbound_tasks.lock().drain(..) {
+            handle.abort();
+        }
+        self.inner.channels.lock().clear();
+        self.inner.pending_opens.lock().clear();
+        self.inner.pool.lock().endpoints.clear();
+        self.inner.sessions.terminate_all(SendError::RuntimeStopped);
     }
 }
 
@@ -272,9 +244,9 @@ impl ClientInner {
             .filter(|node| {
                 node.protocol_version == PEER_PROTOCOL_VERSION
                     && !node.draining
-                    && !node.advertised_address.trim().is_empty()
+                    && !node.advertised_endpoint.trim().is_empty()
             })
-            .map(|node| Endpoint::new(node.advertised_address))
+            .map(|node| Endpoint::new(node.advertised_endpoint))
             .collect();
         endpoints.sort();
         endpoints.dedup();

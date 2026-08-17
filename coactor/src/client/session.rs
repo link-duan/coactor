@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{Arc, Weak, atomic::Ordering},
 };
 
 use parking_lot::Mutex;
@@ -64,6 +64,9 @@ impl Session {
     /// server 侧拒绝（如 MailboxFull）经 SessionError 异步通知。
     pub async fn send(&self, msg: Vec<u8>) -> Result<(), SendError> {
         let client = self.client.upgrade().ok_or(SendError::RuntimeStopped)?;
+        if client.status.load(Ordering::Acquire) != super::RUNNING {
+            return Err(SendError::RuntimeStopped);
+        }
         let endpoint = self
             .owner_endpoint
             .clone()

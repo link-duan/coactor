@@ -1,20 +1,32 @@
 extern crate self as coactor;
 
-pub mod cluster;
+mod cluster;
+
+pub mod coordination {
+    pub use crate::cluster::{
+        ActorOwner, ActorOwnerRecord, ActorOwnerStore, CoordinationError, CoordinationErrorKind,
+        CoordinationStore, MutationOutcome, NodeDirectory, NodeLeaseStore, NodeRecord,
+        NodeSessionId, Revision, VersionedActorOwnerRecord,
+    };
+
+    pub mod backend {
+        pub mod s3 {
+            pub use crate::cluster::s3::{S3CoordinationStore, S3StoreConfigError};
+        }
+    }
+}
 
 #[cfg(test)]
-pub(crate) use cluster::PlacementCtx;
-#[cfg(test)]
-pub(crate) use cluster::S3CoordinationStore;
-#[cfg(test)]
-pub(crate) use cluster::ServerRuntimeConfig;
+pub(crate) use cluster::s3::S3CoordinationStore;
 pub(crate) use cluster::{
-    ActorOwner, ActorOwnerRecord, ActorOwnerStore, AmbiguousMutation, CoordinationError,
-    CoordinationStores, LeaseMutation, LeaseTiming, LeaseToken, Mutation, NodeDirectory,
-    NodeLeaseStore, NodeRecord, NodeSessionId, PlacementStrategy, Revision, ServerConfig,
-    ServerStarter, ServerSupervision, ServerTermination, ServerTerminationReason,
+    ActorOwner, ActorOwnerRecord, ActorOwnerStore, CoordinationError, MutationOutcome,
+    NodeDirectory, NodeLeaseStore, NodeRecord, NodeSessionId, PlacementStrategy, Revision,
     VersionedActorOwnerRecord,
 };
+#[cfg(test)]
+pub(crate) use cluster::{CoordinationStores, ServerRuntimeConfig, ServerStarter};
+#[cfg(test)]
+pub(crate) use runtime::ServerBuilderCore;
 
 pub use coactor_macros::actor;
 
@@ -36,12 +48,10 @@ pub mod test_support;
 
 pub use actor::*;
 pub use client::session::Session;
-pub use client::{ActorRef, Client, ClientBuilder, ClientConfig};
-pub use cluster::{CoordinationConfig, S3CoordinationConfig};
-pub use runtime::actor::{Actor, ActorRuntime, BoxFuture, MessageContext};
+pub use client::{Client, ClientBuilder};
+pub use runtime::actor::{Actor, ActorRuntime, MessageContext};
 pub use runtime::session::{SessionHandle, SessionId};
 pub use runtime::{Server, ServerBuilder};
-pub use transport::Endpoint;
 
 #[cfg(test)]
 #[path = "../tests/cluster_authority.rs"]

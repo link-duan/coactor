@@ -1,64 +1,42 @@
-# CoActor design brief
+# Design brief
 
-## Problem
+CoActor 为业务 key 提供按需运行的 Actor 执行边界。`ActorAddress` 是由经过 Kubernetes DNS-label 校验的 Actor Type 与 Actor ID 组成的稳定纯值。Caller 使用 `Client::open(&ActorAddress)` 建立 Session；Server 按需创建 Active Actor，Actor 通过 Action 接收入站字节，并通过 Event 输出字节。
 
-CoActor is an embedded Rust runtime for stateful workloads addressed by stable business identity. Game rooms and collaborative documents are validation scenarios, while the shared runtime owns Actor identity, serial execution, lifecycle, Session semantics, routing, ownership and fencing.
+## Runtime 边界
 
-The current runtime deliberately separates availability from durability. It can move service to a new Owner after failure, but the new Active Actor starts from empty CoActor-managed state.
+- `Server::builder(coordination_store)` 接收具体 `CoordinationStore`，只宿主 Actor、参与 placement 与写入 ownership/Node Lease。
+- `Client::builder(node_directory).build()` 只接收 `NodeDirectory`，不能取得 Node Lease 或 Actor Owner 写能力。
+- `TestServer::builder()` 提供内存 transport 测试环境，不模拟生产 local mode。
+- App State 默认为 `()`；`.with_state(state)` 可位于 Actor 注册之前或之后。Actor 只看到 `ActorRuntime::state() -> &S`。
+- `.actor::<A>("name")` 使用默认策略；`ActorConfig` 提供单个 Actor Type 的 mailbox 与 idle override。
+- `Server`、`Client` 与 `TestServer` 都是非 Clone lifecycle owner，shutdown 消费 handle。
 
-## Current architecture
+## Coordination
+
+公开扩展边界位于 `coactor::coordination`：
+
+- `NodeDirectory`：只读 live Node snapshot；
+- `NodeLeaseStore`：Node Lease 条件创建、续租与删除；
+- `ActorOwnerStore`：Actor Owner CAS；
+- `CoordinationStore`：组合以上三项 capability。
+
+Mutation outcome 区分 `Applied`、`Conflict` 与携带后端错误的 `Indeterminate`。普通 Coordination failure 暴露稳定的 `Unavailable`、`PermissionDenied`、`InvalidData` kind，同时保留标准 error source chain。
+
+内置 S3 backend 位于 `coactor::coordination::backend::s3`，由 AWS SDK S3 Client、bucket 与 canonical prefix 构造。凭证、region、endpoint、retry、HTTP 与 timeout 均由调用方通过 AWS SDK 配置。
+
+## Node identity
+
+Node ID 是跨重启稳定的逻辑 slot；Node Session ID 是每次 Server start 生成的进程 incarnation。Node Directory 与 Node Lease 按 Node ID 查询，lease body 保存 Session ID 与递增 generation。Actor Owner 同时保存 Node ID、Session ID 与 Ownership Epoch，任何 Session 切换都必须 CAS 并提高 epoch。
+
+S3 key 使用可读结构：
 
 ```text
-consumer application
-    │ Client.actor("room", id).open() → Session      │ Server 侧：Actor 宿主
-    ▼                                                ▼
-Client (调用方)                                Server (宿主 + 网关)
-    ├── Node Directory → Gateway Pool → 会话经网关中继  ├── registry, mailbox, lifecycle
-    └── transport seam (connect 半部)                  └── 网关放置/转发 + ownership
-        │                                              ├── transport seam (accept 半部)
-        └──────── 双向 Envelope 流（gRPC / inmem）───────┘
-                         Coordination Store
-                       ├── live Node Directory / Node Lease
-                       └── Actor Owner Record + Ownership Epoch
+<prefix>/nodes/<node-id>/lease.json
+<prefix>/actors/<actor-type>/<actor-id>/ownership.json
 ```
 
-- `ServerBuilder::local`（测试便利，经 `test_support::TestServer`）与 `ServerBuilder::cluster`（分布式）分别选择运行形态；两者都经 `start()` 异步启动。`Client` 是独立于 `Server` 的调用方入口（ADR-0008）。
-- Actor Refs are stable weak handles obtained by Actor Type name + Actor ID; `open()` establishes a persistent bidirectional Session (Action in, Event out, byte payloads).
-- `#[coactor::actor]` marks the Actor struct and generates the type-erased dispatch impl; the Actor Type name is passed explicitly at registration (`register::<A>(name)`). Consumers implement the `Actor` trait with native `async fn` methods. `ActorRuntime` injects identity, AppState and `broadcast` at construction; `MessageContext` carries the current Session for directed Event delivery.
-- A local Active Actor owns a bounded mailbox and executes one message at a time, including across handler `.await` points.
-- Passivation fires only when no live Session remains for the Actor; failover explicitly breaks Sessions (callers re-`open()`), detected lazily on the next send.
-- Cluster mode uses Node Leases for runtime authority and Actor Owner Records for per-address routing and monotonically fenced takeover.
-- Gateways resolve ownership on session ingress: claim unowned/stale actors (placement strategy, bounded retry) or forward sessions to the current Owner over a per-session relay; Owner or gateway failure explicitly breaks the Session (ADR-0008).
-- The public cluster API selects a built-in Coordination Store through `CoordinationConfig`; S3 is the currently delivered variant. Node Directory, Node Lease, Actor Owner and transport capabilities remain crate-private seams with deterministic fakes.
-- Client reads the Coordination Store's Node Directory, keeps a Gateway Pool, and opens Sessions through a live Gateway; transport-level open failures fail over to another pool node. Client credentials are read-only and cannot mutate Node Leases or Actor Owner Records.
+object key 是 record identity，因此 body 不重复 Node ID 或 Actor Address。重启节点不扫描 ownership；下一次访问时惰性执行 same-node takeover。若该 Node 无法服务，则回到普通 placement 以保持可用性。
 
-## Delivered guarantees
+## 当前保证与未来工作
 
-- stable `ActorType + ActorId` addressing with name-based lookup;
-- lazy activation via `open()`, bounded admission and serial non-reentrant handling;
-- persistent bidirectional Sessions with fire-and-forget Action delivery and bounded outbound backpressure;
-- activation/deactivation/session lifecycle hooks, idle passivation gated on live Sessions, and graceful shutdown;
-- structured local and remote failure categories;
-- location-transparent Session dispatch over multiplexed bidi gRPC streams;
-- S3 conditional-write ownership, advisory placement and stateless Availability Failover;
-- Owner-side self-fencing that stops local Active Actor execution and Event delivery when Node authority expires or is lost.
-
-Event delivery remains non-durable. CoActor does not currently provide Actor Store persistence, Recovery, Migration, message deduplication, exactly-once delivery, actor-scoped timers, or fencing for consumer-managed external side effects.
-
-## Future direction
-
-The next persistence stage may introduce an Actor-scoped transactional KV, epoch-isolated Actor Store objects, asynchronous checkpoints and a fixed Restore Cut. Durable ACK, message deduplication and planned Migration remain separate later decisions; they must not be inferred from the current ownership protocol. Typed (prost) Action/Event payloads are a separate later decision recorded in ADR-0005.
-
-## Acceptance questions
-
-1. Does one Owner serialize messages for an Actor Address while its authority remains valid?
-2. Are passivation and new-message races free from silent message loss?
-3. Do ambiguous ownership writes require exact bounded read-back rather than blind replay?
-4. Does lease loss stop mutation and successful Event delivery without terminating the host process?
-5. Is a live Session guaranteed to block passivation, and does a closed Session allow it?
-6. Does failover break Sessions such that callers re-establish them on the new Owner?
-7. After failover, is empty-state activation described as Availability Failover rather than Recovery?
-
-## Research background
-
-Existing Rust Actor frameworks informed the in-process execution model, but CoActor keeps distributed lifecycle, ownership and fencing semantics inside its own runtime boundary. Detailed historical research is retained outside this design brief; current guarantees are defined by the runtime semantics documents and accepted ADRs.
+当前保证覆盖内存 Actor lifecycle、Session、Node Lease、availability failover 与 S3 Coordination protocol。Actor Store、durable ACK、Recovery 与 Migration 仍是未来持久化工作；普通 Event 不代表持久提交。

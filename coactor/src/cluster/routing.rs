@@ -5,7 +5,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use super::placement::Candidate;
 use super::wall_time_millis;
 use crate::{
-    ActorAddress, ActorOwner, ActorOwnerRecord, ActorOwnerStore, Mutation, NodeDirectory,
+    ActorAddress, ActorOwner, ActorOwnerRecord, ActorOwnerStore, MutationOutcome, NodeDirectory,
     NodeSessionId, SendError,
 };
 
@@ -91,16 +91,19 @@ impl ClusterRouter {
         let Some(owner) = &current.record.owner else {
             return Ok(OwnerStatus::Unowned);
         };
+        if owner.node_id == self.node_id {
+            return Ok(OwnerStatus::Unowned);
+        }
         let node = tokio::time::timeout(
             self.operation_timeout,
-            self.directory.read_node(&owner.session_id),
+            self.directory.read_node(&owner.node_id),
         )
         .await
         .map_err(|_| SendError::OwnershipUnavailable)?
         .map_err(|_| SendError::OwnershipUnavailable)?;
         match node {
             Some(node) => Ok(OwnerStatus::Remote {
-                endpoint: node.advertised_address,
+                endpoint: node.advertised_endpoint,
             }),
             _ => {
                 // owner lease 缺失或过期：视为可放置（availability failover 语义）。
@@ -132,15 +135,63 @@ impl ClusterRouter {
                     });
                 }
                 if let Some(owner) = &current.record.owner {
+                    if owner.node_id == self.node_id {
+                        let expected =
+                            self.local_claim(current.record.ownership_epoch.saturating_add(1));
+                        let reservation = capacity
+                            .clone()
+                            .try_acquire_owned()
+                            .map_err(|_| SendError::RuntimeAtCapacity)?;
+                        let mutation = tokio::time::timeout(
+                            self.operation_timeout,
+                            self.owners.compare_exchange_actor_owner(
+                                address,
+                                expected.clone(),
+                                Some(&current.revision),
+                            ),
+                        )
+                        .await
+                        .map_err(|_| SendError::OwnershipUnavailable)?
+                        .map_err(|_| SendError::OwnershipUnavailable)?;
+                        match mutation {
+                            MutationOutcome::Applied(_) => {
+                                return Ok(ResolvedOwner::Local {
+                                    reservation: Some(reservation),
+                                    guard,
+                                });
+                            }
+                            MutationOutcome::Conflict => {
+                                drop(reservation);
+                                continue;
+                            }
+                            MutationOutcome::Indeterminate(_) => {
+                                if let Ok(Ok(Some(confirmed))) = tokio::time::timeout(
+                                    self.operation_timeout,
+                                    self.owners.read_actor_owner(address),
+                                )
+                                .await
+                                {
+                                    if confirmed.record == expected {
+                                        return Ok(ResolvedOwner::Local {
+                                            reservation: Some(reservation),
+                                            guard,
+                                        });
+                                    }
+                                }
+                                drop(reservation);
+                                continue;
+                            }
+                        }
+                    }
                     let node = tokio::time::timeout(
                         self.operation_timeout,
-                        self.directory.read_node(&owner.session_id),
+                        self.directory.read_node(&owner.node_id),
                     )
                     .await
                     .map_err(|_| SendError::OwnershipUnavailable)?
                     .map_err(|_| SendError::OwnershipUnavailable)?;
                     if let Some(node) = node {
-                        let endpoint = node.advertised_address.clone();
+                        let endpoint = node.advertised_endpoint.clone();
                         let protocol_version = node.protocol_version;
                         return Ok(ResolvedOwner::Remote {
                             endpoint,
@@ -175,17 +226,17 @@ impl ClusterRouter {
             .map_err(|_| SendError::OwnershipUnavailable)?
             .map_err(|_| SendError::OwnershipUnavailable)?;
             match mutation {
-                Mutation::Applied { .. } => {
+                MutationOutcome::Applied(_) => {
                     return Ok(ResolvedOwner::Local {
                         reservation: Some(reservation),
                         guard,
                     });
                 }
-                Mutation::Conflict => {
+                MutationOutcome::Conflict => {
                     drop(reservation);
                     continue;
                 }
-                Mutation::Ambiguous(_) => {
+                MutationOutcome::Indeterminate(_) => {
                     let mut should_reresolve = false;
                     for _ in 0..3 {
                         let confirmed = tokio::time::timeout(
@@ -216,6 +267,56 @@ impl ClusterRouter {
         Err(SendError::OwnershipUnavailable)
     }
 
+    pub(crate) async fn clear_owner_for_fallback(
+        &self,
+        address: &ActorAddress,
+        rejected_endpoint: &str,
+    ) -> Result<bool, SendError> {
+        let current = tokio::time::timeout(
+            self.operation_timeout,
+            self.owners.read_actor_owner(address),
+        )
+        .await
+        .map_err(|_| SendError::OwnershipUnavailable)?
+        .map_err(|_| SendError::OwnershipUnavailable)?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let Some(owner) = &current.record.owner else {
+            return Ok(false);
+        };
+        let node = tokio::time::timeout(
+            self.operation_timeout,
+            self.directory.read_node(&owner.node_id),
+        )
+        .await
+        .map_err(|_| SendError::OwnershipUnavailable)?
+        .map_err(|_| SendError::OwnershipUnavailable)?;
+        if !node.is_some_and(|node| node.advertised_endpoint == rejected_endpoint) {
+            return Ok(false);
+        }
+        let expected = ActorOwnerRecord::unowned(current.record.ownership_epoch);
+        let mutation = tokio::time::timeout(
+            self.operation_timeout,
+            self.owners.release_actor_owner(address, &current),
+        )
+        .await
+        .map_err(|_| SendError::OwnershipUnavailable)?
+        .map_err(|_| SendError::OwnershipUnavailable)?;
+        match mutation {
+            MutationOutcome::Applied(_) => Ok(true),
+            MutationOutcome::Conflict => Ok(false),
+            MutationOutcome::Indeterminate(_) => {
+                let confirmed = tokio::time::timeout(
+                    self.operation_timeout,
+                    self.owners.read_actor_owner(address),
+                )
+                .await;
+                Ok(matches!(confirmed, Ok(Ok(Some(record))) if record.record == expected))
+            }
+        }
+    }
+
     pub(crate) async fn release_local_owner(
         &self,
         address: &ActorAddress,
@@ -241,8 +342,8 @@ impl ClusterRouter {
         .map_err(|_| SendError::OwnershipUnavailable)?
         .map_err(|_| SendError::OwnershipUnavailable)?;
         let confirmed = match released {
-            Mutation::Applied { .. } => true,
-            Mutation::Conflict | Mutation::Ambiguous(_) => {
+            MutationOutcome::Applied(_) => true,
+            MutationOutcome::Conflict | MutationOutcome::Indeterminate(_) => {
                 let expected = ActorOwnerRecord::unowned(current.record.ownership_epoch);
                 let mut confirmed = false;
                 for _ in 0..3 {
@@ -299,7 +400,7 @@ impl ClusterRouter {
                     && node.active_actor_count < node.max_actor_count
             })
             .map(|node| Candidate {
-                endpoint: crate::transport::Endpoint::new(node.advertised_address),
+                endpoint: crate::transport::Endpoint::new(node.advertised_endpoint),
                 active_actor_count: node.active_actor_count,
                 max_actor_count: node.max_actor_count,
             })

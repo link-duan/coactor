@@ -2,96 +2,159 @@ use std::{fmt, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct ActorId(Arc<[u8]>);
-
-impl ActorId {
-    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
-        Self(bytes.into().into())
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl From<&str> for ActorId {
-    fn from(value: &str) -> Self {
-        Self::new(value.as_bytes())
-    }
-}
-
-impl fmt::Debug for ActorId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("ActorId").field(&self.0).finish()
-    }
-}
-
+/// A validated, reusable Actor address.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ActorAddress {
     actor_type: Arc<str>,
-    actor_id: ActorId,
+    actor_id: Arc<str>,
 }
 
 impl ActorAddress {
-    pub fn new(actor_type: impl Into<Arc<str>>, actor_id: ActorId) -> Self {
-        Self {
-            actor_type: actor_type.into(),
-            actor_id,
+    pub fn new(
+        actor_type: impl AsRef<str>,
+        actor_id: impl AsRef<str>,
+    ) -> Result<Self, ActorAddressError> {
+        let actor_type = actor_type.as_ref();
+        let actor_id = actor_id.as_ref();
+        if !is_dns_label(actor_type) {
+            return Err(ActorAddressError::InvalidActorType);
         }
+        if !is_dns_label(actor_id) {
+            return Err(ActorAddressError::InvalidActorId);
+        }
+        Ok(Self {
+            actor_type: Arc::from(actor_type),
+            actor_id: Arc::from(actor_id),
+        })
     }
 
     pub fn actor_type(&self) -> &str {
         &self.actor_type
     }
 
-    pub fn actor_id(&self) -> &ActorId {
+    pub fn actor_id(&self) -> &str {
         &self.actor_id
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let name = self.actor_type.as_bytes();
-        let mut bytes = Vec::with_capacity(4 + name.len() + self.actor_id.as_bytes().len());
-        bytes.extend_from_slice(&(name.len() as u32).to_be_bytes());
-        bytes.extend_from_slice(name);
-        bytes.extend_from_slice(self.actor_id.as_bytes());
-        bytes
     }
 }
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum StartError {
+pub(crate) fn is_dns_label(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ActorAddressError {
+    #[error("Actor Type must be a Kubernetes DNS label")]
+    InvalidActorType,
+    #[error("Actor ID must be a Kubernetes DNS label")]
+    InvalidActorId,
+}
+
+#[derive(Debug, Error)]
+pub enum ServerStartError {
+    #[error("bind address is required")]
+    MissingBindAddress,
+    #[error("advertised endpoint is required")]
+    MissingAdvertisedEndpoint,
+    #[error("Actor Type `{0}` is invalid")]
+    InvalidActorType(String),
     #[error("Actor Type `{0}` was registered more than once")]
-    DuplicateActorType(&'static str),
+    DuplicateActorType(String),
     #[error("mailbox capacity must be greater than zero")]
     InvalidMailboxCapacity,
     #[error("max_active_actors must be greater than zero")]
     InvalidMaxActiveActors,
-    #[error("Node ID must not be empty")]
+    #[error("Node ID must be a Kubernetes DNS label")]
     InvalidNodeId,
-    #[error("advertised address must have a non-zero port")]
-    InvalidAdvertisedAddress,
-    #[error("lease timing is invalid")]
-    InvalidLeaseTiming,
+    #[error("advertised endpoint must be a canonical host:port without a scheme or path")]
+    InvalidAdvertisedEndpoint,
+    #[error("Node Lease TTL must be greater than zero")]
+    InvalidNodeLeaseTtl,
+    #[error("Coordination operation timeout must be greater than zero")]
+    InvalidCoordinationTimeout,
+    #[error("peer connection timeout must be greater than zero")]
+    InvalidPeerConnectTimeout,
+    #[error("deactivation timeout must be greater than zero")]
+    InvalidDeactivationTimeout,
+    #[error("shutdown timeout must be greater than zero")]
+    InvalidShutdownTimeout,
     #[error("the peer listener could not bind")]
-    BindFailed,
+    BindFailed(#[source] std::io::Error),
     #[error("Node Lease is already owned")]
     LeaseConflict,
     #[error("Node Lease acquisition could not be confirmed")]
     LeaseUnconfirmed,
-    #[error("ownership authority is unavailable during startup")]
+    #[error("Coordination Store is unavailable during startup")]
+    Coordination(#[source] crate::coordination::CoordinationError),
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ServerFailure {
+    #[error("the Server self-fenced after losing Node authority")]
+    Fenced,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ClientBuildError {
+    #[error("open timeout must be greater than zero")]
+    InvalidOpenTimeout,
+    #[error("peer connection timeout must be greater than zero")]
+    InvalidPeerConnectTimeout,
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum OpenError {
+    #[error("the Client runtime stopped")]
+    RuntimeStopped,
+    #[error("the Node Directory is unavailable")]
+    DirectoryUnavailable,
+    #[error("the Node Directory has no available Gateway")]
+    NoAvailableGateway,
+    #[error("the remote runtime is unavailable")]
+    RemoteUnavailable,
+    #[error("the Actor Type is not registered")]
+    ActorTypeNotRegistered,
+    #[error("the runtime has reached its Active Actor limit")]
+    RuntimeAtCapacity,
+    #[error("distributed ownership is unavailable")]
     OwnershipUnavailable,
+    #[error("the remote runtime rejected the protocol")]
+    RemoteProtocol,
+}
+
+impl From<SendError> for OpenError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::RuntimeStopped | SendError::RuntimeShuttingDown => Self::RuntimeStopped,
+            SendError::DirectoryUnavailable => Self::DirectoryUnavailable,
+            SendError::NoAvailableGateway => Self::NoAvailableGateway,
+            SendError::ActorTypeNotRegistered(_) => Self::ActorTypeNotRegistered,
+            SendError::RuntimeAtCapacity => Self::RuntimeAtCapacity,
+            SendError::OwnershipUnavailable => Self::OwnershipUnavailable,
+            SendError::RemoteProtocol(_) => Self::RemoteProtocol,
+            _ => Self::RemoteUnavailable,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ActorTypeConfig {
+pub struct ActorConfig {
+    pub(crate) name: &'static str,
     pub(crate) mailbox_capacity: Option<usize>,
     pub(crate) idle_timeout: Option<Duration>,
 }
 
-impl ActorTypeConfig {
-    pub fn new() -> Self {
-        Self::default()
+impl ActorConfig {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            ..Self::default()
+        }
     }
 
     pub fn mailbox_capacity(mut self, capacity: usize) -> Self {
@@ -101,6 +164,22 @@ impl ActorTypeConfig {
 
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = Some(timeout);
+        self
+    }
+}
+
+pub trait IntoActorConfig {
+    fn into_actor_config(self) -> ActorConfig;
+}
+
+impl IntoActorConfig for &'static str {
+    fn into_actor_config(self) -> ActorConfig {
+        ActorConfig::new(self)
+    }
+}
+
+impl IntoActorConfig for ActorConfig {
+    fn into_actor_config(self) -> ActorConfig {
         self
     }
 }
@@ -195,5 +274,11 @@ impl SendError {
             RuntimeFailure::OwnershipUnavailable => Self::OwnershipUnavailable,
             _ => Self::RemoteProtocol(RemoteProtocolError::VersionMismatch),
         }
+    }
+}
+
+impl fmt::Display for ActorAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.actor_type, self.actor_id)
     }
 }

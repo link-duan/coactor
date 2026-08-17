@@ -140,7 +140,7 @@ mod tests {
     use super::*;
     use rand::{SeedableRng, rngs::StdRng};
 
-    use crate::{ActorAddress, ActorId};
+    use crate::ActorAddress;
 
     fn candidate(endpoint: &str, active: usize, max: usize) -> Candidate {
         Candidate {
@@ -155,7 +155,7 @@ mod tests {
     }
 
     fn address() -> ActorAddress {
-        ActorAddress::new("test", ActorId::from("1"))
+        ActorAddress::new("test", "one").unwrap()
     }
 
     /// 两个候选：选 Load Ratio 低的（与采样顺序无关）。

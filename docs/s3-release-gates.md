@@ -1,51 +1,36 @@
 # S3 release gates
 
-CoActor's ownership adapter is **designed for AWS S3 semantics**. Local development and merge-gating CI do not prove equivalence with the real AWS service.
+CoActor's built-in Coordination Store is designed around AWS S3 conditional-write semantics. The local programmable HTTP fixture verifies request contracts, but it does not prove equivalence with the real AWS service.
 
 ## Merge gates
 
-CI runs the ignored S3 ownership-semantics tests against MinIO as a local integration endpoint. MinIO verifies SDK configuration, object encoding, response-loss reconciliation, and multi-runtime behavior, but it is not a supported production authority and does not replace real AWS qualification.
+Regular tests verify:
 
-The MinIO gate runs the Node Lease and Actor Owner Record lifecycle plus multiple real Runtime instances over loopback gRPC. The multi-node gate covers typed remote calls, cold claims, lease renewal, bounded-capacity placement, runtime fencing, idle ownership release, graceful shutdown, response-loss reconciliation, and higher-epoch Availability Failover.
+- exact readable keys for Node Lease and Actor Owner records;
+- identity omission from record bodies;
+- `If-None-Match` create and `If-Match` replace/delete behavior;
+- Node Lease generation advancement;
+- conflict versus indeterminate mutation classification;
+- exact read-back after a response-loss simulation;
+- Node Directory cache freshness and singleflight behavior.
 
-The tests never fall back to the deterministic fake. Explicit execution requires an endpoint and bucket:
-
-```console
-COACTOR_S3_ENDPOINT=http://127.0.0.1:9000 \
-COACTOR_S3_BUCKET=coactor-local \
-cargo test -p coactor --lib node_and_actor_records_obey_conditional_s3_updates -- --ignored --test-threads=1
-
-COACTOR_S3_ENDPOINT=http://127.0.0.1:9000 \
-COACTOR_S3_BUCKET=coactor-local \
-cargo test -p coactor --lib multiple_runtimes_preserve_ownership_lifecycle_through_s3 -- --ignored --test-threads=1
-```
-
-The compatibility test can set `COACTOR_S3_REQUIRE_CONDITIONAL_DELETE=1` when its endpoint implements conditional `DeleteObject`. Real AWS qualification always requires and verifies the strict behavior.
+The S3 Store is created from an AWS SDK S3 Client. Test and deployment code configure credentials, region, endpoint, retry, HTTP and timeout through the AWS SDK rather than CoActor-specific credential fields.
 
 ## Real AWS qualification
 
-Real AWS qualification is ignored by default and is not a daily CI requirement. Run it with temporary credentials and a dedicated existing bucket:
+Before a production release, run the same protocol against a dedicated existing AWS bucket with temporary credentials and a run-specific canonical prefix. Qualification must verify:
 
-```console
-COACTOR_AWS_QUALIFICATION=1 \
-COACTOR_AWS_QUALIFICATION_BUCKET=my-isolated-qualification-bucket \
-COACTOR_AWS_QUALIFICATION_PREFIX=coactor/qualification/my-run \
-AWS_REGION=us-east-1 \
-AWS_ACCESS_KEY_ID=... \
-AWS_SECRET_ACCESS_KEY=... \
-AWS_SESSION_TOKEN=... \
-cargo test -p coactor --lib aws_s3_supports_ambiguous_write_reconciliation_and_takeover -- --ignored --test-threads=1
-```
+- conditional create, replace and delete;
+- ETag/revision preservation;
+- read/list consistency after successful writes;
+- exact read-back after an applied mutation whose response is lost;
+- expired Node Lease takeover by storage revision;
+- graceful conditional lease deletion;
+- higher-epoch Actor ownership takeover under a new Node Session ID;
+- runtime self-fencing after lease authority is lost.
 
-Each execution appends a UUID below the supplied prefix. A successful run deletes all objects it created. Use a run-specific prefix so an interrupted process can be cleaned safely without touching unrelated data.
+Real AWS qualification remains an external release gate rather than a regular local or CI requirement. Until it passes in the intended deployment configuration, release claims should say “designed for AWS S3 semantics,” not “verified against AWS S3.”
 
-The qualification verifies the protocol assumptions that matter to CoActor:
+## Lifecycle policy
 
-- `If-None-Match` and `If-Match` conditional writes;
-- ETag preservation and guarded updates/deletes;
-- immediate read/list consistency after successful writes;
-- exact read-back after an applied mutation whose response is treated as lost;
-- runtime self-fencing after lease loss;
-- higher-epoch takeover with empty-state Availability Failover.
-
-Passing this suite is a condition for the first production release. Until it has passed in the intended AWS deployment configuration, documentation and release claims must continue to say “designed for AWS S3 semantics,” not “verified against AWS S3.”
+Crash residue is ignored after Node Lease expiry; CoActor does not run a distributed janitor. Production buckets should configure Lifecycle expiration for expired Node objects. If S3 Versioning is enabled, configure noncurrent-version expiration as well so replaced and deleted lease versions do not accumulate indefinitely.

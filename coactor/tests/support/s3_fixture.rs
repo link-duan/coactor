@@ -27,6 +27,7 @@ pub(super) struct ProgrammableS3 {
     next_etag: Arc<Mutex<u64>>,
     dropped_put_responses: Arc<Mutex<HashMap<String, usize>>>,
     put_counts: Arc<Mutex<HashMap<String, usize>>>,
+    list_count: Arc<Mutex<usize>>,
 }
 
 impl ProgrammableS3 {
@@ -37,6 +38,7 @@ impl ProgrammableS3 {
             next_etag: Arc::default(),
             dropped_put_responses: Arc::default(),
             put_counts: Arc::default(),
+            list_count: Arc::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -70,6 +72,10 @@ impl ProgrammableS3 {
             .get(key)
             .copied()
             .unwrap_or_default()
+    }
+
+    pub(super) fn list_count(&self) -> usize {
+        *self.list_count.lock().unwrap()
     }
 
     pub(super) fn object_body(&self, key: &str) -> Option<Vec<u8>> {
@@ -134,6 +140,7 @@ async fn handle(State(state): State<ProgrammableS3>, request: Request<Body>) -> 
         .to_owned();
 
     if parts.method == Method::GET && path == state.bucket_path.as_ref() {
+        *state.list_count.lock().unwrap() += 1;
         let prefix = parts
             .uri
             .query()

@@ -1,29 +1,20 @@
 # CoActor
 
-CoActor 是一个嵌入式 Rust actor runtime：为稳定业务身份（game room、document 等）提供**串行、非重入**的消息处理，以及 **caller ↔ Actor 的双向 Session 消息**。支持从单机测试到多节点分布的运行形态。
+CoActor 是面向 Rust 应用的嵌入式分布式 Actor runtime。业务以经过校验的 `ActorAddress`（Actor Type + Actor ID）标识逻辑 Actor，通过 `Client` 打开持久双向 `Session`；`Server` 按需激活 Actor，并通过 Coordination Store 协调节点租约、放置与 ownership。
 
-> **Early development:** CoActor is currently an experimental project. Its APIs, runtime semantics, and architecture may change significantly.
+## 核心 API
 
-## 模型
+- `Server::builder(coordination_store)`：注入具体 Coordination Store，配置 bind、advertised endpoint、可选稳定 Node ID、State 与 Actor Type。
+- `Client::builder(node_directory).build()`：只依赖只读 Node Directory；构造同步且不访问后端。
+- `TestServer::builder()`：使用内存 transport 的测试入口，与生产 API 共用 State、Actor 注册和 runtime policy 词汇。
+- `ActorAddress::new(actor_type, actor_id)`：一次校验、可跨 Client 复用的纯值。
+- `Client::open(&address)`：直接建立 Session；Action/Event 投递失败使用 `SendError`，建链失败使用 `OpenError`。
 
-- **Actor**：`#[coactor::actor]` 标注的 struct + 手写 `impl Actor<S>`（原生 `async fn`），业务逻辑与生命周期 hook 都在 trait 中
-- **Action / Event**：Session 上的入站 / 出站字节消息（fire-and-forget）
-- **Session**：caller 与 Actor 之间的持久双向通道，由 `ActorRef::open()` 建立
-- **Server / Client**：`Server` 宿主 Actor 并充当 Gateway（认领、转发与 Placement）；`Client` 从 Coordination Store 的 Node Directory 建立 Gateway Pool，经 Gateway 中继 Session，不变更 Node Lease 或 Actor Owner Record
+## 文档
 
-状态只在内存中：passivation、进程退出或崩溃后，Actor 从空状态重新启动。当前不提供持久化、durable ACK、Recovery 或 Migration。
-
-## Quick start
-
-生产环境的 Server、Client、S3 Coordination Store 配置与完整运行步骤见：
-
-- [docs/quick-start.md](docs/quick-start.md)
-- [coactor/examples/cluster_counter.rs](coactor/examples/cluster_counter.rs)
-
-## 了解更多
-
-- [docs/quick-start.md](docs/quick-start.md) — 完整起步（Actor 定义、注册、配置）
-- [docs/runtime-semantics.md](docs/runtime-semantics.md) — 本地语义（lifecycle、passivation、错误分类）
-- [docs/distributed-runtime-semantics.md](docs/distributed-runtime-semantics.md) — 分布式语义（ownership、fencing、Availability Failover、网关转发）
-- [docs/design-brief.md](docs/design-brief.md) — 架构概览与已交付保证
-- [docs/adr/](docs/adr/) — 架构决策记录
+- [快速开始](docs/quick-start.md)
+- [设计简述](docs/design-brief.md)
+- [本地运行时语义](docs/runtime-semantics.md)
+- [分布式运行时语义](docs/distributed-runtime-semantics.md)
+- [产品方向](docs/product-direction.md)
+- [ADR 索引](docs/adr/README.md)

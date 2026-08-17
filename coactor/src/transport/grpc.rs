@@ -145,7 +145,12 @@ impl ServerTransport for GrpcTransport {
 #[async_trait::async_trait]
 impl ClientTransport for GrpcTransport {
     async fn connect(&self, endpoint: &Endpoint) -> Result<Box<dyn PeerStream>, TransportError> {
-        let endpoint_str = endpoint.as_str().to_owned();
+        let endpoint_str = endpoint.as_str();
+        let endpoint_str = if endpoint_str.contains("://") {
+            endpoint_str.to_owned()
+        } else {
+            format!("http://{endpoint_str}")
+        };
         let endpoint = tonic::transport::Endpoint::new(endpoint_str.clone())
             .map_err(|error| TransportError::ConnectFailed(error.to_string()))?;
         let channel = tokio::time::timeout(self.peer_connect_timeout, endpoint.connect())

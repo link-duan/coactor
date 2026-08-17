@@ -1,96 +1,51 @@
-use std::{env, error::Error, net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
-use aws_credential_types::{Credentials, provider::SharedCredentialsProvider};
 use coactor::{
-    Actor, ActorId, ActorRuntime, ClientBuilder, ClientConfig, CoordinationConfig, MessageContext,
-    ServerBuilder, actor,
-    cluster::{S3CoordinationConfig, ServerConfig},
+    Actor, ActorAddress, ActorRuntime, Client, MessageContext, Server, actor,
+    coordination::backend::s3::S3CoordinationStore,
 };
-
-#[derive(Clone)]
-struct AppState;
 
 #[actor]
 struct CounterActor {
-    _runtime: ActorRuntime<AppState>,
-    value: i64,
+    count: u64,
 }
 
-impl Actor<AppState> for CounterActor {
-    fn new(runtime: ActorRuntime<AppState>) -> Self {
-        Self {
-            _runtime: runtime,
-            value: 0,
-        }
+impl Actor<()> for CounterActor {
+    fn new(_runtime: ActorRuntime<()>) -> Self {
+        Self { count: 0 }
     }
 
-    async fn on_message(&mut self, ctx: &MessageContext, msg: &[u8]) {
-        let amount = i64::from_be_bytes(msg.try_into().expect("8-byte Action"));
-        self.value += amount;
-        let _ = ctx.send(self.value.to_be_bytes().to_vec()).await;
+    async fn on_message(&mut self, ctx: &MessageContext, _msg: &[u8]) {
+        self.count += 1;
+        let _ = ctx.send(self.count.to_string().into_bytes()).await;
     }
-}
-
-fn coordination_config() -> S3CoordinationConfig {
-    let session_token = env::var("AWS_SESSION_TOKEN").ok();
-    S3CoordinationConfig {
-        bucket: env::var("COACTOR_S3_BUCKET").expect("COACTOR_S3_BUCKET"),
-        prefix: env::var("COACTOR_S3_PREFIX").unwrap_or_else(|_| "coactor/production".to_owned()),
-        region: env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
-        endpoint_url: env::var("COACTOR_S3_ENDPOINT").ok(),
-        credentials_provider: SharedCredentialsProvider::new(Credentials::new(
-            env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID"),
-            env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY"),
-            session_token,
-            None,
-            "environment",
-        )),
-        request_timeout: Duration::from_secs(5),
-    }
-}
-
-async fn run_server() -> Result<(), Box<dyn Error>> {
-    let bind_address: SocketAddr = env::var("COACTOR_BIND_ADDRESS")?.parse()?;
-    let advertised_address: SocketAddr = env::var("COACTOR_ADVERTISED_ADDRESS")?.parse()?;
-    let server = ServerBuilder::cluster(
-        AppState,
-        ServerConfig::new(
-            env::var("COACTOR_NODE_ID")?,
-            bind_address,
-            advertised_address,
-            CoordinationConfig::S3(coordination_config()),
-        ),
-    )
-    .register::<CounterActor>("counter")
-    .start()
-    .await?;
-
-    tokio::signal::ctrl_c().await?;
-    server.shutdown().await;
-    Ok(())
-}
-
-async fn run_client() -> Result<(), Box<dyn Error>> {
-    let client = ClientBuilder::new(ClientConfig {
-        coordination: CoordinationConfig::S3(coordination_config()),
-    })
-    .start();
-    let mut session = client
-        .actor("counter", ActorId::from("production-counter"))
-        .open()
-        .await?;
-    session.send(3i64.to_be_bytes().to_vec()).await?;
-    let event = session.recv().await.ok_or("Session closed")??;
-    println!("value = {}", i64::from_be_bytes(event.try_into().unwrap()));
-    client.shutdown().await;
-    Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    match env::args().nth(1).as_deref() {
-        Some("server") => run_server().await,
-        Some("client") => run_client().await,
-        _ => Err("usage: cluster_counter <server|client>".into()),
-    }
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bucket = std::env::var("COACTOR_S3_BUCKET")?;
+    let prefix = std::env::var("COACTOR_S3_PREFIX").unwrap_or_default();
+    let bind: SocketAddr = std::env::var("COACTOR_BIND")?.parse()?;
+    let advertised = std::env::var("COACTOR_ADVERTISED_ENDPOINT")?;
+    let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+
+    let server_store = S3CoordinationStore::new(aws_sdk_s3::Client::new(&sdk), &bucket, &prefix)?;
+    let server = Server::builder(server_store)
+        .bind(bind)
+        .advertised_endpoint(&advertised)
+        .actor::<CounterActor>("counter")
+        .start()
+        .await?;
+
+    let client_store = S3CoordinationStore::new(aws_sdk_s3::Client::new(&sdk), bucket, prefix)?
+        .directory_refresh_interval(Duration::from_secs(3));
+    let client = Client::builder(client_store).build()?;
+    let address = ActorAddress::new("counter", "production-counter")?;
+    let mut session = client.open(&address).await?;
+    session.send(b"increment".to_vec()).await?;
+    println!("{}", String::from_utf8(session.recv().await.unwrap()?)?);
+
+    client.shutdown().await;
+    server.shutdown().await;
+    Ok(())
 }
