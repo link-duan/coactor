@@ -270,7 +270,10 @@ where
     S: Send + Sync + 'static,
 {
     match message {
-        MailboxMessage::Action { session_id, payload } => {
+        MailboxMessage::Action {
+            session_id,
+            payload,
+        } => {
             let ctx = runtime.make_message_context(address, session_id);
             match std::panic::AssertUnwindSafe(handle(actor, &ctx, &payload))
                 .catch_unwind()
@@ -282,7 +285,9 @@ where
             }
         }
         MailboxMessage::SessionOpened {
-            session_id, complete, ..
+            session_id,
+            complete,
+            ..
         } => {
             let ctx = runtime.make_message_context(address, session_id);
             match std::panic::AssertUnwindSafe(session_opened(actor, &ctx))

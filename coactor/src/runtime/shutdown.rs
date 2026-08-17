@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::core::{FENCED, RUNNING, ServerInner, SHUTTING_DOWN, STOPPED};
-use crate::cluster::{NodeLease, wall_time_millis};
+use super::core::{FENCED, RUNNING, SHUTTING_DOWN, STOPPED, ServerInner};
+use crate::cluster::NodeRecord;
 use crate::{ActorAddress, SendError};
 
 impl<S> ServerInner<S>
@@ -18,13 +18,13 @@ where
                 .is_none_or(|authority| authority.is_valid())
     }
 
-    pub(crate) fn update_capacity_sample(&self, lease: &mut NodeLease) {
+    pub(crate) fn update_capacity_sample(&self, node: &mut NodeRecord) {
         let available = self.capacity.available_permits();
-        lease.sampled_at_unix_ms = wall_time_millis();
-        lease.active_actor_count = self.max_active_actors.saturating_sub(available);
-        lease.max_actor_count = self.max_active_actors;
-        lease.pressured = available == 0;
-        lease.draining = self.status.load(Ordering::Acquire) != RUNNING;
+        node.sampled_at_unix_ms = crate::cluster::wall_time_millis();
+        node.active_actor_count = self.max_active_actors.saturating_sub(available);
+        node.max_actor_count = self.max_active_actors;
+        node.pressured = available == 0;
+        node.draining = self.status.load(Ordering::Acquire) != RUNNING;
     }
 
     pub async fn shutdown(self: &Arc<Self>) {
@@ -75,7 +75,8 @@ where
             tokio::task::yield_now().await;
             self.actors.lock().clear();
         }
-        self.terminate_all_sessions(SendError::RuntimeShuttingDown).await;
+        self.terminate_all_sessions(SendError::RuntimeShuttingDown)
+            .await;
         self.channels.lock().clear();
         self.abort_inbound_tasks();
         self.pending_opens.lock().clear();

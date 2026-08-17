@@ -4,35 +4,39 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::cluster::{
-    ClusterRouter, NodeAuthority, NodeLease, NodeSessionId, ResolvedOwner, wall_time_millis,
+    ClusterRouter, NodeAuthority, NodeRecord, NodeSessionId, ResolvedOwner, wall_time_millis,
 };
-use crate::test_support::{TestOwnershipBackend, start_cluster};
-use crate::{Actor, ActorAddress, ActorId, LeaseMutation, OwnershipBackend, ServerBuilder};
+use crate::test_support::{TestCoordinationStore, start_cluster};
+use crate::{
+    Actor, ActorAddress, ActorId, ActorOwnerStore, LeaseMutation, NodeDirectory, NodeLeaseStore,
+    ServerBuilder,
+};
 
 fn address(id: &str) -> ActorAddress {
     ActorAddress::new("ownership-probe", ActorId::from(id))
 }
 
-async fn router(
-    storage: &Arc<TestOwnershipBackend>,
-    node_id: &str,
-) -> Arc<ClusterRouter> {
+async fn router(storage: &Arc<TestCoordinationStore>, node_id: &str) -> Arc<ClusterRouter> {
     let session_id = NodeSessionId::generate();
-    let lease = NodeLease {
+    let node = NodeRecord {
         node_id: node_id.to_owned(),
         session_id: session_id.clone(),
         advertised_address: "http://127.0.0.1:7000".to_owned(),
         protocol_version: crate::PEER_PROTOCOL_VERSION,
-        expires_at_unix_ms: wall_time_millis() + 60_000,
+        lease_generation: 0,
         sampled_at_unix_ms: wall_time_millis(),
         active_actor_count: 0,
         max_actor_count: 100,
         pressured: false,
         draining: false,
     };
-    let mutation = storage.acquire_node_lease(lease).await.unwrap();
+    let mutation = storage
+        .acquire_node(node, Duration::from_secs(60))
+        .await
+        .unwrap();
     assert!(matches!(mutation, LeaseMutation::Applied { .. }));
     ClusterRouter::new(
+        storage.clone(),
         storage.clone(),
         node_id.to_owned(),
         session_id,
@@ -43,7 +47,7 @@ async fn router(
 
 #[tokio::test]
 async fn first_resolve_claims_owner_with_epoch_one() {
-    let storage = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     // 需要先有 node lease 供 resolve 检查（owner 是本地时不检查 lease）
     let _ = start_cluster(
         ServerBuilder::local(()).register::<ProbeActor>("ownership-probe"),
@@ -54,12 +58,18 @@ async fn first_resolve_claims_owner_with_epoch_one() {
     let capacity = Arc::new(Semaphore::new(8));
     let r = router(&storage, "node-a").await;
 
-    match r.resolve(&address("a-1"), &capacity).await.expect("resolve") {
+    match r
+        .resolve(&address("a-1"), &capacity)
+        .await
+        .expect("resolve")
+    {
         ResolvedOwner::Local { .. } => {}
         _ => panic!("first claim must be local"),
     }
     // release 后记录 unowned 且 epoch 保留为 1
-    r.release_local_owner(&address("a-1")).await.expect("release");
+    r.release_local_owner(&address("a-1"))
+        .await
+        .expect("release");
     let record = storage
         .read_actor_owner(&address("a-1"))
         .await
@@ -72,7 +82,7 @@ async fn first_resolve_claims_owner_with_epoch_one() {
 
 #[tokio::test]
 async fn concurrent_resolves_coalesce_to_one_owner() {
-    let storage = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let capacity = Arc::new(Semaphore::new(8));
     let first = router(&storage, "node-a").await;
     let second = router(&storage, "node-b").await;
@@ -102,7 +112,7 @@ async fn concurrent_resolves_coalesce_to_one_owner() {
 
 #[tokio::test]
 async fn takeover_requires_expired_or_absent_owner_lease() {
-    let storage = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let capacity = Arc::new(Semaphore::new(8));
     let ra = router(&storage, "node-a").await;
     match ra
@@ -126,15 +136,20 @@ async fn takeover_requires_expired_or_absent_owner_lease() {
     }
 
     // node-a 释放 lease → node-b 可接管，epoch 递增
-    let lease = storage
-        .list_node_leases()
+    let node = storage
+        .list_nodes()
         .await
         .unwrap()
         .into_iter()
-        .find(|entry| entry.lease.node_id == "node-a")
+        .find(|node| node.node_id == "node-a")
+        .unwrap();
+    let (_, token) = storage
+        .read_node_lease(&node.session_id)
+        .await
+        .unwrap()
         .unwrap();
     storage
-        .release_node_lease(&lease.lease.session_id, &lease.etag)
+        .release_node(&node.session_id, &token)
         .await
         .unwrap();
     match rb
@@ -166,7 +181,10 @@ async fn node_authority_renews_until_deadline_and_fences() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         elapsed += Duration::from_millis(100);
     }
-    assert!(!authority.is_valid(), "authority must expire with the deadline");
+    assert!(
+        !authority.is_valid(),
+        "authority must expire with the deadline"
+    );
 }
 
 #[tokio::test]

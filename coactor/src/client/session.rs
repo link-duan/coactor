@@ -88,12 +88,16 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.registry.unregister_local(&self.session_id);
-        let Some(endpoint) = self.owner_endpoint.clone() else { return };
+        let Some(endpoint) = self.owner_endpoint.clone() else {
+            return;
+        };
         let client = self.client.clone();
         let address = self.address.clone();
         let session_id = self.session_id;
         tokio::spawn(async move {
-            let Some(client) = client.upgrade() else { return };
+            let Some(client) = client.upgrade() else {
+                return;
+            };
             let Ok(channel) = client.ensure_channel(&endpoint).await else {
                 return;
             };

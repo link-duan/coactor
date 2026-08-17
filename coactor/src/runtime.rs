@@ -6,14 +6,15 @@ use tokio::sync::{Semaphore, watch};
 use crate::cluster::{
     ClusterRouter, ClusterTasks, NodeAuthority, PeerTask, RenewalTask, spawn_peer,
 };
+use crate::runtime::session::SessionRegistry;
 use crate::{
-    __macro, transport::ClientTransport, ActorTypeConfig, PlacementStrategy, ServerConfig,
-    ServerStarter, PEER_PROTOCOL_VERSION, ServerSupervision, ServerTermination, S3OwnershipBackend,
-    StartError,
+    __macro, ActorTypeConfig, PEER_PROTOCOL_VERSION, PlacementStrategy, ServerConfig,
+    ServerStarter, ServerSupervision, ServerTermination, StartError, transport::ClientTransport,
 };
 #[cfg(test)]
-use crate::{ServerRuntimeConfig, OwnershipBackend};
-use crate::runtime::session::SessionRegistry;
+use crate::{
+    ActorOwnerStore, CoordinationStores, NodeDirectory, NodeLeaseStore, ServerRuntimeConfig,
+};
 
 pub struct ServerBuilder<S> {
     state: S,
@@ -101,7 +102,8 @@ where
     where
         A: __macro::ActorType<S>,
     {
-        self.registrations.push(__macro::Registration::of::<A>(name));
+        self.registrations
+            .push(__macro::Registration::of::<A>(name));
         self
     }
 
@@ -117,34 +119,37 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn cluster_with_backend(
+    pub(crate) fn cluster_with_backend<T>(
         self,
         config: ServerRuntimeConfig,
-        storage: Arc<dyn OwnershipBackend>,
-    ) -> Result<ServerStarter<S>, StartError> {
+        store: Arc<T>,
+    ) -> Result<ServerStarter<S>, StartError>
+    where
+        T: NodeDirectory + NodeLeaseStore + ActorOwnerStore,
+    {
         debug_assert!(self.cluster.is_none());
         config.validate()?;
         Ok(ServerStarter {
             builder: self,
             config,
-            storage,
+            stores: CoordinationStores::new(store),
         })
     }
 
     pub(crate) fn build_local(self) -> Result<Server<S>, StartError> {
         debug_assert!(self.cluster.is_none());
         self.build_with_authority(None, None)
-    }    pub async fn start(mut self) -> Result<Server<S>, StartError> {
+    }
+    pub async fn start(mut self) -> Result<Server<S>, StartError> {
         let Some(cluster) = self.cluster.take() else {
             return self.build_local();
         };
-        let (config, ownership) = cluster.into_parts();
+        let (config, coordination) = cluster.into_parts();
         config.validate()?;
-        let storage = Arc::new(S3OwnershipBackend::new(ownership));
         ServerStarter {
             builder: self,
             config,
-            storage,
+            stores: coordination.build(),
         }
         .start()
         .await

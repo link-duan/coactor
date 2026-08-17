@@ -1,10 +1,8 @@
-//! caller 侧 runtime：只调用不宿主（ADR-0008）。
+//! caller 侧 runtime：只调用不宿主（ADR-0008、ADR-0010）。
 //!
-//! `Client` 经 Service Discovery 获取候选 Server（网关）节点，维护连接池并按
-//! 会话 round-robin 分配网关；会话经网关中继到 owner。不持有 AppState、不
-//! 参与 ownership（不 claim、不接管）、无 lease/self-fence。
+//! `Client` 从 Coordination Store 的 Node Directory 获取 live Server 节点，维护
+//! Gateway Pool 并按会话 round-robin 分配网关；会话经网关中继到 Owner。
 
-pub mod discovery;
 pub(crate) mod session;
 
 use std::{
@@ -17,15 +15,16 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
+use self::session::Session;
 use crate::peer_protocol::{Envelope, envelope, session_opened_ack};
 use crate::transport::grpc::GrpcTransport;
 use crate::transport::{ClientTransport, Endpoint, PeerSender};
-use crate::{ActorAddress, ActorId, PEER_PROTOCOL_VERSION, SendError};
-
-use self::discovery::ServiceDiscovery;
-use self::session::Session;
+use crate::{
+    ActorAddress, ActorId, CoordinationConfig, LeaseTiming, NodeDirectory, PEER_PROTOCOL_VERSION,
+    SendError,
+};
 
 pub(crate) const SESSION_RECEIVER_CAPACITY: usize = 64;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -36,42 +35,53 @@ const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const RUNNING: u8 = 0;
 pub(crate) const STOPPED: u8 = 1;
 
-/// 公开 Client 配置：服务发现 + （可扩展的池参数）。
+/// 公开 Client 配置：Coordination Store 提供只读 Node Directory。
 #[derive(Clone)]
 pub struct ClientConfig {
-    pub discovery: Arc<dyn ServiceDiscovery>,
+    pub coordination: CoordinationConfig,
 }
 
 pub struct ClientBuilder {
     transport: Arc<dyn ClientTransport>,
-    discovery: Arc<dyn ServiceDiscovery>,
+    directory: Arc<dyn NodeDirectory>,
+    refresh_interval: Duration,
 }
 
 impl ClientBuilder {
-    /// 公开构造：gRPC transport + 自定义服务发现。
+    /// 公开构造：gRPC transport + Coordination Store Node Directory。
     pub fn new(config: ClientConfig) -> Self {
+        let stores = config.coordination.build();
         Self {
             transport: Arc::new(GrpcTransport::new(PEER_CONNECT_TIMEOUT)),
-            discovery: config.discovery,
+            directory: stores.directory,
+            refresh_interval: LeaseTiming::default().renewal_interval,
         }
     }
 
-    /// crate 内部：注入 transport（inmem 测试路径）。
+    /// crate 内部：注入 transport 与 Node Directory（inmem 测试路径）。
     pub(crate) fn with_transport(
         transport: Arc<dyn ClientTransport>,
-        discovery: Arc<dyn ServiceDiscovery>,
+        directory: Arc<dyn NodeDirectory>,
     ) -> Self {
         Self {
             transport,
-            discovery,
+            directory,
+            refresh_interval: LeaseTiming::default().renewal_interval,
         }
+    }
+
+    pub fn directory_refresh_interval(mut self, interval: Duration) -> Self {
+        self.refresh_interval = interval;
+        self
     }
 
     pub fn start(self) -> Client {
         Client {
             inner: Arc::new(ClientInner {
                 transport: self.transport,
-                discovery: self.discovery,
+                directory: self.directory,
+                refresh_interval: self.refresh_interval,
+                refresh_lock: AsyncMutex::new(()),
                 pool: Mutex::new(Pool::default()),
                 sessions: session::CallerRegistry::new(),
                 channels: Mutex::new(HashMap::new()),
@@ -87,22 +97,26 @@ pub struct Client {
     pub(crate) inner: Arc<ClientInner>,
 }
 
-/// 网关连接池：最新发现结果 + round-robin 游标。
+/// Gateway Pool：最新 Node Directory 结果 + round-robin 游标。
 #[derive(Default)]
 pub(crate) struct Pool {
     endpoints: Vec<Endpoint>,
     next: usize,
+    refresh_at: Option<tokio::time::Instant>,
 }
 
 pub(crate) struct ClientInner {
     pub(crate) transport: Arc<dyn ClientTransport>,
-    pub(crate) discovery: Arc<dyn ServiceDiscovery>,
+    pub(crate) directory: Arc<dyn NodeDirectory>,
+    pub(crate) refresh_interval: Duration,
+    pub(crate) refresh_lock: AsyncMutex<()>,
     pub(crate) pool: Mutex<Pool>,
     pub(crate) sessions: Arc<session::CallerRegistry>,
     /// 到各网关节点的 bidi stream 发送端（node-pair 复用）。
     pub(crate) channels: Mutex<HashMap<String, Arc<dyn PeerSender>>>,
     /// 远程 SessionOpen 的 ack 等待表。
-    pub(crate) pending_opens: Mutex<HashMap<crate::SessionId, oneshot::Sender<Result<(), SendError>>>>,
+    pub(crate) pending_opens:
+        Mutex<HashMap<crate::SessionId, oneshot::Sender<Result<(), SendError>>>>,
     pub(crate) inbound_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     pub(crate) status: AtomicU8,
 }
@@ -212,31 +226,74 @@ impl ActorRef {
 }
 
 impl ClientInner {
-    /// 池中按 round-robin 选一个网关端点；池空时先刷新发现。
-    pub(crate) async fn pick_endpoint(&self) -> Result<Endpoint, SendError> {
-        let cached = {
-            let mut pool = self.pool.lock();
-            if pool.endpoints.is_empty() {
-                None
-            } else {
-                let endpoint = pool.endpoints[pool.next % pool.endpoints.len()].clone();
-                pool.next += 1;
-                Some(endpoint)
+    fn next_directory_refresh(&self) -> tokio::time::Instant {
+        let jitter = 0.8 + (rand::random::<u16>() % 401) as f64 / 1000.0;
+        tokio::time::Instant::now() + self.refresh_interval.mul_f64(jitter)
+    }
+
+    /// 从 Node Directory 刷新 Gateway Pool；到期刷新单飞，失败时保留旧池。
+    async fn refresh_directory_if_due(&self) -> Result<(), SendError> {
+        let due = {
+            let pool = self.pool.lock();
+            pool.endpoints.is_empty()
+                || pool
+                    .refresh_at
+                    .is_none_or(|refresh_at| tokio::time::Instant::now() >= refresh_at)
+        };
+        if !due {
+            return Ok(());
+        }
+
+        let _guard = self.refresh_lock.lock().await;
+        let due = {
+            let pool = self.pool.lock();
+            pool.endpoints.is_empty()
+                || pool
+                    .refresh_at
+                    .is_none_or(|refresh_at| tokio::time::Instant::now() >= refresh_at)
+        };
+        if !due {
+            return Ok(());
+        }
+
+        let nodes = match self.directory.list_nodes().await {
+            Ok(nodes) => nodes,
+            Err(_) => {
+                let mut pool = self.pool.lock();
+                if pool.endpoints.is_empty() {
+                    return Err(SendError::DirectoryUnavailable);
+                }
+                pool.refresh_at = Some(self.next_directory_refresh());
+                return Ok(());
             }
         };
-        if let Some(endpoint) = cached {
-            return Ok(endpoint);
-        }
-        let endpoints = self
-            .discovery
-            .resolve()
-            .await
-            .map_err(|_| SendError::OwnershipUnavailable)?;
-        if endpoints.is_empty() {
-            return Err(SendError::OwnershipUnavailable);
-        }
+        let mut endpoints: Vec<Endpoint> = nodes
+            .into_iter()
+            .filter(|node| {
+                node.protocol_version == PEER_PROTOCOL_VERSION
+                    && !node.draining
+                    && !node.advertised_address.trim().is_empty()
+            })
+            .map(|node| Endpoint::new(node.advertised_address))
+            .collect();
+        endpoints.sort();
+        endpoints.dedup();
+
         let mut pool = self.pool.lock();
         pool.endpoints = endpoints;
+        let endpoint_count = pool.endpoints.len().max(1);
+        pool.next %= endpoint_count;
+        pool.refresh_at = Some(self.next_directory_refresh());
+        Ok(())
+    }
+
+    /// Gateway Pool 中按 round-robin 选择节点。
+    pub(crate) async fn pick_endpoint(&self) -> Result<Endpoint, SendError> {
+        self.refresh_directory_if_due().await?;
+        let mut pool = self.pool.lock();
+        if pool.endpoints.is_empty() {
+            return Err(SendError::NoAvailableGateway);
+        }
         let endpoint = pool.endpoints[pool.next % pool.endpoints.len()].clone();
         pool.next += 1;
         Ok(endpoint)
@@ -315,28 +372,38 @@ impl ClientInner {
     }
 }
 
-fn envelope_session_open(address: &ActorAddress, session_id: crate::SessionId, version: u32) -> Envelope {
+fn envelope_session_open(
+    address: &ActorAddress,
+    session_id: crate::SessionId,
+    version: u32,
+) -> Envelope {
     Envelope {
         protocol_version: version,
         actor_type: address.actor_type().to_owned(),
         actor_id: address.actor_id().as_bytes().to_vec(),
         session_id: session_id.as_bytes(),
         from_node: String::new(),
-        kind: Some(envelope::Kind::SessionOpen(crate::peer_protocol::SessionOpen {
-            caller_endpoint: String::new(),
-        })),
+        kind: Some(envelope::Kind::SessionOpen(
+            crate::peer_protocol::SessionOpen {
+                caller_endpoint: String::new(),
+            },
+        )),
     }
 }
 
-pub(crate) fn envelope_action(address: &ActorAddress, session_id: crate::SessionId, payload: Vec<u8>) -> Envelope {
+pub(crate) fn envelope_action(
+    address: &ActorAddress,
+    session_id: crate::SessionId,
+    payload: Vec<u8>,
+) -> Envelope {
     Envelope {
         protocol_version: PEER_PROTOCOL_VERSION,
         actor_type: address.actor_type().to_owned(),
         actor_id: address.actor_id().as_bytes().to_vec(),
         session_id: session_id.as_bytes(),
         from_node: String::new(),
-        kind: Some(envelope::Kind::Action(crate::peer_protocol::ActionMessage {
-            payload,
-        })),
+        kind: Some(envelope::Kind::Action(
+            crate::peer_protocol::ActionMessage { payload },
+        )),
     }
 }

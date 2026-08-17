@@ -24,10 +24,7 @@ pub struct Spawned {
     pub(crate) completed: watch::Receiver<bool>,
 }
 
-pub fn try_send(
-    sender: &MailboxSender,
-    message: MailboxMessage,
-) -> Result<(), crate::SendError> {
+pub fn try_send(sender: &MailboxSender, message: MailboxMessage) -> Result<(), crate::SendError> {
     sender.try_send(message).map_err(|error| match error {
         mpsc::error::TrySendError::Full(_) => crate::SendError::MailboxFull,
         mpsc::error::TrySendError::Closed(_) => crate::SendError::ActorStopped,

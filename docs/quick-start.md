@@ -111,17 +111,17 @@ let server = coactor::test_support::TestServerBuilder::new(state)
 
 ## Run a cluster node
 
-Cluster mode runs an embedded Server node per process: an S3-backed ownership authority decides which node owns each Actor Address, and the Server acts as a gateway — it claims unowned actors (or forwards sessions to the current Owner, with placement and bounded retry). Callers connect through a `Client`, which discovers gateway nodes, keeps a pool, and opens Sessions through one of them.
+Cluster mode runs an embedded Server node per process. A Coordination Store provides the live Node Directory and Actor Ownership Authority; the Server acts as a Gateway that claims unowned Actors or forwards Sessions to the current Owner. Client reads the same Node Directory, maintains a Gateway Pool, and opens Sessions through one of its live nodes.
 
 ```rust,no_run
 use coactor::{
-    ClientBuilder, ClientConfig, Endpoint, ServerBuilder, StaticListDiscovery,
-    cluster::{ServerConfig, S3OwnershipConfig},
+    ClientBuilder, ClientConfig, CoordinationConfig, ServerBuilder,
+    cluster::{ServerConfig, S3CoordinationConfig},
 };
 
 # async fn start() -> Result<(), coactor::StartError> {
 // Server 节点（宿主 + 网关）
-let ownership = S3OwnershipConfig::local(
+let coordination = S3CoordinationConfig::local(
     "coactor",
     "development",
     "http://127.0.0.1:9000",
@@ -132,24 +132,22 @@ let server = ServerBuilder::cluster(
         "node-a",
         "0.0.0.0:7000".parse().unwrap(),
         "127.0.0.1:7000".parse().unwrap(),
-        ownership,
+        coordination.clone(),
     ),
 )
 .start()
 .await?;
 
-// Client（调用方）：发现网关节点 → 连接池 → 会话经网关中继
+// Client（调用方）：从 Node Directory 建立 Gateway Pool
 let client = ClientBuilder::new(ClientConfig {
-    discovery: StaticListDiscovery::new(vec![Endpoint::new(
-        "http://127.0.0.1:7000",
-    )]),
+    coordination: CoordinationConfig::S3(coordination),
 })
 .start();
 # Ok(())
 # }
 ```
 
-For production, construct `S3OwnershipConfig` with the deployment's bucket, prefix, region, credentials provider, and request timeout; use `DnsDiscovery` (e.g. a K8s headless service name) instead of `StaticListDiscovery`. Each node needs a unique advertised address and a stable operational Node ID; every runtime start creates a distinct Node Session internally.
+For production, construct separate `S3CoordinationConfig` values when Client and Server use different credentials. Client credentials need read-only access to the Node Directory, while Server credentials also mutate Node Leases and Actor Owner Records. Each node needs a unique advertised address and a stable operational Node ID; every runtime start creates a distinct Node Session internally.
 
 ## Semantics you should know
 

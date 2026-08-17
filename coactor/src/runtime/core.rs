@@ -43,7 +43,8 @@ pub(crate) struct ServerInner<S> {
     /// 入站连接的接收 task（shutdown 时中止，确保连接关闭）。
     pub inbound_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     /// 远程 SessionOpen 的 ack 等待表。
-    pub pending_opens: Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<Result<(), SendError>>>>,
+    pub pending_opens:
+        Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<Result<(), SendError>>>>,
     /// 出站连接用的 client transport（网关转发）；None = 本地单节点。
     pub client_transport: Option<Arc<dyn ClientTransport>>,
     /// 放置策略（未拥有 Actor 的候选选择）。
@@ -58,7 +59,6 @@ pub(crate) struct Relay {
     pub owner: String,
     pub client: Arc<dyn PeerSender>,
 }
-
 
 impl<S> ServerInner<S>
 where
@@ -168,10 +168,14 @@ where
         let actors = self.actors.lock();
         if let Some(route) = actors.get(address) {
             if let RouteState::Active = &route.state {
-                return route.task.sender.try_send(message).map_err(|error| match error {
-                    mpsc::error::TrySendError::Full(_) => SendError::MailboxFull,
-                    mpsc::error::TrySendError::Closed(_) => SendError::ActorStopped,
-                });
+                return route
+                    .task
+                    .sender
+                    .try_send(message)
+                    .map_err(|error| match error {
+                        mpsc::error::TrySendError::Full(_) => SendError::MailboxFull,
+                        mpsc::error::TrySendError::Closed(_) => SendError::ActorStopped,
+                    });
             }
         }
         Ok(())
@@ -212,7 +216,10 @@ where
                 address.actor_type().to_owned(),
             )));
         }
-        if !self.sessions.register_actor(address, session_id, sink.clone()) {
+        if !self
+            .sessions
+            .register_actor(address, session_id, sink.clone())
+        {
             return Ok(Err(SendError::ActorStopped));
         }
         let (complete, receive) = oneshot::channel();
@@ -239,7 +246,10 @@ where
                 }
                 self.dispatch_message(
                     address,
-                    MailboxMessage::Action { session_id, payload },
+                    MailboxMessage::Action {
+                        session_id,
+                        payload,
+                    },
                     None,
                     None,
                 )
@@ -317,7 +327,9 @@ where
             }
             runtime.notify_channel_closed(&closed_endpoint).await;
         });
-        self.channels.lock().insert(endpoint.to_owned(), sender.clone());
+        self.channels
+            .lock()
+            .insert(endpoint.to_owned(), sender.clone());
         Ok(sender)
     }
 
@@ -365,7 +377,7 @@ where
                     match reply.clone() {
                         Some(sender) => {
                             // 转发来的会话：确认自己是 owner 后宿主；属他人则拒绝（不二次转发，防环）。
-                            let outcome = if let Some(cluster) = &self.cluster {
+                            if let Some(cluster) = &self.cluster {
                                 match cluster.resolve(&address, &self.capacity).await {
                                     Ok(ResolvedOwner::Local { reservation, guard }) => {
                                         self.open_local_session(
@@ -388,8 +400,7 @@ where
                                     None,
                                 )
                                 .await
-                            };
-                            outcome
+                            }
                         }
                         None => Ok(Err(SendError::RemoteUnavailable)),
                     }
@@ -400,14 +411,14 @@ where
                 };
                 if let Some(sender) = reply {
                     let outcome = match result {
-                        Ok(Ok(())) => Some(
-                            crate::peer_protocol::session_opened_ack::Outcome::Ok(Vec::new()),
-                        ),
-                        Ok(Err(error)) | Err(error) => Some(
-                            crate::peer_protocol::session_opened_ack::Outcome::Failure(
+                        Ok(Ok(())) => Some(crate::peer_protocol::session_opened_ack::Outcome::Ok(
+                            Vec::new(),
+                        )),
+                        Ok(Err(error)) | Err(error) => {
+                            Some(crate::peer_protocol::session_opened_ack::Outcome::Failure(
                                 error.to_wire(),
-                            ),
-                        ),
+                            ))
+                        }
                     };
                     let _ = sender.try_send(crate::peer_protocol::Envelope {
                         protocol_version: 0,
@@ -552,15 +563,16 @@ where
                 self.forward_session_open(address, session_id, &Endpoint::new(endpoint), client)
                     .await
             }
-            Ok(OwnerStatus::Local) => self
-                .open_local_session(
+            Ok(OwnerStatus::Local) => {
+                self.open_local_session(
                     address,
                     session_id,
                     EventSink::Remote { sender: client },
                     None,
                     None,
                 )
-                .await,
+                .await
+            }
             Ok(OwnerStatus::Unowned) => Ok(Err(SendError::RuntimeAtCapacity)),
             Err(error) => Ok(Err(error)),
         }
@@ -703,7 +715,7 @@ where
                             // 网关语义：入站会话先只读判断所有权——已归自己则宿主，
                             // 归他人则转发给 owner，未拥有/stale 则走放置决策。
                             // 无 router 的单节点（TestServer）直接宿主。
-                            let outcome = if let Some(cluster) = &self.cluster {
+                            if let Some(cluster) = &self.cluster {
                                 match cluster.owner_only(&address).await {
                                     Ok(OwnerStatus::Local) => {
                                         self.open_local_session(
@@ -727,16 +739,12 @@ where
                                     Ok(OwnerStatus::Unowned) => {
                                         if envelope.from_node.is_empty() {
                                             // 来自 client：网关做放置决策。
-                                            self.place_session(&address, session_id, sender)
-                                                .await
+                                            self.place_session(&address, session_id, sender).await
                                         } else {
                                             // 转发来的会话：目标节点就地认领
                                             // （resolve 含 claim），不二次转发（防环）。
                                             match cluster.resolve(&address, &self.capacity).await {
-                                                Ok(ResolvedOwner::Local {
-                                                    reservation,
-                                                    guard,
-                                                }) => {
+                                                Ok(ResolvedOwner::Local { reservation, guard }) => {
                                                     self.open_local_session(
                                                         &address,
                                                         session_id,
@@ -761,8 +769,7 @@ where
                                     None,
                                 )
                                 .await
-                            };
-                            outcome
+                            }
                         }
                         None => Ok(Err(SendError::RemoteUnavailable)),
                     }
@@ -773,14 +780,14 @@ where
                 };
                 if let Some(sender) = reply {
                     let outcome = match result {
-                        Ok(Ok(())) => Some(
-                            crate::peer_protocol::session_opened_ack::Outcome::Ok(Vec::new()),
-                        ),
-                        Ok(Err(error)) | Err(error) => Some(
-                            crate::peer_protocol::session_opened_ack::Outcome::Failure(
+                        Ok(Ok(())) => Some(crate::peer_protocol::session_opened_ack::Outcome::Ok(
+                            Vec::new(),
+                        )),
+                        Ok(Err(error)) | Err(error) => {
+                            Some(crate::peer_protocol::session_opened_ack::Outcome::Failure(
                                 error.to_wire(),
-                            ),
-                        ),
+                            ))
+                        }
                     };
                     let _ = sender.try_send(crate::peer_protocol::Envelope {
                         protocol_version: 0,
@@ -855,7 +862,11 @@ impl<S> ServerInner<S>
 where
     S: Send + Sync + 'static,
 {
-    pub(crate) fn make_message_context(&self, address: &ActorAddress, session_id: SessionId) -> MessageContext {
+    pub(crate) fn make_message_context(
+        &self,
+        address: &ActorAddress,
+        session_id: SessionId,
+    ) -> MessageContext {
         MessageContext {
             address: address.clone(),
             session: super::session::SessionHandle {
@@ -908,4 +919,3 @@ fn envelope_session_close(session_id: SessionId) -> crate::peer_protocol::Envelo
         )),
     }
 }
-

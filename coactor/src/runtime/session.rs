@@ -1,14 +1,10 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
 use uuid::Uuid;
 
 use crate::transport::PeerSender;
 use crate::{ActorAddress, SendError};
-
 
 /// 本节点 Session 接收流的容量（出站 Event 背压上界）。
 /// Session 的唯一标识，由 caller 建立 Session 时生成。
@@ -33,9 +29,7 @@ impl SessionId {
 /// Session 的 Event 回传路径（owner 节点视角）：经该节点对间的 bidi stream 发送端回传。
 #[derive(Clone)]
 pub(crate) enum EventSink {
-    Remote {
-        sender: Arc<dyn PeerSender>,
-    },
+    Remote { sender: Arc<dyn PeerSender> },
 }
 
 /// Server 侧 Session 注册表：actor → 存活 Session 的回传路径。
@@ -52,7 +46,12 @@ impl SessionRegistry {
     }
 
     /// owner 侧注册一个 Actor 的存活 Session；重复注册返回 false。
-    pub(crate) fn register_actor(&self, address: &ActorAddress, session_id: SessionId, sink: EventSink) -> bool {
+    pub(crate) fn register_actor(
+        &self,
+        address: &ActorAddress,
+        session_id: SessionId,
+        sink: EventSink,
+    ) -> bool {
         self.by_actor
             .lock()
             .entry(address.clone())
@@ -66,7 +65,11 @@ impl SessionRegistry {
         let removed = by_actor
             .get_mut(address)
             .is_some_and(|sessions| sessions.remove(session_id).is_some());
-        if removed && by_actor.get(address).is_some_and(|sessions| sessions.is_empty()) {
+        if removed
+            && by_actor
+                .get(address)
+                .is_some_and(|sessions| sessions.is_empty())
+        {
             by_actor.remove(address);
         }
         removed
@@ -114,11 +117,9 @@ impl SessionRegistry {
                     actor_id: Vec::new(),
                     session_id: session_id.as_bytes(),
                     from_node: String::new(),
-                    kind: Some(
-                        crate::peer_protocol::envelope::Kind::Event(
-                            crate::peer_protocol::EventMessage { payload },
-                        ),
-                    ),
+                    kind: Some(crate::peer_protocol::envelope::Kind::Event(
+                        crate::peer_protocol::EventMessage { payload },
+                    )),
                 })
                 .map_err(|_| SendError::RemoteUnavailable),
             None => Err(SendError::ActorStopped),
@@ -142,13 +143,11 @@ impl SessionRegistry {
                     actor_id: Vec::new(),
                     session_id: session_id.as_bytes(),
                     from_node: String::new(),
-                    kind: Some(
-                        crate::peer_protocol::envelope::Kind::SessionError(
-                            crate::peer_protocol::SessionError {
-                                failure: error.to_wire(),
-                            },
-                        ),
-                    ),
+                    kind: Some(crate::peer_protocol::envelope::Kind::SessionError(
+                        crate::peer_protocol::SessionError {
+                            failure: error.to_wire(),
+                        },
+                    )),
                 });
             }
             None => {}
@@ -186,4 +185,3 @@ impl SessionHandle {
             .await
     }
 }
-

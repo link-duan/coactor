@@ -35,12 +35,10 @@ pub(crate) struct GrpcPeerSender {
 
 impl PeerSender for GrpcPeerSender {
     fn try_send(&self, envelope: peer_protocol::Envelope) -> Result<(), TransportError> {
-        self.sender
-            .try_send(envelope)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => TransportError::Full,
-                mpsc::error::TrySendError::Closed(_) => TransportError::Closed,
-            })
+        self.sender.try_send(envelope).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => TransportError::Full,
+            mpsc::error::TrySendError::Closed(_) => TransportError::Closed,
+        })
     }
 }
 
@@ -100,7 +98,9 @@ impl peer_protocol::peer_server::Peer for GrpcPeerService {
         let inbound = request.into_inner();
         let (outbound_tx, outbound_rx) = mpsc::channel::<peer_protocol::Envelope>(1);
         let stream: Box<dyn PeerStream> = Box::new(GrpcPeerStream {
-            sender: Arc::new(GrpcPeerSender { sender: outbound_tx }),
+            sender: Arc::new(GrpcPeerSender {
+                sender: outbound_tx,
+            }),
             inbound,
         });
         self.accepted
@@ -128,16 +128,13 @@ impl ServerTransport for GrpcTransport {
         let task = tokio::spawn(async move {
             let serve = tonic::transport::Server::builder()
                 .add_service(peer_protocol::peer_server::PeerServer::new(service))
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(listener),
-                    async move {
-                        let mut rx = shutdown_rx;
-                        let _ = rx.changed().await;
-                    },
-                );
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let mut rx = shutdown_rx;
+                    let _ = rx.changed().await;
+                });
             let _ = serve.await;
         });
-        let _ = task;
+        drop(task);
         Ok(Box::new(GrpcPeerListener {
             accepted: accepted_rx,
             shutdown: shutdown_tx,
@@ -147,10 +144,7 @@ impl ServerTransport for GrpcTransport {
 
 #[async_trait::async_trait]
 impl ClientTransport for GrpcTransport {
-    async fn connect(
-        &self,
-        endpoint: &Endpoint,
-    ) -> Result<Box<dyn PeerStream>, TransportError> {
+    async fn connect(&self, endpoint: &Endpoint) -> Result<Box<dyn PeerStream>, TransportError> {
         let endpoint_str = endpoint.as_str().to_owned();
         let endpoint = tonic::transport::Endpoint::new(endpoint_str.clone())
             .map_err(|error| TransportError::ConnectFailed(error.to_string()))?;
@@ -169,7 +163,9 @@ impl ClientTransport for GrpcTransport {
         .map_err(|error| TransportError::ConnectFailed(error.to_string()))?
         .into_inner();
         Ok(Box::new(GrpcPeerStream {
-            sender: Arc::new(GrpcPeerSender { sender: outbound_tx }),
+            sender: Arc::new(GrpcPeerSender {
+                sender: outbound_tx,
+            }),
             inbound,
         }) as Box<dyn PeerStream>)
     }

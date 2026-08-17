@@ -114,9 +114,8 @@ pub enum MessageOutcome {
 /// 类型擦除的 dispatch 能力（非泛型，macro 生成 impl）：
 /// 在具体类型上下文中调用 `Actor` 的 async fn，使 Send 自动继承生效。
 pub trait ErasedActor: Send + 'static {
-    fn activate<'a>(
-        actor: &'a mut (dyn std::any::Any + Send),
-    ) -> BoxFuture<'a, Result<(), String>>;
+    fn activate<'a>(actor: &'a mut (dyn std::any::Any + Send))
+    -> BoxFuture<'a, Result<(), String>>;
 
     fn deactivate<'a>(
         actor: &'a mut (dyn std::any::Any + Send),

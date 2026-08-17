@@ -43,28 +43,28 @@ impl Actor<AppState> for TestActor {
 
     async fn on_message(&mut self, ctx: &MessageContext, msg: &[u8]) {
         match msg {
-                b"add" => {
-                    self.value += 1;
-                    let _ = ctx.send(self.value.to_be_bytes().to_vec()).await;
-                }
-                b"echo" => {
-                    let _ = ctx.send(b"echoed".to_vec()).await;
-                }
-                b"broadcast" => {
-                    self.runtime.broadcast(b"broadcasted".to_vec()).await;
-                }
-                b"sleep" => {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                }
-                b"block" => {
-                    self.state.entered.notify_one();
-                    self.state.release.notified().await;
-                }
-                b"panic" => panic!("session test failure"),
-                _ => {
-                    let _ = ctx.send(b"unknown".to_vec()).await;
-                }
+            b"add" => {
+                self.value += 1;
+                let _ = ctx.send(self.value.to_be_bytes().to_vec()).await;
             }
+            b"echo" => {
+                let _ = ctx.send(b"echoed".to_vec()).await;
+            }
+            b"broadcast" => {
+                self.runtime.broadcast(b"broadcasted".to_vec()).await;
+            }
+            b"sleep" => {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            b"block" => {
+                self.state.entered.notify_one();
+                self.state.release.notified().await;
+            }
+            b"panic" => panic!("session test failure"),
+            _ => {
+                let _ = ctx.send(b"unknown".to_vec()).await;
+            }
+        }
     }
 
     async fn on_activate(&mut self) -> Result<(), String> {
@@ -92,21 +92,23 @@ async fn session_carries_bidirectional_messages() {
         .start()
         .await
         .expect("runtime builds");
-    let actor = server.client().actor("session-test", ActorId::from("bidirectional"));
+    let actor = server
+        .client()
+        .actor("session-test", ActorId::from("bidirectional"));
 
     let mut session = actor.open().await.expect("open succeeds");
     // on_session_opened 立即推送
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
-    session.send(b"add".to_vec()).await.expect("action accepted");
-    assert_eq!(
-        session.recv().await,
-        Some(Ok(1i64.to_be_bytes().to_vec()))
-    );
-    session.send(b"add".to_vec()).await.expect("action accepted");
-    assert_eq!(
-        session.recv().await,
-        Some(Ok(2i64.to_be_bytes().to_vec()))
-    );
+    session
+        .send(b"add".to_vec())
+        .await
+        .expect("action accepted");
+    assert_eq!(session.recv().await, Some(Ok(1i64.to_be_bytes().to_vec())));
+    session
+        .send(b"add".to_vec())
+        .await
+        .expect("action accepted");
+    assert_eq!(session.recv().await, Some(Ok(2i64.to_be_bytes().to_vec())));
 
     server.shutdown().await;
 }
@@ -118,14 +120,19 @@ async fn on_session_opened_and_broadcast_reach_all_sessions() {
         .start()
         .await
         .expect("runtime builds");
-    let actor = server.client().actor("session-test", ActorId::from("broadcast"));
+    let actor = server
+        .client()
+        .actor("session-test", ActorId::from("broadcast"));
 
     let mut first = actor.open().await.expect("first session");
     assert_eq!(first.recv().await, Some(Ok(b"opened".to_vec())));
     let mut second = actor.open().await.expect("second session");
     assert_eq!(second.recv().await, Some(Ok(b"opened".to_vec())));
 
-    first.send(b"broadcast".to_vec()).await.expect("action accepted");
+    first
+        .send(b"broadcast".to_vec())
+        .await
+        .expect("action accepted");
     assert_eq!(first.recv().await, Some(Ok(b"broadcasted".to_vec())));
     assert_eq!(second.recv().await, Some(Ok(b"broadcasted".to_vec())));
 
@@ -141,7 +148,9 @@ async fn live_sessions_block_passivation() {
         .start()
         .await
         .expect("runtime builds");
-    let actor = server.client().actor("session-test", ActorId::from("passivation"));
+    let actor = server
+        .client()
+        .actor("session-test", ActorId::from("passivation"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
@@ -166,11 +175,16 @@ async fn panic_terminates_sessions_with_actor_stopped() {
         .start()
         .await
         .expect("runtime builds");
-    let actor = server.client().actor("session-test", ActorId::from("panic"));
+    let actor = server
+        .client()
+        .actor("session-test", ActorId::from("panic"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
-    session.send(b"panic".to_vec()).await.expect("action accepted");
+    session
+        .send(b"panic".to_vec())
+        .await
+        .expect("action accepted");
     assert_eq!(session.recv().await, Some(Err(SendError::ActorStopped)));
 
     server.shutdown().await;
@@ -184,7 +198,9 @@ async fn mailbox_full_returns_send_error_without_terminating_session() {
         .start()
         .await
         .expect("runtime builds");
-    let actor = server.client().actor("session-test", ActorId::from("overload"));
+    let actor = server
+        .client()
+        .actor("session-test", ActorId::from("overload"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
@@ -206,10 +222,7 @@ async fn mailbox_full_returns_send_error_without_terminating_session() {
 
     // 释放 sleep 后 actor 恢复处理
     tokio::time::advance(Duration::from_secs(10)).await;
-    assert_eq!(
-        session.recv().await,
-        Some(Ok(1i64.to_be_bytes().to_vec()))
-    );
+    assert_eq!(session.recv().await, Some(Ok(1i64.to_be_bytes().to_vec())));
 
     server.shutdown().await;
 }
@@ -221,13 +234,18 @@ async fn shutdown_terminates_sessions_with_runtime_shutting_down() {
         .start()
         .await
         .expect("runtime builds");
-    let actor = server.client().actor("session-test", ActorId::from("shutdown"));
+    let actor = server
+        .client()
+        .actor("session-test", ActorId::from("shutdown"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));
 
     server.shutdown().await;
-    assert_eq!(session.recv().await, Some(Err(SendError::RuntimeShuttingDown)));
+    assert_eq!(
+        session.recv().await,
+        Some(Err(SendError::RuntimeShuttingDown))
+    );
 }
 
 #[tokio::test]
@@ -238,7 +256,9 @@ async fn actions_from_one_session_are_processed_in_order() {
         .start()
         .await
         .expect("runtime builds");
-    let actor = server.client().actor("session-test", ActorId::from("ordering"));
+    let actor = server
+        .client()
+        .actor("session-test", ActorId::from("ordering"));
 
     let mut session = actor.open().await.expect("open succeeds");
     assert_eq!(session.recv().await, Some(Ok(b"opened".to_vec())));

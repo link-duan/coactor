@@ -135,6 +135,10 @@ pub enum SendError {
     NodeFenced,
     #[error("the remote runtime is unavailable")]
     RemoteUnavailable,
+    #[error("the Node Directory is unavailable")]
+    DirectoryUnavailable,
+    #[error("the Node Directory has no available Gateway")]
+    NoAvailableGateway,
     #[error("distributed ownership is unavailable")]
     OwnershipUnavailable,
     #[error("the remote runtime rejected the protocol: {0}")]
@@ -166,6 +170,9 @@ impl SendError {
             Self::RuntimeStopped => RuntimeFailure::RuntimeStopped,
             Self::NodeFenced => RuntimeFailure::NodeFenced,
             Self::RemoteUnavailable => RuntimeFailure::RemoteUnavailable,
+            Self::DirectoryUnavailable | Self::NoAvailableGateway => {
+                RuntimeFailure::RemoteUnavailable
+            }
             Self::OwnershipUnavailable => RuntimeFailure::OwnershipUnavailable,
             Self::RemoteProtocol(_) => RuntimeFailure::ProtocolMismatch,
         }) as i32

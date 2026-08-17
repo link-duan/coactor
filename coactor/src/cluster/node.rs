@@ -9,11 +9,12 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, watch};
 
-use super::{confirm_node_lease, wall_time_millis};
+use super::confirm_node_lease;
 use crate::{
-    __macro::ServerInner, transport::{Endpoint, ServerTransport}, LeaseMutation,
-    LeaseTiming, NodeLease, NodeSessionId, OwnershipBackend, ServerTermination,
-    ServerTerminationReason,
+    __macro::ServerInner,
+    LeaseMutation, LeaseTiming, LeaseToken, NodeLeaseStore, NodeRecord, NodeSessionId,
+    ServerTermination, ServerTerminationReason,
+    transport::{Endpoint, ServerTransport},
 };
 
 pub struct NodeAuthority {
@@ -78,9 +79,9 @@ pub struct RenewalTask {
 }
 
 struct RenewalExit {
-    storage: Arc<dyn OwnershipBackend>,
+    leases: Arc<dyn NodeLeaseStore>,
     session_id: NodeSessionId,
-    etag: String,
+    token: LeaseToken,
     release: bool,
 }
 
@@ -97,8 +98,8 @@ impl ClusterTasks {
         if let Ok(exit) = self.renewal.task.await {
             if exit.release {
                 let _ = exit
-                    .storage
-                    .release_node_lease(&exit.session_id, &exit.etag)
+                    .leases
+                    .release_node(&exit.session_id, &exit.token)
                     .await;
             }
         }
@@ -160,9 +161,9 @@ where
 pub fn spawn_lease_renewal<S>(
     runtime: Arc<ServerInner<S>>,
     authority: Arc<NodeAuthority>,
-    storage: Arc<dyn OwnershipBackend>,
-    mut lease: NodeLease,
-    mut etag: String,
+    leases: Arc<dyn NodeLeaseStore>,
+    mut node: NodeRecord,
+    mut token: LeaseToken,
     timing: LeaseTiming,
 ) -> RenewalTask
 where
@@ -176,9 +177,9 @@ where
             tokio::select! {
                 _ = tokio::time::sleep_until(wake_at) => {}
                 _ = &mut shutdown_receiver => return RenewalExit {
-                    storage,
-                    session_id: lease.session_id,
-                    etag,
+                    leases,
+                    session_id: node.session_id,
+                    token,
                     release: true,
                 },
             }
@@ -186,40 +187,39 @@ where
                 authority.fence();
                 runtime.fence().await;
                 return RenewalExit {
-                    storage,
-                    session_id: lease.session_id,
-                    etag,
+                    leases,
+                    session_id: node.session_id,
+                    token,
                     release: false,
                 };
             }
             let operation_started = tokio::time::Instant::now();
-            runtime.update_capacity_sample(&mut lease);
-            lease.expires_at_unix_ms =
-                wall_time_millis().saturating_add(timing.ttl.as_millis() as u64);
+            node.lease_generation = node.lease_generation.saturating_add(1);
+            runtime.update_capacity_sample(&mut node);
             let Some(remaining) = authority.remaining() else {
                 authority.fence();
                 runtime.fence().await;
                 return RenewalExit {
-                    storage,
-                    session_id: lease.session_id,
-                    etag,
+                    leases,
+                    session_id: node.session_id,
+                    token,
                     release: false,
                 };
             };
             let outcome = tokio::time::timeout(
                 timing.operation_timeout.min(remaining),
-                storage.renew_node_lease(lease.clone(), &etag),
+                leases.renew_node(node.clone(), timing.ttl, &token),
             )
             .await;
             match outcome {
-                Ok(Ok(LeaseMutation::Applied { etag: next })) => {
-                    etag = next;
+                Ok(Ok(LeaseMutation::Applied { token: next })) => {
+                    token = next;
                     authority.renew(operation_started);
                 }
                 Ok(Ok(LeaseMutation::Ambiguous(_))) => {
                     let Some(next) = confirm_node_lease(
-                        storage.as_ref(),
-                        &lease,
+                        leases.as_ref(),
+                        &node,
                         authority.deadline(),
                         timing.operation_timeout,
                     )
@@ -228,22 +228,22 @@ where
                         authority.fence();
                         runtime.fence().await;
                         return RenewalExit {
-                            storage,
-                            session_id: lease.session_id,
-                            etag,
+                            leases,
+                            session_id: node.session_id,
+                            token,
                             release: false,
                         };
                     };
-                    etag = next;
+                    token = next;
                     authority.renew(operation_started);
                 }
-                Ok(Ok(LeaseMutation::ConditionalRejected)) => {
+                Ok(Ok(LeaseMutation::Conflict)) => {
                     authority.fence();
                     runtime.fence().await;
                     return RenewalExit {
-                        storage,
-                        session_id: lease.session_id,
-                        etag,
+                        leases,
+                        session_id: node.session_id,
+                        token,
                         release: false,
                     };
                 }
@@ -251,9 +251,9 @@ where
                     authority.fence();
                     runtime.fence().await;
                     return RenewalExit {
-                        storage,
-                        session_id: lease.session_id,
-                        etag,
+                        leases,
+                        session_id: node.session_id,
+                        token,
                         release: false,
                     };
                 }

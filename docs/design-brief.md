@@ -13,13 +13,13 @@ consumer application
     │ Client.actor("room", id).open() → Session      │ Server 侧：Actor 宿主
     ▼                                                ▼
 Client (调用方)                                Server (宿主 + 网关)
-    ├── Service Discovery → 网关池 → 会话经网关中继     ├── registry, mailbox, lifecycle
-    └── transport seam (connect 半部)                └── 网关放置/转发 + ownership
-        │                                            ├── transport seam (accept 半部)
-        └──────── 双向 Envelope 流（gRPC / inmem）─────┘
-                            S3 Ownership Authority
-                                ├── Node Lease
-                                └── Actor Owner Record + Ownership Epoch
+    ├── Node Directory → Gateway Pool → 会话经网关中继  ├── registry, mailbox, lifecycle
+    └── transport seam (connect 半部)                  └── 网关放置/转发 + ownership
+        │                                              ├── transport seam (accept 半部)
+        └──────── 双向 Envelope 流（gRPC / inmem）───────┘
+                         Coordination Store
+                       ├── live Node Directory / Node Lease
+                       └── Actor Owner Record + Ownership Epoch
 ```
 
 - `ServerBuilder::local`（测试便利，经 `test_support::TestServer`）与 `ServerBuilder::cluster`（分布式）分别选择运行形态；两者都经 `start()` 异步启动。`Client` 是独立于 `Server` 的调用方入口（ADR-0008）。
@@ -29,8 +29,8 @@ Client (调用方)                                Server (宿主 + 网关)
 - Passivation fires only when no live Session remains for the Actor; failover explicitly breaks Sessions (callers re-`open()`), detected lazily on the next send.
 - Cluster mode uses Node Leases for runtime authority and Actor Owner Records for per-address routing and monotonically fenced takeover.
 - Gateways resolve ownership on session ingress: claim unowned/stale actors (placement strategy, bounded retry) or forward sessions to the current Owner over a per-session relay; Owner or gateway failure explicitly breaks the Session (ADR-0008).
-- The public cluster API uses the built-in S3 authority. The transport and backend abstractions are crate-private seams: grpc + inmem transport, S3 backend with deterministic fakes.
-- Callers never touch the authority: Client discovers gateways (Service Discovery), keeps a pool, and opens Sessions through a gateway; transport-level open failures fail over to another pool node.
+- The public cluster API selects a built-in Coordination Store through `CoordinationConfig`; S3 is the currently delivered variant. Node Directory, Node Lease, Actor Owner and transport capabilities remain crate-private seams with deterministic fakes.
+- Client reads the Coordination Store's Node Directory, keeps a Gateway Pool, and opens Sessions through a live Gateway; transport-level open failures fail over to another pool node. Client credentials are read-only and cannot mutate Node Leases or Actor Owner Records.
 
 ## Delivered guarantees
 

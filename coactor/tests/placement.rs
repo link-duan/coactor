@@ -1,17 +1,17 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::client::discovery::StaticListDiscovery;
 use crate::client::{Client, ClientBuilder};
-use crate::test_support::{TestOwnershipBackend, start_cluster_inmem};
-use crate::transport::inmem::{InmemRegistry, InmemTransport};
+use crate::test_support::{TestCoordinationStore, start_cluster_inmem};
 use crate::transport::Endpoint;
+use crate::transport::inmem::{InmemRegistry, InmemTransport};
 use crate::{
-    Actor, ActorAddress, ActorId, ActorOwner, ActorOwnerRecord, ActorRuntime, MessageContext,
-    OwnershipBackend, PlacementCtx, PlacementStrategy, Server, ServerBuilder, SendError, actor,
+    Actor, ActorAddress, ActorId, ActorOwner, ActorOwnerRecord, ActorOwnerStore, ActorRuntime,
+    LeaseMutation, LeaseToken, MessageContext, Mutation, NodeDirectory, NodeLeaseStore, NodeRecord,
+    PlacementCtx, PlacementStrategy, Revision, SendError, Server, ServerBuilder, actor,
 };
 
 #[derive(Default, Clone)]
@@ -19,12 +19,12 @@ struct AppState;
 
 #[actor]
 struct EchoActor {
-    runtime: ActorRuntime<AppState>,
+    _runtime: ActorRuntime<AppState>,
 }
 
 impl Actor<AppState> for EchoActor {
     fn new(runtime: ActorRuntime<AppState>) -> Self {
-        Self { runtime }
+        Self { _runtime: runtime }
     }
 
     async fn on_message(&mut self, ctx: &MessageContext, msg: &[u8]) {
@@ -48,34 +48,44 @@ impl PlacementStrategy for FixedPlacement {
 
 /// 预置节点 lease 的负载快照（active/max/pressured），供默认 p2c 策略决策。
 async fn preset_lease(
-    storage: &Arc<dyn OwnershipBackend>,
+    storage: &Arc<TestCoordinationStore>,
     node_id: &str,
     active: usize,
     max: usize,
     pressured: bool,
 ) {
-    let leases = storage.list_node_leases().await.unwrap();
-    let entry = leases
-        .iter()
-        .find(|entry| entry.lease.node_id == node_id)
-        .expect("node lease");
-    let mut lease = entry.lease.clone();
-    lease.active_actor_count = active;
-    lease.max_actor_count = max;
-    lease.pressured = pressured;
+    let node = storage
+        .list_nodes()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|node| node.node_id == node_id)
+        .expect("Node Lease");
+    let (_, token) = storage
+        .read_node_lease(&node.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut node = node;
+    node.active_actor_count = active;
+    node.max_actor_count = max;
+    node.pressured = pressured;
     let mutation = storage
-        .renew_node_lease(lease, &entry.etag)
+        .renew_node(node, Duration::from_secs(10), &token)
         .await
         .unwrap();
-    assert!(matches!(mutation, crate::LeaseMutation::Applied { .. }));
+    assert!(matches!(mutation, LeaseMutation::Applied { .. }));
 }
 
-async fn server_with_placement(
-    storage: Arc<dyn OwnershipBackend>,
+async fn server_with_placement<T>(
+    storage: Arc<T>,
     node_id: &str,
     registry: Arc<InmemRegistry>,
     placement: Arc<dyn PlacementStrategy>,
-) -> Server<AppState> {
+) -> Server<AppState>
+where
+    T: NodeDirectory + NodeLeaseStore + ActorOwnerStore,
+{
     start_cluster_inmem(
         ServerBuilder::local(AppState)
             .with_placement_strategy(placement)
@@ -87,59 +97,95 @@ async fn server_with_placement(
     .await
 }
 
-fn inmem_client(registry: Arc<InmemRegistry>, endpoint: &str) -> Client {
-    ClientBuilder::with_transport(
-        Arc::new(InmemTransport::new(registry)),
-        StaticListDiscovery::new(vec![Endpoint::new(endpoint)]),
-    )
-    .start()
+fn inmem_client(registry: Arc<InmemRegistry>, directory: Arc<dyn NodeDirectory>) -> Client {
+    ClientBuilder::with_transport(Arc::new(InmemTransport::new(registry)), directory).start()
 }
 
 /// 对目标地址的**首次**读取谎报"未拥有"，之后转交真实 backend——模拟
 /// 网关读-认领窗口内被他人抢先的竞态（确定性触发 NotOwner 路径）。
 struct FirstReadUnowned {
-    inner: Arc<TestOwnershipBackend>,
+    inner: Arc<TestCoordinationStore>,
     target: ActorAddress,
     lied: AtomicBool,
 }
 
 #[async_trait]
-impl OwnershipBackend for FirstReadUnowned {
-    async fn acquire_node_lease(&self, lease: crate::NodeLease) -> Result<crate::LeaseMutation, crate::OwnershipBackendError> {
-        self.inner.acquire_node_lease(lease).await
+impl NodeDirectory for FirstReadUnowned {
+    async fn read_node(
+        &self,
+        session_id: &crate::NodeSessionId,
+    ) -> Result<Option<NodeRecord>, crate::CoordinationError> {
+        self.inner.read_node(session_id).await
     }
-    async fn read_node_lease(&self, session_id: &crate::NodeSessionId) -> Result<Option<crate::VersionedNodeLease>, crate::OwnershipBackendError> {
+
+    async fn list_nodes(&self) -> Result<Vec<NodeRecord>, crate::CoordinationError> {
+        self.inner.list_nodes().await
+    }
+}
+
+#[async_trait]
+impl NodeLeaseStore for FirstReadUnowned {
+    async fn read_node_lease(
+        &self,
+        session_id: &crate::NodeSessionId,
+    ) -> Result<Option<(NodeRecord, LeaseToken)>, crate::CoordinationError> {
         self.inner.read_node_lease(session_id).await
     }
-    async fn list_node_leases(&self) -> Result<Vec<crate::VersionedNodeLease>, crate::OwnershipBackendError> {
-        self.inner.list_node_leases().await
+
+    async fn acquire_node(
+        &self,
+        node: NodeRecord,
+        ttl: Duration,
+    ) -> Result<LeaseMutation, crate::CoordinationError> {
+        self.inner.acquire_node(node, ttl).await
     }
-    async fn renew_node_lease(&self, lease: crate::NodeLease, etag: &str) -> Result<crate::LeaseMutation, crate::OwnershipBackendError> {
-        self.inner.renew_node_lease(lease, etag).await
+
+    async fn renew_node(
+        &self,
+        node: NodeRecord,
+        ttl: Duration,
+        token: &LeaseToken,
+    ) -> Result<LeaseMutation, crate::CoordinationError> {
+        self.inner.renew_node(node, ttl, token).await
     }
-    async fn release_node_lease(&self, session_id: &crate::NodeSessionId, etag: &str) -> Result<crate::LeaseMutation, crate::OwnershipBackendError> {
-        self.inner.release_node_lease(session_id, etag).await
+
+    async fn release_node(
+        &self,
+        session_id: &crate::NodeSessionId,
+        token: &LeaseToken,
+    ) -> Result<LeaseMutation, crate::CoordinationError> {
+        self.inner.release_node(session_id, token).await
     }
-    async fn read_actor_owner(&self, address: &ActorAddress) -> Result<Option<crate::VersionedActorOwnerRecord>, crate::OwnershipBackendError> {
+}
+
+#[async_trait]
+impl ActorOwnerStore for FirstReadUnowned {
+    async fn read_actor_owner(
+        &self,
+        address: &ActorAddress,
+    ) -> Result<Option<crate::VersionedActorOwnerRecord>, crate::CoordinationError> {
         if address == &self.target && !self.lied.swap(true, Ordering::SeqCst) {
             return Ok(None);
         }
         self.inner.read_actor_owner(address).await
     }
-    async fn claim_actor_owner(
+
+    async fn compare_exchange_actor_owner(
         &self,
         address: &ActorAddress,
         record: ActorOwnerRecord,
-        etag: Option<&str>,
-    ) -> Result<crate::LeaseMutation, crate::OwnershipBackendError> {
-        self.inner.claim_actor_owner(address, record, etag).await
+        revision: Option<&Revision>,
+    ) -> Result<Mutation, crate::CoordinationError> {
+        self.inner
+            .compare_exchange_actor_owner(address, record, revision)
+            .await
     }
 }
 
 /// 转发目标被抢先认领（NotOwner）→ 网关重解析并转发给真 owner，会话照常建立。
 #[tokio::test]
 async fn placement_forwards_to_actual_owner_when_claim_raced() {
-    let inner = Arc::new(TestOwnershipBackend::default());
+    let inner = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     let server_b = start_cluster_inmem(
         ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
@@ -157,20 +203,20 @@ async fn placement_forwards_to_actual_owner_when_claim_raced() {
     .await;
     let address = ActorAddress::new("placement-echo", ActorId::from("raced-1"));
     // C 先认领目标地址（竞态的另一方）
-    let c_lease = inner
-        .list_node_leases()
+    let c_node = inner
+        .list_nodes()
         .await
         .unwrap()
         .into_iter()
-        .find(|entry| entry.lease.node_id == "C")
+        .find(|node| node.node_id == "C")
         .unwrap();
     inner
-        .claim_actor_owner(
+        .compare_exchange_actor_owner(
             &address,
             ActorOwnerRecord {
                 owner: Some(ActorOwner {
                     node_id: "C".to_owned(),
-                    session_id: c_lease.lease.session_id,
+                    session_id: c_node.session_id,
                 }),
                 ownership_epoch: 1,
             },
@@ -180,20 +226,20 @@ async fn placement_forwards_to_actual_owner_when_claim_raced() {
         .unwrap();
 
     // 网关 A：首次读取谎报 Unowned → 放置到 B → B 发现 owner=C → NotOwner → 转发给 C
-    let storage: Arc<dyn OwnershipBackend> = Arc::new(FirstReadUnowned {
+    let storage = Arc::new(FirstReadUnowned {
         inner: inner.clone(),
         target: address.clone(),
         lied: AtomicBool::new(false),
     });
     let server_a = server_with_placement(
-        storage,
+        storage.clone(),
         "A",
         registry.clone(),
         Arc::new(FixedPlacement(vec![Endpoint::new("node-B")])),
     )
     .await;
 
-    let client = inmem_client(registry.clone(), "node-A");
+    let client = inmem_client(registry.clone(), storage.clone());
     let mut session = client
         .actor("placement-echo", ActorId::from("raced-1"))
         .open()
@@ -224,7 +270,7 @@ async fn placement_forwards_to_actual_owner_when_claim_raced() {
 /// 候选不可达 → 剔除后继续试下一个；全部不可达 → 报错。
 #[tokio::test]
 async fn placement_skips_unreachable_candidates() {
-    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     let server_b = start_cluster_inmem(
         ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
@@ -244,7 +290,7 @@ async fn placement_skips_unreachable_candidates() {
     )
     .await;
 
-    let client = inmem_client(registry.clone(), "node-A");
+    let client = inmem_client(registry.clone(), storage.clone());
     let mut session = client
         .actor("placement-echo", ActorId::from("unreach-1"))
         .open()
@@ -270,10 +316,10 @@ async fn placement_skips_unreachable_candidates() {
 /// 全部候选不可达 → RuntimeAtCapacity。
 #[tokio::test]
 async fn placement_reports_capacity_exhausted_when_all_candidates_unreachable() {
-    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     let server_a = server_with_placement(
-        storage,
+        storage.clone(),
         "A",
         registry.clone(),
         Arc::new(FixedPlacement(vec![
@@ -283,7 +329,7 @@ async fn placement_reports_capacity_exhausted_when_all_candidates_unreachable() 
     )
     .await;
 
-    let client = inmem_client(registry.clone(), "node-A");
+    let client = inmem_client(registry.clone(), storage.clone());
     let err = match client
         .actor("placement-echo", ActorId::from("unreach-2"))
         .open()
@@ -301,7 +347,7 @@ async fn placement_reports_capacity_exhausted_when_all_candidates_unreachable() 
 /// Client：池内某网关不可达 → open() 自动驱逐并换下一个（传输层重试）。
 #[tokio::test]
 async fn client_open_fails_over_to_other_gateway_when_one_is_down() {
-    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     let server_b = start_cluster_inmem(
         ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
@@ -313,7 +359,7 @@ async fn client_open_fails_over_to_other_gateway_when_one_is_down() {
     // node-A 从未启动（endpoint 未注册）
     let client = ClientBuilder::with_transport(
         Arc::new(InmemTransport::new(registry.clone())),
-        StaticListDiscovery::new(vec![Endpoint::new("node-A"), Endpoint::new("node-B")]),
+        storage.clone(),
     )
     .start();
 
@@ -346,7 +392,7 @@ async fn client_open_fails_over_to_other_gateway_when_one_is_down() {
 /// 默认策略（空候选）→ 网关就地认领；注入策略 → 会话转发到目标节点。
 #[tokio::test]
 async fn placement_forwards_unowned_actor_to_strategy_target() {
-    let storage = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     let server_b = start_cluster_inmem(
         ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
@@ -363,7 +409,7 @@ async fn placement_forwards_unowned_actor_to_strategy_target() {
     )
     .await;
 
-    let client = inmem_client(registry.clone(), "node-A");
+    let client = inmem_client(registry.clone(), storage.clone());
     let mut session = client
         .actor("placement-echo", ActorId::from("placed-1"))
         .open()
@@ -396,7 +442,7 @@ async fn placement_forwards_unowned_actor_to_strategy_target() {
 /// 目标满 → 试下一个候选。
 #[tokio::test]
 async fn placement_skips_full_candidate() {
-    let storage = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     // B 容量 1 且已占用；C 正常。B 注入空策略：busy 会话就地认领占用容量
     // （默认 p2c 会把 busy 转发走，无法占满 B）。
@@ -429,7 +475,7 @@ async fn placement_skips_full_candidate() {
     .await;
 
     // 占用 B 的容量（一个会话经 B → B claim，permit 归 Route 持有）
-    let busy_client = inmem_client(registry.clone(), "node-B");
+    let busy_client = inmem_client(registry.clone(), storage.clone());
     let mut busy = busy_client
         .actor("placement-echo", ActorId::from("busy"))
         .open()
@@ -438,7 +484,7 @@ async fn placement_skips_full_candidate() {
     assert_eq!(busy.recv().await, Some(Ok(b"opened".to_vec())));
 
     // B 满 → 试下一个候选 C
-    let client = inmem_client(registry.clone(), "node-A");
+    let client = inmem_client(registry.clone(), storage.clone());
     let mut session = client
         .actor("placement-echo", ActorId::from("placed-2"))
         .open()
@@ -454,7 +500,11 @@ async fn placement_skips_full_candidate() {
         .unwrap()
         .unwrap()
         .record;
-    assert_eq!(record.owner.as_ref().unwrap().node_id, "C", "skip full B, place on C");
+    assert_eq!(
+        record.owner.as_ref().unwrap().node_id,
+        "C",
+        "skip full B, place on C"
+    );
 
     client.shutdown().await;
     server_a.shutdown().await;
@@ -465,7 +515,7 @@ async fn placement_skips_full_candidate() {
 /// 全部候选满 → 调用方收到 `RuntimeAtCapacity`（不做自兜底）。
 #[tokio::test]
 async fn placement_reports_capacity_exhausted_when_all_full() {
-    let storage = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     // B、C 容量均为 1 且各有一个占用会话（注入空策略：占用会话就地认领）。
     let server_b = start_cluster_inmem(
@@ -499,14 +549,14 @@ async fn placement_reports_capacity_exhausted_when_all_full() {
     )
     .await;
 
-    let busy_b = inmem_client(registry.clone(), "node-B");
+    let busy_b = inmem_client(registry.clone(), storage.clone());
     let mut hold_b = busy_b
         .actor("placement-echo", ActorId::from("hold-b"))
         .open()
         .await
         .expect("hold B");
     assert_eq!(hold_b.recv().await, Some(Ok(b"opened".to_vec())));
-    let busy_c = inmem_client(registry.clone(), "node-C");
+    let busy_c = inmem_client(registry.clone(), storage.clone());
     let mut hold_c = busy_c
         .actor("placement-echo", ActorId::from("hold-c"))
         .open()
@@ -514,8 +564,12 @@ async fn placement_reports_capacity_exhausted_when_all_full() {
         .expect("hold C");
     assert_eq!(hold_c.recv().await, Some(Ok(b"opened".to_vec())));
 
-    let client = inmem_client(registry.clone(), "node-A");
-    let err = match client.actor("placement-echo", ActorId::from("placed-3")).open().await {
+    let client = inmem_client(registry.clone(), storage.clone());
+    let err = match client
+        .actor("placement-echo", ActorId::from("placed-3"))
+        .open()
+        .await
+    {
         Ok(_) => panic!("placement exhausted must fail"),
         Err(error) => error,
     };
@@ -530,7 +584,7 @@ async fn placement_reports_capacity_exhausted_when_all_full() {
 /// 默认策略（p2c）：预置 B 高负载（95/100）、C 空闲（0/10000）→ 新 Actor 放置到 C。
 #[tokio::test]
 async fn default_placement_picks_less_loaded_node() {
-    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     let server_b = start_cluster_inmem(
         ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
@@ -556,7 +610,7 @@ async fn default_placement_picks_less_loaded_node() {
     preset_lease(&storage, "B", 95, 100, false).await;
     preset_lease(&storage, "C", 0, 10_000, false).await;
 
-    let client = inmem_client(registry.clone(), "node-A");
+    let client = inmem_client(registry.clone(), storage.clone());
     let mut session = client
         .actor("placement-echo", ActorId::from("load-1"))
         .open()
@@ -572,7 +626,11 @@ async fn default_placement_picks_less_loaded_node() {
         .unwrap()
         .unwrap()
         .record;
-    assert_eq!(record.owner.as_ref().unwrap().node_id, "C", "低 Load Ratio 节点优先");
+    assert_eq!(
+        record.owner.as_ref().unwrap().node_id,
+        "C",
+        "低 Load Ratio 节点优先"
+    );
 
     client.shutdown().await;
     server_a.shutdown().await;
@@ -583,7 +641,7 @@ async fn default_placement_picks_less_loaded_node() {
 /// 默认策略：pressured 节点被硬过滤 → 放置到正常节点。
 #[tokio::test]
 async fn default_placement_skips_pressured_node() {
-    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     let server_b = start_cluster_inmem(
         ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
@@ -609,7 +667,7 @@ async fn default_placement_skips_pressured_node() {
     preset_lease(&storage, "B", 100, 100, true).await;
     preset_lease(&storage, "C", 0, 10_000, false).await;
 
-    let client = inmem_client(registry.clone(), "node-A");
+    let client = inmem_client(registry.clone(), storage.clone());
     let mut session = client
         .actor("placement-echo", ActorId::from("pressure-1"))
         .open()
@@ -625,7 +683,11 @@ async fn default_placement_skips_pressured_node() {
         .unwrap()
         .unwrap()
         .record;
-    assert_eq!(record.owner.as_ref().unwrap().node_id, "C", "pressured 节点被过滤");
+    assert_eq!(
+        record.owner.as_ref().unwrap().node_id,
+        "C",
+        "pressured 节点被过滤"
+    );
 
     client.shutdown().await;
     server_a.shutdown().await;
@@ -636,7 +698,7 @@ async fn default_placement_skips_pressured_node() {
 /// 默认策略（p2c + in-flight 记账）：等负载并发放置（Placement Burst）分散到多节点。
 #[tokio::test]
 async fn default_placement_burst_spreads_across_nodes() {
-    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     let server_b = start_cluster_inmem(
         ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
@@ -663,8 +725,9 @@ async fn default_placement_burst_spreads_across_nodes() {
     let mut tasks = Vec::new();
     for i in 0..20 {
         let registry = registry.clone();
+        let storage = storage.clone();
         tasks.push(tokio::spawn(async move {
-            let client = inmem_client(registry, "node-A");
+            let client = inmem_client(registry, storage.clone());
             let actor_id = ActorId::from(format!("burst-{i}").as_str());
             let mut session = client
                 .actor("placement-echo", actor_id)
@@ -696,7 +759,10 @@ async fn default_placement_burst_spreads_across_nodes() {
             other => panic!("unexpected owner {other}"),
         }
     }
-    assert!(owners_b >= 1 && owners_c >= 1, "burst 分散到 B({owners_b}) 与 C({owners_c})");
+    assert!(
+        owners_b >= 1 && owners_c >= 1,
+        "burst 分散到 B({owners_b}) 与 C({owners_c})"
+    );
 
     server_a.shutdown().await;
     server_c.shutdown().await;
@@ -706,7 +772,7 @@ async fn default_placement_burst_spreads_across_nodes() {
 /// 单节点集群：无其他可用节点 → 就地认领（默认行为与 LocalPlacement 一致）。
 #[tokio::test]
 async fn default_placement_claims_locally_when_alone() {
-    let storage: Arc<dyn OwnershipBackend> = Arc::new(TestOwnershipBackend::default());
+    let storage = Arc::new(TestCoordinationStore::default());
     let registry = InmemRegistry::new();
     let server_a = start_cluster_inmem(
         ServerBuilder::local(AppState).register::<EchoActor>("placement-echo"),
@@ -716,7 +782,7 @@ async fn default_placement_claims_locally_when_alone() {
     )
     .await;
 
-    let client = inmem_client(registry.clone(), "node-A");
+    let client = inmem_client(registry.clone(), storage.clone());
     let mut session = client
         .actor("placement-echo", ActorId::from("solo-1"))
         .open()
@@ -732,7 +798,11 @@ async fn default_placement_claims_locally_when_alone() {
         .unwrap()
         .unwrap()
         .record;
-    assert_eq!(record.owner.as_ref().unwrap().node_id, "A", "单节点就地认领");
+    assert_eq!(
+        record.owner.as_ref().unwrap().node_id,
+        "A",
+        "单节点就地认领"
+    );
 
     client.shutdown().await;
     server_a.shutdown().await;

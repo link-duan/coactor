@@ -162,7 +162,10 @@ mod tests {
     #[tokio::test]
     async fn picks_less_loaded_of_two() {
         let placement = P2cPlacement::with_rng(Box::new(StdRng::seed_from_u64(1)));
-        let c = ctx(vec![candidate("node-a", 90, 100), candidate("node-b", 10, 100)]);
+        let c = ctx(vec![
+            candidate("node-a", 90, 100),
+            candidate("node-b", 10, 100),
+        ]);
         let picked = placement.candidates(&address(), &c).await;
         assert_eq!(picked.len(), 2);
         assert_eq!(picked[0], Endpoint::new("node-b"), "低负载优先");
@@ -172,7 +175,10 @@ mod tests {
     #[tokio::test]
     async fn ratio_beats_absolute_count() {
         let placement = P2cPlacement::with_rng(Box::new(StdRng::seed_from_u64(2)));
-        let c = ctx(vec![candidate("node-big", 90, 1000), candidate("node-small", 9, 10)]);
+        let c = ctx(vec![
+            candidate("node-big", 90, 1000),
+            candidate("node-small", 9, 10),
+        ]);
         let picked = placement.candidates(&address(), &c).await;
         assert_eq!(picked[0], Endpoint::new("node-big"), "90/1000 < 9/10");
     }
@@ -196,7 +202,10 @@ mod tests {
     #[tokio::test]
     async fn in_flight_bookkeeping_steers_away_from_target() {
         let placement = P2cPlacement::with_rng(Box::new(StdRng::seed_from_u64(5)));
-        let c = ctx(vec![candidate("node-a", 10, 100), candidate("node-b", 10, 100)]);
+        let c = ctx(vec![
+            candidate("node-a", 10, 100),
+            candidate("node-b", 10, 100),
+        ]);
         let first = placement.candidates(&address(), &c).await;
         let second = placement.candidates(&address(), &c).await;
         assert_ne!(first[0], second[0], "已选节点被记账抬高后不再重复选中");
@@ -206,10 +215,20 @@ mod tests {
     #[tokio::test]
     async fn failed_placement_rolls_back_bookkeeping() {
         let placement = P2cPlacement::with_rng(Box::new(StdRng::seed_from_u64(6)));
-        let c = ctx(vec![candidate("node-a", 10, 100), candidate("node-b", 10, 100)]);
+        let c = ctx(vec![
+            candidate("node-a", 10, 100),
+            candidate("node-b", 10, 100),
+        ]);
         let picked = placement.candidates(&address(), &c).await;
         placement.on_placement_failed(&picked[0]);
         let in_flight = placement.in_flight.lock();
-        assert_eq!(in_flight.get(picked[0].as_str()).copied().unwrap_or((0, Instant::now())).0, 0);
+        assert_eq!(
+            in_flight
+                .get(picked[0].as_str())
+                .copied()
+                .unwrap_or((0, Instant::now()))
+                .0,
+            0
+        );
     }
 }

@@ -84,8 +84,5 @@ pub(crate) trait ServerTransport: Send + Sync {
 
 #[async_trait::async_trait]
 pub(crate) trait ClientTransport: Send + Sync {
-    async fn connect(
-        &self,
-        endpoint: &Endpoint,
-    ) -> Result<Box<dyn PeerStream>, TransportError>;
+    async fn connect(&self, endpoint: &Endpoint) -> Result<Box<dyn PeerStream>, TransportError>;
 }

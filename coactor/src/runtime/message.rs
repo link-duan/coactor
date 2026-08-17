@@ -8,12 +8,17 @@ use crate::{DeactivationReason, SendError};
 
 /// 进入 Actor mailbox 的内部消息：业务 Action 与 Session 生命周期控制消息。
 pub(crate) enum MailboxMessage {
-    Action { session_id: SessionId, payload: Vec<u8> },
+    Action {
+        session_id: SessionId,
+        payload: Vec<u8>,
+    },
     SessionOpened {
         session_id: SessionId,
         complete: oneshot::Sender<Result<(), SendError>>,
     },
-    SessionClosed { session_id: SessionId },
+    SessionClosed {
+        session_id: SessionId,
+    },
 }
 
 pub(crate) type MailboxSender = tokio::sync::mpsc::Sender<MailboxMessage>;

@@ -1,10 +1,7 @@
 //! inmem transport：进程内 Envelope 逻辑转发，无 socket、无序列化。
 //! 供 `test_support::TestServer` 装配，验证"分布式是主线"下本地测试的形态。
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -46,12 +43,10 @@ pub(crate) struct InmemPeerSender {
 
 impl PeerSender for InmemPeerSender {
     fn try_send(&self, envelope: Envelope) -> Result<(), TransportError> {
-        self.sender
-            .try_send(envelope)
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => TransportError::Full,
-                mpsc::error::TrySendError::Closed(_) => TransportError::Closed,
-            })
+        self.sender.try_send(envelope).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => TransportError::Full,
+            mpsc::error::TrySendError::Closed(_) => TransportError::Closed,
+        })
     }
 }
 
@@ -118,10 +113,7 @@ impl ServerTransport for InmemTransport {
 
 #[async_trait::async_trait]
 impl ClientTransport for InmemTransport {
-    async fn connect(
-        &self,
-        endpoint: &Endpoint,
-    ) -> Result<Box<dyn PeerStream>, TransportError> {
+    async fn connect(&self, endpoint: &Endpoint) -> Result<Box<dyn PeerStream>, TransportError> {
         let key = endpoint.as_str().to_owned();
         let accepted = self
             .registry
@@ -181,9 +173,11 @@ mod tests {
                 actor_id: vec![1],
                 session_id: vec![0; 16],
                 from_node: String::new(),
-                kind: Some(envelope::Kind::Action(crate::peer_protocol::ActionMessage {
-                    payload: b"ping".to_vec(),
-                })),
+                kind: Some(envelope::Kind::Action(
+                    crate::peer_protocol::ActionMessage {
+                        payload: b"ping".to_vec(),
+                    },
+                )),
             })
             .expect("send");
         let received = server_stream.recv().await.expect("recv");
