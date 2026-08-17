@@ -1,24 +1,24 @@
-# Domain Docs
+# 领域文档
 
-This is a single-context repository. Engineering skills must use the project domain documentation when exploring, specifying, or modifying the codebase.
+本仓库只有一个 bounded context。工程技能在探索、编写 spec 或修改代码时必须使用项目领域文档。
 
-## Before exploring
+## 探索前
 
-- Read `CONTEXT.md` at the repository root.
-- Read ADRs under `docs/adr/` that affect the area being changed.
-- If either location does not exist, proceed silently rather than proposing it pre-emptively.
+- 阅读仓库根目录的 `CONTEXT.md`。
+- 阅读 `docs/adr/` 下与修改区域相关的 ADR。
+- 如果任一位置不存在，直接继续，不要预先建议创建。
 
-## Vocabulary
+## 词汇
 
-Use the canonical terms defined in `CONTEXT.md` in issue titles, specs, implementation plans, test names, and code review feedback. Avoid synonyms explicitly listed under `_Avoid_`.
+Issue 标题、spec、实现计划、测试名称和 code review feedback 必须使用 `CONTEXT.md` 中定义的 canonical term。避免使用 `_Avoid_` 中明确列出的同义词。
 
-If a needed concept is absent, reconsider whether existing vocabulary already covers it. If it represents a genuine domain gap, record it through the domain-modeling workflow.
+如果缺少需要的概念，先判断现有词汇是否已经覆盖。只有确实存在领域空缺时，才通过 domain-modeling workflow 记录新词汇。
 
-## ADRs
+## ADR
 
-Explicitly flag any proposal that contradicts an accepted ADR rather than silently overriding it. Architectural decisions that supersede earlier decisions must identify the superseded ADR and preserve unaffected portions.
+任何与 accepted ADR 冲突的方案都必须明确指出，不能静默覆盖。Supersede 旧决策的新 ADR 必须列出被取代的 ADR，并保留旧决策中仍然有效的部分。
 
-## Layout
+## 布局
 
 ```text
 /

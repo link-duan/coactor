@@ -18,6 +18,7 @@ pub struct MissingState;
 #[doc(hidden)]
 pub struct ReadyState;
 
+/// Builder for a production [`Server`].
 pub struct ServerBuilder<C, S = (), P = MissingState> {
     store: C,
     core: ServerBuilderCore<S>,
@@ -31,6 +32,7 @@ pub struct ServerBuilder<C, S = (), P = MissingState> {
 }
 
 impl<S: Send + Sync + 'static> Server<S> {
+    /// Creates a production Server builder backed by the supplied Coordination Store.
     pub fn builder<C>(store: C) -> ServerBuilder<C, S, MissingState>
     where
         C: CoordinationStore,
@@ -54,6 +56,7 @@ where
     C: CoordinationStore,
     S: Send + Sync + 'static,
 {
+    /// Registers an Actor Type with either its name or an [`ActorConfig`](crate::ActorConfig).
     pub fn actor<A>(mut self, config: impl IntoActorConfig) -> Self
     where
         A: __macro::ActorType<S>,
@@ -62,14 +65,17 @@ where
         self
     }
 
+    /// Sets the local socket address on which the Server listens.
     pub fn bind(mut self, address: SocketAddr) -> Self {
         self.bind_address = Some(address);
         self
     }
+    /// Sets the canonical `host:port` endpoint advertised to peers and Clients.
     pub fn advertised_endpoint(mut self, endpoint: &str) -> Self {
         self.advertised_endpoint = Some(endpoint.to_owned());
         self
     }
+    /// Sets the stable logical Node ID. It must be a Kubernetes DNS label.
     pub fn node_id(mut self, node_id: &str) -> Self {
         self.node_id = Some(node_id.to_owned());
         self
@@ -169,6 +175,7 @@ where
     C: CoordinationStore,
     S: Send + Sync + 'static,
 {
+    /// Injects the App State shared by every Actor Type in this Server.
     pub fn with_state(self, state: S) -> ServerBuilder<C, S, ReadyState> {
         self.ready(state)
     }
@@ -178,6 +185,7 @@ impl<C> ServerBuilder<C, (), MissingState>
 where
     C: CoordinationStore,
 {
+    /// Validates the configuration, acquires the Node Lease, and starts the Server.
     pub async fn start(self) -> Result<Server<()>, ServerStartError> {
         self.into_starter(Some(()))?.start().await
     }
@@ -188,6 +196,7 @@ where
     C: CoordinationStore,
     S: Send + Sync + 'static,
 {
+    /// Validates the configuration, acquires the Node Lease, and starts the Server.
     pub async fn start(self) -> Result<Server<S>, ServerStartError> {
         self.into_starter(None)?.start().await
     }
@@ -315,6 +324,7 @@ impl<S: Send + Sync + 'static> ServerBuilderCore<S> {
     }
 }
 
+/// Lifecycle owner for a running Actor Server.
 pub struct Server<S = ()> {
     pub(crate) inner: Arc<__macro::ServerInner<S>>,
     cluster: Option<ClusterTasks>,
@@ -341,6 +351,7 @@ impl<S: Send + Sync + 'static> Server<S> {
         });
         self
     }
+    /// Waits until the Server self-fences or its cluster tasks stop.
     pub async fn wait(&self) -> Result<(), ServerFailure> {
         let Some(tasks) = &self.cluster else {
             return Ok(());
@@ -355,6 +366,7 @@ impl<S: Send + Sync + 'static> Server<S> {
             }
         }
     }
+    /// Gracefully stops Actors, peer transport, and Node Lease renewal.
     pub async fn shutdown(mut self) {
         self.inner.shutdown().await;
         if let Some(tasks) = self.cluster.take() {

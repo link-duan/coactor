@@ -2,10 +2,10 @@
 status: accepted
 ---
 
-# Embedded Actor runtime
+# 嵌入式 Actor runtime
 
-CoActor implements its Actor runtime as a library embedded in the consumer's Tokio process. It owns Actor identity, registration, bounded admission, serial non-reentrant execution, lifecycle, failure and shutdown semantics instead of delegating those guarantees to a remoting framework or a hidden executor. This keeps the behavior that matters to consumers explicit and testable while leaving process supervision and infrastructure ownership to the host application.
+CoActor 将 Actor runtime 实现为嵌入 consumer Tokio 进程的 library。它自行负责 Actor identity、registration、bounded admission、串行且不可重入的执行、lifecycle、failure 与 shutdown 语义，而不是把这些保证委托给 remoting framework 或隐藏 executor。这样既能让 consumer 关心的行为保持明确、可测试，也把进程 supervision 与基础设施 ownership 留给宿主应用。
 
-Consumers interact through a struct-level Actor macro and a hand-written `Actor` trait implementation (see ADR-0007). Callers address Actors by stable Actor Type name + Actor ID and establish persistent bidirectional Sessions for message exchange (see ADR-0005). Actor location, message plumbing and runtime dispatch remain hidden; dependencies are injected through `ActorRuntime` when an Actor is constructed rather than discovered through a service locator. A Ref is a stable address handle, not ownership of an Active Actor or the runtime, so retaining it neither activates an Actor nor prevents passivation.
+Consumer 通过 struct-level Actor macro 与手写 `Actor` trait implementation 接入（见 ADR-0007）。Caller 使用稳定的 Actor Type name + Actor ID 寻址 Actor，并通过持久双向 Session 交换消息（见 ADR-0005）。Actor location、消息 plumbing 与 runtime dispatch 对 consumer 隐藏；Actor 构造时通过 `ActorRuntime` 注入依赖，不使用 service locator。
 
-Mailbox acceptance and Event delivery describe only in-memory runtime progress. They are not durable acknowledgements, and an Actor that passivates or fails can restart from empty state until persistence is introduced. Exact API constraints, lifecycle ordering and error behavior belong in the runtime semantics document rather than this ADR.
+Mailbox acceptance 与 Event delivery 只表示内存 runtime 的进度，不是 durable acknowledgement。在引入持久化之前，Actor passivate 或失败后可以从空状态重新启动。精确 API 约束、lifecycle 顺序与 error 行为由 runtime semantics 文档维护，不在本 ADR 重复。

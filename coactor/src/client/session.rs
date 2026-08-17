@@ -48,7 +48,7 @@ impl CallerRegistry {
     }
 }
 
-/// caller 侧持有的持久 Session：入站发送 Action，出站接收 Event 流。
+/// A persistent caller-side Session for sending Actions and receiving Events.
 pub struct Session {
     pub(crate) client: Weak<ClientInner>,
     pub(crate) address: ActorAddress,
@@ -60,8 +60,10 @@ pub struct Session {
 }
 
 impl Session {
-    /// 入站 fire-and-forget：同步返回传输投递状态，进入网关通道后不再确认；
-    /// server 侧拒绝（如 MailboxFull）经 SessionError 异步通知。
+    /// Sends a fire-and-forget Action.
+    ///
+    /// Success confirms transport admission, not Actor processing or durable storage.
+    /// A Server-side rejection may arrive asynchronously through [`Session::recv`].
     pub async fn send(&self, msg: Vec<u8>) -> Result<(), SendError> {
         let client = self.client.upgrade().ok_or(SendError::RuntimeStopped)?;
         if client.status.load(Ordering::Acquire) != super::RUNNING {
@@ -77,12 +79,16 @@ impl Session {
             .map_err(|_| SendError::RemoteUnavailable)
     }
 
-    /// 出站 Event 流：`Some(Ok(bytes))` 为 Event，`Some(Err(e))` 为带原因的终止，
-    /// `None` 表示 Session 已终止（failover 等无法通知的场景），应重新 `open()`。
+    /// Receives the next Event or terminal Session error.
+    ///
+    /// `None` means that the Session ended without a more specific error, for example
+    /// after a failure that prevented the remote runtime from notifying the caller.
+    /// Open a new Session to continue.
     pub async fn recv(&mut self) -> Option<Result<Vec<u8>, SendError>> {
         self.receiver.recv().await
     }
 
+    /// Returns the identifier assigned when this Session was opened.
     pub fn session_id(&self) -> SessionId {
         self.session_id
     }

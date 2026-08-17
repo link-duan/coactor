@@ -2,12 +2,12 @@
 status: accepted
 ---
 
-# Distributed runtime with stateless Availability Failover
+# 提供无状态 Availability Failover 的分布式 runtime
 
-CoActor extends the embedded runtime into a distributed production runtime without introducing a mandatory control-plane service. Production operation requires explicit peer and ownership configuration rather than silently falling back to local-only behavior. Session messages remain location-transparent; Node-to-Node bidi gRPC streams (see ADR-0006) provide the peer transport, while an ownership authority coordinates placement and fencing. CoActor owns the Actor-level rules and uses mature infrastructure only for the lower-level capabilities it actually guarantees.
+CoActor 在嵌入式 runtime 之上扩展分布式生产能力，但不引入强制的 control-plane service。生产运行必须显式配置 peer 与 ownership，不能静默退化为 local-only。Session 消息保持 location-transparent；Node 间 bidi gRPC stream（见 ADR-0006）提供 peer transport，Ownership Authority 协调 Placement 与 Fencing。CoActor 负责 Actor 层规则，只在其实际保证的底层能力上复用成熟基础设施。
 
-The public cluster API uses AWS S3 conditional operations as its ownership authority. A renewable lease establishes whether a runtime session may serve work, and per-Actor ownership records establish routing and monotonically fenced takeover. Lease loss stops the affected runtime session from serving Actors and reports termination through the host's supervision boundary; the library does not terminate the host process. This two-level model avoids renewal work growing linearly with the number of Active Actors.
+当前公开 cluster API 使用 AWS S3 conditional operation 实现共享 Coordination Store。可续持的 Node Lease 证明一个 runtime session 是否可以服务请求；per-Actor ownership record 决定路由并通过单调 epoch 对 takeover 进行 fencing。Node Lease 丢失会阻止受影响的 runtime session 继续服务 Actor，并通过宿主 supervision boundary 报告终止；library 不终止宿主进程。两层模型避免续租工作随 Active Actor 数量线性增长。
 
-The design intentionally assumes ordinary clock synchronization and uses monotonic local time for self-fencing; it does not claim tolerance of arbitrary clock skew. Ambiguous storage mutations require bounded read-back reconciliation. Capacity information is a placement hint, not a reservation.
+设计有意假设普通时钟同步，并使用本地 monotonic time 执行 self-fencing；不宣称可以容忍任意 clock skew。含糊的 storage mutation 必须执行有界 read-back reconciliation。Capacity information 只是 Placement hint，不是 reservation。
 
-This stage provides Availability Failover, not Recovery: after confirmed owner loss, a new owner starts the Actor from empty CoActor-managed state and sessions must be re-established by callers (see ADR-0005). Development and CI validate the adapter with deterministic fakes, local HTTP contract tests and an S3-compatible emulator; qualification against real AWS is a release gate rather than a prerequisite for everyday testing. Detailed wire, lease and takeover rules belong in the distributed runtime semantics document.
+本阶段提供 Availability Failover，而不是 Recovery：确认旧 Owner 失效后，新 Owner 从空 CoActor-managed state 启动，caller 必须重新建立 Session（见 ADR-0005）。开发与 CI 通过 deterministic fake、本地 HTTP contract test 和 S3-compatible emulator 验证 adapter；真实 AWS qualification 是发布门禁，而不是日常测试前提。详细 wire、lease 与 takeover 规则由 distributed runtime semantics 文档维护。

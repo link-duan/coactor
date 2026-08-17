@@ -1,3 +1,17 @@
+//! Embedded distributed Actor runtime for Rust applications.
+//!
+//! CoActor addresses logical Actors with a validated [`ActorAddress`], hosts them
+//! in a [`Server`], and lets callers communicate through persistent bidirectional
+//! [`Session`]s opened by a [`Client`]. Actions and Events are byte messages with
+//! in-memory, at-most-once delivery semantics.
+//!
+//! The current runtime provides availability failover, not Actor state recovery.
+//! Events are not durable acknowledgements.
+//!
+//! Start with the repository's [Getting Started guide][getting-started].
+//!
+//! [getting-started]: https://github.com/link-duan/coactor/blob/main/docs/getting-started.md
+
 extern crate self as coactor;
 
 mod cluster;

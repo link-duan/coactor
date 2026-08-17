@@ -30,6 +30,7 @@ const DEFAULT_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub(crate) const RUNNING: u8 = 0;
 pub(crate) const STOPPED: u8 = 1;
 
+/// Builds a caller-only [`Client`] from a read-only Node Directory.
 pub struct ClientBuilder<D> {
     transport: Arc<dyn ClientTransport>,
     directory: D,
@@ -38,6 +39,7 @@ pub struct ClientBuilder<D> {
 }
 
 impl Client {
+    /// Creates a Client builder without performing directory I/O.
     pub fn builder<D: NodeDirectory>(directory: D) -> ClientBuilder<D> {
         ClientBuilder {
             transport: Arc::new(GrpcTransport::new(DEFAULT_PEER_CONNECT_TIMEOUT)),
@@ -49,15 +51,18 @@ impl Client {
 }
 
 impl<D: NodeDirectory> ClientBuilder<D> {
+    /// Sets the maximum time to wait for a Session-open acknowledgement.
     pub fn open_timeout(mut self, timeout: Duration) -> Self {
         self.open_timeout = timeout;
         self
     }
+    /// Sets the maximum time to establish a peer connection.
     pub fn peer_connect_timeout(mut self, timeout: Duration) -> Self {
         self.peer_connect_timeout = timeout;
         self.transport = Arc::new(GrpcTransport::new(timeout));
         self
     }
+    /// Validates the configuration and constructs the Client without directory I/O.
     pub fn build(self) -> Result<Client, ClientBuildError> {
         if self.open_timeout.is_zero() {
             return Err(ClientBuildError::InvalidOpenTimeout);
@@ -73,6 +78,7 @@ impl<D: NodeDirectory> ClientBuilder<D> {
     }
 }
 
+/// Caller runtime that discovers Gateways and opens Sessions to Actors.
 pub struct Client {
     pub(crate) inner: Arc<ClientInner>,
 }
@@ -129,6 +135,7 @@ impl Client {
         Self::from_parts(transport, directory, DEFAULT_OPEN_TIMEOUT)
     }
 
+    /// Opens a persistent bidirectional Session to the supplied Actor Address.
     pub async fn open(&self, address: &ActorAddress) -> Result<Session, OpenError> {
         let client = self.inner.clone();
         if client.status.load(Ordering::Acquire) != RUNNING {
@@ -185,6 +192,7 @@ impl Client {
         })
     }
 
+    /// Stops the Client and terminates all Sessions owned by it.
     pub async fn shutdown(self) {
         self.inner.status.store(STOPPED, Ordering::Release);
         for handle in self.inner.inbound_tasks.lock().drain(..) {

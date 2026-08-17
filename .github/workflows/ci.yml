@@ -46,11 +46,20 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --all-targets --all-features
 
+      - name: Check documentation structure
+        run: python3 scripts/check-docs.py
+
+      - name: Run documentation tests
+        run: cargo test --locked --workspace --doc --all-features
+
       - name: Build documentation
         run: cargo doc --locked --workspace --no-deps --all-features
 
-      - name: Check counter example
-        run: cargo check --locked -p coactor --example cluster_counter
+      - name: Check counter examples
+        run: >-
+          cargo check --locked -p coactor
+          --example counter_server
+          --example counter_client
 
   s3-contract:
     name: S3 HTTP contract

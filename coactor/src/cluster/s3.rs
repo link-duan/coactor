@@ -27,6 +27,7 @@ struct DirectoryCache {
     refresh_at: Option<tokio::time::Instant>,
 }
 
+/// AWS S3-backed implementation of the Coordination Store capabilities.
 pub struct S3CoordinationStore {
     client: Client,
     bucket: Arc<str>,
@@ -36,6 +37,7 @@ pub struct S3CoordinationStore {
 }
 
 impl S3CoordinationStore {
+    /// Creates a store from an AWS SDK Client, bucket, and canonical object prefix.
     pub fn new(
         client: Client,
         bucket: impl Into<String>,
@@ -67,6 +69,9 @@ impl S3CoordinationStore {
         })
     }
 
+    /// Sets the Node Directory cache refresh interval.
+    ///
+    /// A zero duration is valid and effectively disables caching.
     pub fn directory_refresh_interval(mut self, interval: Duration) -> Self {
         self.directory_refresh_interval = interval;
         self

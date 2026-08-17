@@ -34,11 +34,16 @@ impl NodeDirectory for SingleNodeDirectory {
 
 static NEXT_TEST_ENDPOINT: AtomicU64 = AtomicU64::new(0);
 
+/// Builder for the in-memory [`TestServer`] Actor test harness.
 pub struct TestServerBuilder<S = (), P = crate::runtime::MissingState> {
     core: ServerBuilderCore<S>,
     phase: PhantomData<P>,
 }
 
+/// In-memory Actor test harness with a caller [`Client`].
+///
+/// This is not a production local mode and does not use the production Coordination Store
+/// or gRPC network transport.
 pub struct TestServer<S = ()> {
     server: Server<S>,
     client: Client,
@@ -46,6 +51,7 @@ pub struct TestServer<S = ()> {
 }
 
 impl<S> TestServer<S> {
+    /// Creates a TestServer builder.
     pub fn builder() -> TestServerBuilder<S, crate::runtime::MissingState>
     where
         S: Send + Sync + 'static,
@@ -171,9 +177,11 @@ where
 }
 
 impl<S: Send + Sync + 'static> TestServer<S> {
+    /// Returns the Client connected to this test harness.
     pub fn client(&self) -> &Client {
         &self.client
     }
+    /// Stops the test Server and its in-memory Client.
     pub async fn shutdown(self) {
         self.accept_task.abort();
         self.server.shutdown().await;

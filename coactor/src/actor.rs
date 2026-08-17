@@ -10,6 +10,7 @@ pub struct ActorAddress {
 }
 
 impl ActorAddress {
+    /// Validates and constructs an Actor Address from an Actor Type and Actor ID.
     pub fn new(
         actor_type: impl AsRef<str>,
         actor_id: impl AsRef<str>,
@@ -28,10 +29,12 @@ impl ActorAddress {
         })
     }
 
+    /// Returns the stable Actor Type name.
     pub fn actor_type(&self) -> &str {
         &self.actor_type
     }
 
+    /// Returns the stable Actor ID within its Actor Type.
     pub fn actor_id(&self) -> &str {
         &self.actor_id
     }
@@ -142,6 +145,7 @@ impl From<SendError> for OpenError {
     }
 }
 
+/// Per-Actor-Type runtime policy overrides.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ActorConfig {
     pub(crate) name: &'static str,
@@ -150,6 +154,7 @@ pub struct ActorConfig {
 }
 
 impl ActorConfig {
+    /// Creates a configuration with the supplied Actor Type name and default policy.
     pub fn new(name: &'static str) -> Self {
         Self {
             name,
@@ -157,11 +162,13 @@ impl ActorConfig {
         }
     }
 
+    /// Overrides the mailbox capacity for this Actor Type.
     pub fn mailbox_capacity(mut self, capacity: usize) -> Self {
         self.mailbox_capacity = Some(capacity);
         self
     }
 
+    /// Overrides the idle timeout for this Actor Type.
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = Some(timeout);
         self

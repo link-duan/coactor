@@ -7,8 +7,9 @@ use super::session::SessionHandle;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// actor 侧持有的运行时句柄：绑定自身 Actor Address，携带 AppState 与输出能力。
-/// 每个 Active Actor 在构造时获得一次，是未来扩展（session 查询、定向、timer）的挂载点。
+/// Runtime capabilities provided when an Active Actor is constructed.
+///
+/// The handle exposes the Actor's address, shared App State, and Event broadcast.
 pub struct ActorRuntime<S> {
     pub(crate) address: ActorAddress,
     pub(crate) state: Arc<S>,
@@ -35,19 +36,24 @@ impl<S> fmt::Debug for ActorRuntime<S> {
 }
 
 impl<S: Send + Sync + 'static> ActorRuntime<S> {
+    /// Returns this Actor's ID within its Actor Type.
     pub fn actor_id(&self) -> &str {
         self.address.actor_id()
     }
 
+    /// Returns this Actor's complete logical address.
     pub fn actor_address(&self) -> &ActorAddress {
         &self.address
     }
 
+    /// Returns the App State shared by all Actor Types in this Server.
     pub fn state(&self) -> &S {
         &self.state
     }
 
-    /// 向当前 Actor 的全部存活 Session 广播一个 Event；尽力而为，单点失败不影响其余。
+    /// Broadcasts an Event to every live Session of this Actor.
+    ///
+    /// Delivery is best-effort; failure for one Session does not stop delivery to others.
     pub async fn broadcast(&self, msg: Vec<u8>) {
         let Some(runtime) = self.runtime.upgrade() else {
             return;
@@ -56,52 +62,61 @@ impl<S: Send + Sync + 'static> ActorRuntime<S> {
     }
 }
 
-/// 一次 Action 处理的最小只读运行环境：标识当前 Actor，携带当前 Session 的出站句柄。
+/// Read-only context for processing one Action.
+///
+/// It identifies the Actor and provides the current Session's outbound handle.
 pub struct MessageContext {
     pub(crate) address: ActorAddress,
     pub(crate) session: SessionHandle,
 }
 
 impl MessageContext {
+    /// Returns the current Actor's ID within its Actor Type.
     pub fn actor_id(&self) -> &str {
         self.address.actor_id()
     }
 
+    /// Returns the current Actor's complete logical address.
     pub fn actor_address(&self) -> &ActorAddress {
         &self.address
     }
 
-    /// 当前 Session 的出站句柄；`clone()` 后存入状态可作定向推送。
+    /// Returns the current Session's outbound handle.
+    ///
+    /// Clone and retain the handle when the Actor needs to push later Events to this caller.
     pub fn session(&self) -> &SessionHandle {
         &self.session
     }
 
-    /// 向当前 Session 的 caller 定向发送一个 Event。
+    /// Sends an Event to the caller associated with the current Session.
     pub async fn send(&self, msg: Vec<u8>) -> Result<(), crate::SendError> {
         self.session.send(msg).await
     }
 }
 
-/// Consumer 实现的 Actor 契约：业务逻辑 + 生命周期 hook。
-/// 依赖 `Send` supertrait 让 `async fn` 的 future 自动 Send（见 ADR-0007）。
+/// The consumer-defined Actor contract.
+///
+/// CoActor calls these lifecycle methods serially for one Active Actor.
 #[allow(async_fn_in_trait)]
 pub trait Actor<S>: Send + 'static {
-    /// 构造 Active Actor；`runtime` 提供 AppState、Actor 身份与 `broadcast` 等输出能力。
+    /// Constructs a new Active Actor with access to its address and App State.
     fn new(runtime: ActorRuntime<S>) -> Self;
 
-    /// 处理一条入站 Action（字节负载）。
+    /// Handles one inbound byte Action.
     async fn on_message(&mut self, ctx: &MessageContext, msg: &[u8]);
 
+    /// Runs after construction and before the Active Actor begins serving Sessions.
     async fn on_activate(&mut self) -> Result<(), String> {
         Ok(())
     }
 
+    /// Runs before the Active Actor stops for the supplied reason.
     async fn on_deactivate(&mut self, _reason: DeactivationReason) {}
 
-    /// 新 Session 建立（open）时调用；ctx 可直接推送。
+    /// Runs when a new Session has opened and may immediately emit Events.
     async fn on_session_opened(&mut self, _ctx: &MessageContext) {}
 
-    /// Session 关闭（caller 断开）时调用；ctx 的发送已不可用。
+    /// Runs after a Session closes. Sending through its context is no longer valid.
     async fn on_session_closed(&mut self, _ctx: &MessageContext) {}
 }
 

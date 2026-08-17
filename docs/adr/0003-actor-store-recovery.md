@@ -2,10 +2,10 @@
 status: accepted
 ---
 
-# Actor Store and Recovery as a later persistence stage
+# 将 Actor Store 与 Recovery 延后到持久化阶段
 
-Persistence is deliberately separate from the first distributed availability stage. A later Actor Store will provide Actor-scoped transactional state without requiring consumers to adopt event sourcing, and will bind persisted state to the Actor's fenced ownership epoch so consumers do not manage physical storage identities themselves.
+持久化与首个分布式可用性阶段明确分离。后续 Actor Store 将提供 Actor-scoped transactional state，不要求 consumer 采用 event sourcing；持久状态必须绑定 Actor 的 fenced Ownership Epoch，consumer 不管理物理 storage identity。
 
-The planned baseline checkpoints complete Actor Store files asynchronously and therefore accept a non-zero recovery point objective; an ordinary Handler Reply remains non-durable. Planned passivation, migration and shutdown must flush dirty state before completing, while a persistence failure stops the affected Actor rather than inventing a successful durability guarantee.
+计划中的基础方案异步 checkpoint 完整 Actor Store 文件，因此接受非零 recovery point objective；普通 Event 仍然不是 durable acknowledgement。计划内的 Passivation、Migration 与 Shutdown 必须在完成前 flush dirty state；持久化失败应停止受影响 Actor，而不是虚构成功的 durability guarantee。
 
-Recovery selects a fixed state version from an earlier ownership epoch and does not chase writes from a stale owner. Missing history restores an empty Store, while corrupted selected state is a restore fault rather than a reason to silently choose older data. Storage layout, checkpoint scheduling and restore algorithms remain future design details and should be refined in the persistence specification before implementation.
+Recovery 从更早 Ownership Epoch 选择固定 state version，不追逐 stale Owner 的后续写入。不存在历史状态时恢复空 Store；选定状态损坏属于 Restore Fault，不能静默回退到更旧数据。Storage layout、checkpoint scheduling 与 restore algorithm 仍是未来设计细节，实现前必须在持久化 spec 中进一步明确。

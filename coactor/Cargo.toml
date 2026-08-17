@@ -1,6 +1,11 @@
 [package]
 name = "coactor"
 version = "0.1.0"
+description = "An embedded distributed Actor runtime for Rust applications"
+readme = "../README.md"
+documentation = "https://docs.rs/coactor"
+keywords = ["actor", "distributed", "runtime", "tokio"]
+categories = ["asynchronous", "concurrency"]
 autotests = false
 edition.workspace = true
 license.workspace = true
@@ -40,8 +45,12 @@ tracing-subscriber = { version = "0.3.19", features = ["fmt"] }
 trybuild = "1.0.105"
 
 [[example]]
-name = "cluster_counter"
-path = "examples/cluster_counter.rs"
+name = "counter_server"
+path = "examples/counter_server.rs"
+
+[[example]]
+name = "counter_client"
+path = "examples/counter_client.rs"
 
 [[test]]
 name = "macro_ui"

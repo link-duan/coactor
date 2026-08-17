@@ -2,8 +2,10 @@
 status: accepted
 ---
 
-# Built-in S3 ownership authority
+# 内置 S3 Ownership Authority
 
-> Public backend configuration and the `OwnershipBackend` seam were first superseded by [ADR-0010](0010-node-directory-coordination-store.md); its backend variant configuration was subsequently superseded by [ADR-0011](0011-chainable-runtime-api.md). The S3 conditional-write correctness decisions remain valid.
+> 公开 backend 配置与 `OwnershipBackend` seam 首先被 [ADR-0010](0010-node-directory-coordination-store.md) 取代，其 backend variant 配置随后又被 [ADR-0011](0011-chainable-runtime-api.md) 取代。S3 conditional-write correctness 相关决策仍然有效。
 
-CoActor's public cluster API binds ownership to the built-in S3 authority instead of exposing a consumer-supplied provider interface. During early development, this keeps the supported configuration and correctness boundary small while Node Lease and Actor Owner Record semantics evolve together. A crate-private `OwnershipBackend` seam remains solely to isolate the protocol implementation and enable deterministic tests; supporting another authority requires an intentional runtime change rather than an application plugin.
+CoActor 早期公开 cluster API 将 ownership 绑定到内置 S3 authority，而不是暴露 consumer-supplied provider interface。这样可以在 Node Lease 与 Actor Owner Record 语义共同演进时，保持支持的配置面和 correctness boundary 足够小。crate-private `OwnershipBackend` seam 当时只用于隔离协议实现与支持 deterministic test；增加另一种 authority 必须是有意的 runtime 修改，而不是 application plugin。
+
+后续 ADR 已将公开边界改为 capability-based Coordination Store。本 ADR 只保留 S3 conditional operation、含糊写入 read-back 与 fencing correctness 方面的历史决策。
