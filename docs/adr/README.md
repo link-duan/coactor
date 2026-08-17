@@ -11,5 +11,6 @@ ADR status 表示决策是否仍然有效，不表示实现已经交付。
 - [ADR-0005: Session 双向消息模型](0005-session-message-model.md) — Action/Event 字节消息、passivation 条件、failover 打断
 - [ADR-0006: Node 间 bidi gRPC stream](0006-bidi-peer-stream.md) — 多路复用流替代 unary Invoke
 - [ADR-0007: Actor trait 形态](0007-actor-trait-shape.md) — struct 挂 macro、原生 async fn、按名字索引
-- [ADR-0008: Server/Client 拆分](0008-server-client-split.md) — 网关转发、服务发现与 transport seam
+- [ADR-0008: Server/Client 拆分](0008-server-client-split.md) — 网关转发与 transport seam；节点发现部分由 ADR-0010 取代
 - [ADR-0009: 放置均衡 p2c](0009-p2c-placement-balancing.md) — p2c + Load Ratio + In-flight 记账
+- [ADR-0010: Node Directory 与可替换 Coordination Store](0010-node-directory-coordination-store.md) — Node Lease 统一节点来源、S3/etcd variant 与原生租约语义

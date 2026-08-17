@@ -4,6 +4,8 @@ status: accepted
 
 # Server/Client 拆分：网关转发、服务发现与 transport seam
 
+> Node discovery、Client authority access 与 DNS/static-list 决策已由 [ADR-0010](0010-node-directory-coordination-store.md) supersede；Server/Client 拆分、Gateway 中继与 transport seam 仍然有效。
+
 单一 `coactor` crate 同时承载宿主与调用能力，client 侧 consumer 被迫接触 server 机制（Actor macro、注册表、AppState 泛型）。分布式远程能力是主线，本地能力仅为测试验证；因此按 API 边界把 runtime 拆成 `Server` 与 `Client` 两个公开入口（保持单 crate、无 feature 门控，模块边界为未来拆 crate 预留）。
 
 - **Server**（`ServerBuilder`，泛型 `S`）只宿主：Actor Type 注册、生命周期、ownership authority 写入、accept 入站传输、网关转发与按负载放置。不提供 caller 能力。

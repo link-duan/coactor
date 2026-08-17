@@ -135,8 +135,12 @@ _Avoid_: Ownership loss, node-wide fence
 _Avoid_: Empty state, first activation
 
 **Ownership Authority**:
-由 runtime 掌控、负责竞争、续持和释放 ownership，并产生单调 Ownership Epoch 的共享权威。它是集群正确性边界，不是 consumer 可替换的插件 API。
-_Avoid_: Ownership Provider, Actor registry, service discovery
+由 runtime 掌控、负责竞争、续持和释放 ownership，并产生单调 Ownership Epoch 的共享权威。它是集群正确性边界，通过 Coordination Store 实现，但不等同于 Node Directory。
+_Avoid_: Ownership Provider, Actor registry, Node Directory
+
+**Coordination Store**:
+承载 Node Lease 与 Actor Owner Record 的共享存储边界；它提供节点租约、live Node Directory 与 ownership 条件写语义，具体后端可采用 S3 或 etcd 的原生机制。
+_Avoid_: Ownership Authority, Service Discovery, Actor Store
 
 **Node**:
 嵌入 CoActor runtime 并通过网络接收或转发 Action 的 consumer 进程运行位置；一个 Node 的长期运维身份与单次运行会话必须区分。
@@ -151,7 +155,7 @@ _Avoid_: Node Session ID, Owner
 _Avoid_: Node ID, hostname, Pod name
 
 **Node Lease**:
-共享 ownership authority 中证明某个 Node Session 在有界时间内仍具备运行资格的记录；失去该资格会触发整个 runtime self-fence。
+Coordination Store 中授予某个 Node Session 有界运行资格的租约；S3 以带截止时间的记录维护，etcd 以 attached key 与原生 Lease 维护，失去续持资格会触发整个 runtime self-fence。
 _Avoid_: Actor Owner Record, heartbeat alone
 
 **Load Ratio**:
@@ -159,8 +163,8 @@ Node 当前负载的排序指标，由当前活跃 Actor 数与上限之比（ac
 _Avoid_: active actor count alone, remaining capacity
 
 **Actor Owner Record**:
-共享 ownership authority 中把一个 Actor Address 绑定到 Node Session 与 Ownership Epoch 的记录；它决定路由和 takeover，不表示 Active Actor 当前一定驻留内存。
-_Avoid_: Node Lease, local route, service discovery entry
+Coordination Store 中把一个 Actor Address 绑定到 Node Session 与 Ownership Epoch 的记录；它决定路由和 takeover，不表示 Active Actor 当前一定驻留内存。
+_Avoid_: Node Lease, local route, Node Directory entry
 
 **Availability Failover**:
 旧 Owner 失效后，由新 Owner 以更高 Ownership Epoch 从空 CoActor 状态重新提供服务；consumer 可自行重建外部状态，但 CoActor 不保证状态恢复。
@@ -179,12 +183,12 @@ embed CoActor runtime 并宿主 Actor 的一侧；它注册 Actor Type、维护 
 _Avoid_: Runtime, Node, Host
 
 **Client**:
-embed CoActor runtime 但只发起 Session 的调用方；它通过 Service Discovery 发现 Server 节点、维护连接池，经网关节点中继 Action/Event。Client 不宿主 Actor，不持有 authority 访问。
+embed CoActor runtime 但只发起 Session 的调用方；它从 Coordination Store 的只读 Node Directory 建立 Gateway Pool，经网关节点中继 Action/Event。Client 不宿主 Actor，也不能变更 Node Lease 或 Actor Owner Record。
 _Avoid_: Runtime, caller handle
 
-**Service Discovery**:
-Client 获取候选 Server 节点列表的公开机制，返回 `Vec<Endpoint>` 供连接池建池；内置 `dns`（DNS 名多 A 记录，覆盖 K8s headless service）与 `static-list` 两个实现。它不是正确性边界，发现错误可重发现恢复。
-_Avoid_: Actor Owner Record, registry entry
+**Node Directory**:
+由当前 live Node Session 构成的只读节点目录，是 Client Gateway Pool、Server Placement 和 Owner endpoint 解析的共同节点来源；它不决定 Actor ownership，也不保证 endpoint 此刻一定可连接。
+_Avoid_: Service Discovery, Actor registry, Actor Owner Record
 
 **Placement**:
 网关对未拥有或 stale 的 Actor 决定 Owner 节点的决策过程；基于候选节点的 Load Ratio 快照与随机化（p2c），一次性决策经 ownership claim 固定，直到 failover。它不持续再平衡。
