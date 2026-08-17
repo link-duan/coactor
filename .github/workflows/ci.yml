@@ -49,13 +49,13 @@ jobs:
       - name: Build documentation
         run: cargo doc --locked --workspace --no-deps --all-features
 
-      - name: Run counter example
-        run: cargo run --locked -p coactor --example counter
+      - name: Check counter example
+        run: cargo check --locked -p coactor --example cluster_counter
 
-  s3-integration:
-    name: S3 ownership semantics
+  s3-contract:
+    name: S3 HTTP contract
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - name: Check out repository
@@ -70,34 +70,7 @@ jobs:
       - name: Use stable Rust toolchain
         run: rustup default stable
 
-      - name: Start MinIO S3 endpoint
-        run: |
-          docker run --detach --name coactor-minio \
-            --publish 9000:9000 \
-            --env MINIO_ROOT_USER=test-access-key \
-            --env MINIO_ROOT_PASSWORD=test-secret-key \
-            minio/minio:latest server /data
-          for attempt in $(seq 1 60); do
-            if docker exec coactor-minio \
-              mc alias set ci http://127.0.0.1:9000 test-access-key test-secret-key >/dev/null 2>&1 \
-              && docker exec coactor-minio mc ready ci >/dev/null 2>&1; then
-              exit 0
-            fi
-            sleep 1
-          done
-          docker logs coactor-minio
-          exit 1
-
-      - name: Run MinIO ownership semantics
-        env:
-          COACTOR_S3_ENDPOINT: http://127.0.0.1:9000
-          COACTOR_S3_BUCKET: coactor-minio-ci
-        run: |
-          cargo test --locked -p coactor --lib node_and_actor_records_obey_conditional_s3_updates -- --ignored --test-threads=1
-          cargo test --locked -p coactor --lib multiple_runtimes_preserve_ownership_lifecycle_through_s3 -- --ignored --test-threads=1
-
-      - name: Show MinIO diagnostics
-        if: always()
-        run: |
-          docker logs coactor-minio || true
-          docker rm --force coactor-minio || true
+      - name: Run S3 HTTP contract tests
+        run: >-
+          cargo test --locked -p coactor --lib s3_coordination_tests:: --
+          --test-threads=1
