@@ -9,20 +9,16 @@ CoActor 为业务 key 提供按需运行的 Actor 执行边界。本词汇表同
 _Avoid_: Entity, Actor instance, Tokio task
 
 **Actor Type**:
-consumer 约定并在注册时显式传入 runtime 的稳定业务类型名称，例如 `room` 或 `document`；名称不从 Rust 类型名推导、不由 macro 生成，并在一个 runtime 内唯一。Client 与 Server 两侧 consumer 通过该名称约定相互寻址。
-_Avoid_: Rust type name, macro 属性
+consumer 约定并在注册时显式提供的稳定业务类型名称，在一个 runtime 内唯一；采用 Kubernetes DNS label 形式（1–63 个字符、小写字母或数字起止、中间可含 `-`），例如 `room` 或 `collab-document`。Client 与 Server 通过该名称约定相互寻址，名称不从 Rust 类型名推导、不由 macro 生成。
+_Avoid_: Rust type name, macro 属性, arbitrary string, path
 
 **Actor ID**:
-由业务提供、在同一 Actor Type 内唯一的稳定字节包装，例如 room ID 或 document ID；Actor Type 的 `new` 接收该统一类型，业务解释由 consumer 负责。
-_Avoid_: Actor Key, Task ID, memory address
+由业务提供、在同一 Actor Type 内唯一的稳定标识符；采用 Kubernetes DNS label 形式（1–63 个字符、小写字母或数字起止、中间可含 `-`），例如 `room-123`。
+_Avoid_: Actor Key, arbitrary bytes, path, memory address
 
 **Actor Address**:
 Actor Type 与 Actor ID 的稳定组合，是 runtime 用于寻址 Actor 的完整身份，可跨进程和节点重新构造。
 _Avoid_: Actor ID, Entity ID, local handle
-
-**Actor Ref**:
-Client 按 Actor Type 名称 + Actor ID 返回的通用稳定地址句柄（非泛型，不携带 AppState 类型参数）；它通过 `open()` 建立与 Actor 的 Session。它只弱引用 runtime，持有或 clone 不会保持 runtime/Actor 存活，也不会阻止 passivation。
-_Avoid_: Actor Address, untyped byte channel
 
 **Active Actor**:
 一个 Actor 启动后在某个 runtime 进程中的临时执行实例，持有 mailbox 与热状态；同一 Actor 可先后产生多个 Active Actor。
@@ -41,7 +37,7 @@ Actor 通过 Session Handle 推送给 caller 的出站消息，字节负载；Ac
 _Avoid_: Reply, response, Durable ACK
 
 **Session**:
-caller 与 Actor 之间的一次持久双向通道；所有 Action 都经 Session 入站，Event 经 Session 出站。它由 Actor Ref 的 `open()` 建立；物理路径可经网关节点中继到 owner，owner 或网关失效都会显式打断它，由 caller 重新 `open()` 恢复。
+caller 与 Actor 之间的一次持久双向通道；所有 Action 都经 Session 入站，Event 经 Session 出站。Client 以 Actor Address 打开 Session；owner 或网关失效都会显式打断它，由 caller 重新打开。
 _Avoid_: Connection handle, command channel
 
 **Session Handle**:
@@ -147,15 +143,15 @@ _Avoid_: Ownership Authority, Service Discovery, Actor Store
 _Avoid_: Actor Owner, Runtime handle, Pod
 
 **Node ID**:
-用于日志、运维和部署定位的 Node 稳定标签；它本身不证明当前进程拥有服务权。
-_Avoid_: Node Session ID, Owner
+Server 跨进程重启保持的稳定逻辑节点身份；同一时刻最多由一个有效 Node Session 占用。Actor placement 可保留该逻辑归属，但实际服务权仍须结合 Node Session ID 与 Ownership Epoch 判断。
+_Avoid_: Node Session ID, display label, process identity
 
 **Node Session ID**:
 一次 runtime 启动的唯一身份，是 Node Lease 与 Actor Owner Record 中判断实际 Owner 进程的依据。
 _Avoid_: Node ID, hostname, Pod name
 
 **Node Lease**:
-Coordination Store 中授予某个 Node Session 有界运行资格的租约；S3 以带截止时间的记录维护，etcd 以 attached key 与原生 Lease 维护，失去续持资格会触发整个 runtime self-fence。
+授予某个 Node Session 在有界时间内占用某个 Node ID 的运行资格；失去续持资格会触发整个 runtime self-fence。
 _Avoid_: Actor Owner Record, heartbeat alone
 
 **Load Ratio**:
@@ -163,7 +159,7 @@ Node 当前负载的排序指标，由当前活跃 Actor 数与上限之比（ac
 _Avoid_: active actor count alone, remaining capacity
 
 **Actor Owner Record**:
-Coordination Store 中把一个 Actor Address 绑定到 Node Session 与 Ownership Epoch 的记录；它决定路由和 takeover，不表示 Active Actor 当前一定驻留内存。
+把一个 Actor Address 绑定到 Node ID、Node Session ID 与 Ownership Epoch 的权威记录；Node ID 保留逻辑 placement，Node Session ID 区分具体进程 incarnation。它不表示 Active Actor 当前一定驻留内存。
 _Avoid_: Node Lease, local route, Node Directory entry
 
 **Availability Failover**:
