@@ -6,7 +6,7 @@ status: accepted
 
 Client 的 Gateway 发现与 Server 的 Placement 当前分别依赖 DNS/静态列表和 Node Lease，形成两份可能漂移的节点来源；同时 `OwnershipBackend` 混合节点租约、Actor ownership 与 S3 ETag 语义，不利于引入 etcd。本 ADR 以 Node Lease 支撑的 Node Directory 取代独立 Service Discovery，并把共享存储重塑为可由 S3 或 etcd 提供的 Coordination Store。
 
-本 ADR supersede ADR-0008 中“Client 不访问 authority”与“DNS/static-list Service Discovery”的决策；Server/Client 拆分、Gateway 中继和 transport seam 继续有效。
+本 ADR supersede ADR-0008 中“Client 不访问 authority”与“DNS/static-list Service Discovery”的决策；Server/Client 拆分、Gateway 中继和 transport seam 继续有效。公开 backend variant 与 runtime 构造 API 后由 [ADR-0011](0011-chainable-runtime-api.md) supersede，Node Directory 的稳定 Node ID identity 与持久 key 由 [ADR-0012](0012-stable-node-identity-and-keys.md) 扩展；能力拆分、Node Directory/Ownership Authority 分离和 backend 原生租约语义仍然有效。
 
 ## Decision
 

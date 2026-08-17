@@ -2,7 +2,7 @@
 status: accepted
 ---
 
-> 注：Actor Type 名称已移出 macro（ADR-0008）；本 ADR 正文描述的是命名 macro 时代（`#[actor(name = "...")]` + `ACTOR_NAME`），现宏形态为 `#[actor]` 无属性、仅生成类型擦除 dispatch 实现，名称由 `register::<A>(name)` 显式传入。
+> 注：Actor Type 名称移出 macro 的决策仍然有效；具体注册 API 与 client 侧 `ActorRef` 寻址形态已由 [ADR-0011](0011-chainable-runtime-api.md) supersede。本 ADR 正文保留命名 macro 与早期 Ref API 的历史背景，当前仍有效的核心决策是 struct 挂 macro、consumer 手写 `Actor` trait 与原生 `async fn`。
 
 # Actor trait 形态：struct 挂 macro + 原生 async fn + 按名字索引
 

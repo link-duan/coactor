@@ -232,7 +232,7 @@ impl<C, S> ServerBuilder<C, S> {
 }
 
 impl<C> ServerBuilder<C, ()> {
-    pub async fn start(self) -> Result<Server<()>, StartError>;
+    pub async fn start(self) -> Result<Server<()>, ServerStartError>;
 }
 
 impl<C, S> ReadyServerBuilder<C, S> {
@@ -240,7 +240,7 @@ impl<C, S> ReadyServerBuilder<C, S> {
     where
         A: ActorType<S>;
 
-    pub async fn start(self) -> Result<Server<S>, StartError>;
+    pub async fn start(self) -> Result<Server<S>, ServerStartError>;
 }
 ```
 
