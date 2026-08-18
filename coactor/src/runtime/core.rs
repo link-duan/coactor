@@ -272,7 +272,6 @@ where
             .filter(|(_, relay)| relay.owner == endpoint)
             .map(|(id, relay)| (*id, relay.clone()))
             .collect();
-        drop(self.relays.lock());
         for (session_id, relay) in stale {
             self.relays.lock().remove(&session_id);
             let _ = relay.client.try_send(crate::peer_protocol::Envelope {
@@ -708,7 +707,6 @@ where
             .filter(|(_, relay)| Arc::ptr_eq(&relay.client, sender))
             .map(|(id, relay)| (*id, relay.clone()))
             .collect();
-        drop(self.relays.lock());
         for (session_id, relay) in stale {
             self.relays.lock().remove(&session_id);
             let _ = self
