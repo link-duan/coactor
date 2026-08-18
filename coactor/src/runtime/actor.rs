@@ -99,13 +99,23 @@ impl MessageContext {
 /// CoActor calls these lifecycle methods serially for one Active Actor.
 #[allow(async_fn_in_trait)]
 pub trait Actor<S>: Send + 'static {
-    /// Constructs a new Active Actor with access to its address and App State.
+    /// Constructs a new Active Actor using only inexpensive, non-blocking
+    /// in-memory state initialization.
+    ///
+    /// This method must not perform I/O, wait for synchronization, or execute
+    /// expensive computation. Blocking here may delay routing and lifecycle work
+    /// for unrelated Actors hosted by the same Server.
+    ///
+    /// Perform asynchronous initialization in [`Actor::on_activate`].
     fn new(runtime: ActorRuntime<S>) -> Self;
 
     /// Handles one inbound byte Action.
     async fn on_message(&mut self, ctx: &MessageContext, msg: &[u8]);
 
-    /// Runs after construction and before the Active Actor begins serving Sessions.
+    /// Performs asynchronous initialization before the Active Actor begins serving Sessions.
+    ///
+    /// Use this method for network, database, filesystem, and restore work. Offload
+    /// unavoidable blocking operations with [`tokio::task::spawn_blocking`].
     async fn on_activate(&mut self) -> Result<(), String> {
         Ok(())
     }
