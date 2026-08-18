@@ -1,4 +1,7 @@
-use std::{collections::HashMap, marker::PhantomData, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, marker::PhantomData, net::SocketAddr, pin::Pin,
+    sync::Arc, time::Duration,
+};
 
 use parking_lot::Mutex;
 use tokio::sync::{Semaphore, watch};
@@ -9,8 +12,8 @@ use crate::cluster::{
 };
 use crate::runtime::session::SessionRegistry;
 use crate::{
-    __macro, IntoActorConfig, PEER_PROTOCOL_VERSION, PlacementStrategy, ServerFailure,
-    ServerStartError, transport::ClientTransport,
+    __macro, IntoActorConfig, PEER_PROTOCOL_VERSION, PlacementStrategy, ServerError,
+    transport::ClientTransport,
 };
 
 #[doc(hidden)]
@@ -28,6 +31,7 @@ pub struct ServerBuilder<C, S = (), P = MissingState> {
     node_lease_ttl: Duration,
     coordination_timeout: Duration,
     peer_connect_timeout: Duration,
+    shutdown_signal: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     phase: PhantomData<P>,
 }
 
@@ -46,6 +50,7 @@ impl<S: Send + Sync + 'static> Server<S> {
             node_lease_ttl: Duration::from_secs(10),
             coordination_timeout: Duration::from_secs(15),
             peer_connect_timeout: Duration::from_secs(3),
+            shutdown_signal: None,
             phase: PhantomData,
         }
     }
@@ -65,11 +70,6 @@ where
         self
     }
 
-    /// Sets the local socket address on which the Server listens.
-    pub fn bind(mut self, address: SocketAddr) -> Self {
-        self.bind_address = Some(address);
-        self
-    }
     /// Sets the canonical `host:port` endpoint advertised to peers and Clients.
     pub fn advertised_endpoint(mut self, endpoint: &str) -> Self {
         self.advertised_endpoint = Some(endpoint.to_owned());
@@ -112,6 +112,36 @@ where
         self.peer_connect_timeout = timeout;
         self
     }
+    /// Sets the application-owned future that requests graceful Server shutdown.
+    pub fn shutdown_signal<F>(mut self, signal: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.shutdown_signal = Some(Box::pin(signal));
+        self
+    }
+
+    async fn serve_with_state(
+        mut self,
+        address: &str,
+        state: Option<S>,
+    ) -> Result<(), ServerError> {
+        self.bind_address = Some(parse_listen_address(address)?);
+        let shutdown_signal = self.shutdown_signal.take();
+        let server = self.into_starter(state)?.start().await?;
+        let result = match shutdown_signal {
+            Some(signal) => {
+                tokio::select! {
+                    biased;
+                    result = server.wait() => result,
+                    () = signal => Ok(()),
+                }
+            }
+            None => server.wait().await,
+        };
+        let shutdown_result = server.shutdown().await;
+        result.and(shutdown_result)
+    }
 
     fn ready(self, state: S) -> ServerBuilder<C, S, ReadyState> {
         ServerBuilder {
@@ -123,35 +153,34 @@ where
             node_lease_ttl: self.node_lease_ttl,
             coordination_timeout: self.coordination_timeout,
             peer_connect_timeout: self.peer_connect_timeout,
+            shutdown_signal: self.shutdown_signal,
             phase: PhantomData,
         }
     }
 
-    fn into_starter(mut self, state: Option<S>) -> Result<ServerStarter<S>, ServerStartError> {
+    fn into_starter(mut self, state: Option<S>) -> Result<ServerStarter<S>, ServerError> {
         if let Some(state) = state {
             self.core = self.core.with_state(state);
         }
-        let bind_address = self
-            .bind_address
-            .ok_or(ServerStartError::MissingBindAddress)?;
+        let bind_address = self.bind_address.expect("serve supplies the bind address");
         let raw_endpoint = self
             .advertised_endpoint
-            .ok_or(ServerStartError::MissingAdvertisedEndpoint)?;
+            .ok_or(ServerError::MissingAdvertisedEndpoint)?;
         let advertised_endpoint =
-            canonical_endpoint(&raw_endpoint).ok_or(ServerStartError::InvalidAdvertisedEndpoint)?;
+            canonical_endpoint(&raw_endpoint).ok_or(ServerError::InvalidAdvertisedEndpoint)?;
         let node_id = match self.node_id {
             Some(node_id) if crate::is_dns_label(&node_id) => node_id,
-            Some(_) => return Err(ServerStartError::InvalidNodeId),
+            Some(_) => return Err(ServerError::InvalidNodeId),
             None => advertised_endpoint.clone(),
         };
         if self.node_lease_ttl.is_zero() {
-            return Err(ServerStartError::InvalidNodeLeaseTtl);
+            return Err(ServerError::InvalidNodeLeaseTtl);
         }
         if self.coordination_timeout.is_zero() {
-            return Err(ServerStartError::InvalidCoordinationTimeout);
+            return Err(ServerError::InvalidCoordinationTimeout);
         }
         if self.peer_connect_timeout.is_zero() {
-            return Err(ServerStartError::InvalidPeerConnectTimeout);
+            return Err(ServerError::InvalidPeerConnectTimeout);
         }
         let config = ServerRuntimeConfig::production(
             node_id,
@@ -185,9 +214,13 @@ impl<C> ServerBuilder<C, (), MissingState>
 where
     C: CoordinationStore,
 {
-    /// Validates the configuration, acquires the Node Lease, and starts the Server.
-    pub async fn start(self) -> Result<Server<()>, ServerStartError> {
-        self.into_starter(Some(()))?.start().await
+    /// Runs the Server until it self-fences, its tasks stop, or the shutdown signal completes.
+    ///
+    /// Dropping or aborting this future is not cancellation-safe and does not guarantee
+    /// graceful cleanup or Node Lease release. Configure [`Self::shutdown_signal`] and
+    /// continue awaiting `serve` to shut down gracefully.
+    pub async fn serve(self, address: &str) -> Result<(), ServerError> {
+        self.serve_with_state(address, Some(())).await
     }
 }
 
@@ -196,10 +229,28 @@ where
     C: CoordinationStore,
     S: Send + Sync + 'static,
 {
-    /// Validates the configuration, acquires the Node Lease, and starts the Server.
-    pub async fn start(self) -> Result<Server<S>, ServerStartError> {
-        self.into_starter(None)?.start().await
+    /// Runs the Server until it self-fences, its tasks stop, or the shutdown signal completes.
+    ///
+    /// Dropping or aborting this future is not cancellation-safe and does not guarantee
+    /// graceful cleanup or Node Lease release. Configure [`Self::shutdown_signal`] and
+    /// continue awaiting `serve` to shut down gracefully.
+    pub async fn serve(self, address: &str) -> Result<(), ServerError> {
+        self.serve_with_state(address, None).await
     }
+}
+
+fn parse_listen_address(address: &str) -> Result<SocketAddr, ServerError> {
+    if let Some(port) = address.strip_prefix(':') {
+        if port.is_empty() || port.contains(':') {
+            return Err(ServerError::InvalidListenAddress);
+        }
+        return format!("0.0.0.0:{port}")
+            .parse()
+            .map_err(|_| ServerError::InvalidListenAddress);
+    }
+    address
+        .parse()
+        .map_err(|_| ServerError::InvalidListenAddress)
 }
 
 pub(crate) struct ServerBuilderCore<S> {
@@ -247,31 +298,29 @@ impl<S: Send + Sync + 'static> ServerBuilderCore<S> {
         self.client_transport = Some(transport);
         self
     }
-    pub(crate) fn validate(&self) -> Result<(), ServerStartError> {
+    pub(crate) fn validate(&self) -> Result<(), ServerError> {
         if self.mailbox_capacity == 0 {
-            return Err(ServerStartError::InvalidMailboxCapacity);
+            return Err(ServerError::InvalidMailboxCapacity);
         }
         if self.max_active_actors == 0 {
-            return Err(ServerStartError::InvalidMaxActiveActors);
+            return Err(ServerError::InvalidMaxActiveActors);
         }
         if self.deactivation_timeout.is_zero() {
-            return Err(ServerStartError::InvalidDeactivationTimeout);
+            return Err(ServerError::InvalidDeactivationTimeout);
         }
         if self.shutdown_timeout.is_zero() {
-            return Err(ServerStartError::InvalidShutdownTimeout);
+            return Err(ServerError::InvalidShutdownTimeout);
         }
         let mut names = std::collections::HashSet::new();
         for registration in &self.registrations {
             if !crate::is_dns_label(registration.name) {
-                return Err(ServerStartError::InvalidActorType(
-                    registration.name.to_owned(),
-                ));
+                return Err(ServerError::InvalidActorType(registration.name.to_owned()));
             }
             if registration.mailbox_capacity == Some(0) {
-                return Err(ServerStartError::InvalidMailboxCapacity);
+                return Err(ServerError::InvalidMailboxCapacity);
             }
             if !names.insert(registration.name) {
-                return Err(ServerStartError::DuplicateActorType(
+                return Err(ServerError::DuplicateActorType(
                     registration.name.to_owned(),
                 ));
             }
@@ -285,7 +334,7 @@ impl<S: Send + Sync + 'static> ServerBuilderCore<S> {
         self,
         authority: Option<Arc<NodeAuthority>>,
         cluster: Option<Arc<ClusterRouter>>,
-    ) -> Result<Server<S>, ServerStartError> {
+    ) -> Result<Server<S>, ServerError> {
         self.validate()?;
         let mut registrations = HashMap::new();
         for mut registration in self.registrations {
@@ -324,7 +373,7 @@ impl<S: Send + Sync + 'static> ServerBuilderCore<S> {
     }
 }
 
-/// Lifecycle owner for a running Actor Server.
+/// Entry point for configuring and serving a production Actor Server.
 pub struct Server<S = ()> {
     pub(crate) inner: Arc<__macro::ServerInner<S>>,
     cluster: Option<ClusterTasks>,
@@ -352,26 +401,45 @@ impl<S: Send + Sync + 'static> Server<S> {
         self
     }
     /// Waits until the Server self-fences or its cluster tasks stop.
-    pub async fn wait(&self) -> Result<(), ServerFailure> {
+    pub(crate) async fn wait(&self) -> Result<(), ServerError> {
         let Some(tasks) = &self.cluster else {
             return Ok(());
         };
         let mut fenced = tasks.fenced.clone();
+        let mut peer_stopped = tasks.peer.stopped.clone();
+        let mut renewal_stopped = tasks.renewal.stopped.clone();
         loop {
             if *fenced.borrow() {
-                return Err(ServerFailure::Fenced);
+                return Err(ServerError::Fenced);
             }
-            if fenced.changed().await.is_err() {
-                return Ok(());
+            if *peer_stopped.borrow() {
+                return Err(ServerError::ServiceStopped);
+            }
+            tokio::select! {
+                biased;
+                changed = fenced.changed() => {
+                    if changed.is_err() {
+                        return Err(ServerError::ServiceStopped);
+                    }
+                }
+                changed = peer_stopped.changed() => {
+                    if changed.is_err() || *peer_stopped.borrow() {
+                        return Err(ServerError::ServiceStopped);
+                    }
+                }
+                _ = renewal_stopped.changed() => {
+                    return Err(ServerError::ServiceStopped);
+                }
             }
         }
     }
     /// Gracefully stops Actors, peer transport, and Node Lease renewal.
-    pub async fn shutdown(mut self) {
-        self.inner.shutdown().await;
+    pub(crate) async fn shutdown(mut self) -> Result<(), ServerError> {
+        let result = self.inner.shutdown().await;
         if let Some(tasks) = self.cluster.take() {
             tasks.shutdown().await;
         }
+        result
     }
 }
 

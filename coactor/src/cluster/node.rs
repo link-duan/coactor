@@ -61,11 +61,13 @@ pub struct PeerTask {
     pub shutdown: watch::Sender<bool>,
     pub force: oneshot::Sender<()>,
     pub task: tokio::task::JoinHandle<()>,
+    pub stopped: watch::Receiver<bool>,
 }
 
 pub struct RenewalTask {
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<RenewalExit>,
+    pub stopped: watch::Receiver<bool>,
 }
 struct RenewalExit {
     leases: Arc<dyn NodeLeaseStore>,
@@ -107,6 +109,7 @@ where
 {
     let (shutdown, shutdown_receiver) = watch::channel(false);
     let (force, force_receiver) = oneshot::channel();
+    let (stopped_sender, stopped) = watch::channel(false);
     let mut listener = transport
         .listen(advertised, listener)
         .expect("peer listener bind");
@@ -130,11 +133,13 @@ where
                 }
             }
         }
+        let _ = stopped_sender.send(true);
     });
     PeerTask {
         shutdown,
         force,
         task,
+        stopped,
     }
 }
 
@@ -156,7 +161,9 @@ where
     S: Send + Sync + 'static,
 {
     let (shutdown, mut shutdown_receiver) = oneshot::channel();
+    let (stopped_sender, stopped) = watch::channel(false);
     let task = tokio::spawn(async move {
+        let _stopped_sender = stopped_sender;
         loop {
             let jitter = 0.8 + (rand::random::<u16>() % 401) as f64 / 1000.0;
             let renewal_due = tokio::time::Instant::now() + timing.interval.mul_f64(jitter);
@@ -243,5 +250,9 @@ where
             }
         }
     });
-    RenewalTask { shutdown, task }
+    RenewalTask {
+        shutdown,
+        task,
+        stopped,
+    }
 }

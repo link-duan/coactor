@@ -59,9 +59,11 @@ pub enum ActorAddressError {
 }
 
 #[derive(Debug, Error)]
-pub enum ServerStartError {
-    #[error("bind address is required")]
-    MissingBindAddress,
+pub enum ServerError {
+    #[error(
+        "listen address must be `:port`, an IPv4 socket address, or a bracketed IPv6 socket address"
+    )]
+    InvalidListenAddress,
     #[error("advertised endpoint is required")]
     MissingAdvertisedEndpoint,
     #[error("Actor Type `{0}` is invalid")]
@@ -94,12 +96,12 @@ pub enum ServerStartError {
     LeaseUnconfirmed,
     #[error("Coordination Store is unavailable during startup")]
     Coordination(#[source] crate::coordination::CoordinationError),
-}
-
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub enum ServerFailure {
+    #[error("an internal Server service stopped unexpectedly")]
+    ServiceStopped,
     #[error("the Server self-fenced after losing Node authority")]
     Fenced,
+    #[error("the Server forced Active Actors to stop after graceful shutdown timed out")]
+    ShutdownTimedOut,
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]

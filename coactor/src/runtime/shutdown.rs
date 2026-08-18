@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use super::core::{FENCED, RUNNING, SHUTTING_DOWN, STOPPED, ServerInner};
 use crate::cluster::NodeRecord;
-use crate::{ActorAddress, SendError};
+use crate::{ActorAddress, SendError, ServerError};
 
 impl<S> ServerInner<S>
 where
@@ -27,7 +27,7 @@ where
         node.draining = self.status.load(Ordering::Acquire) != RUNNING;
     }
 
-    pub async fn shutdown(self: &Arc<Self>) {
+    pub async fn shutdown(self: &Arc<Self>) -> Result<(), ServerError> {
         tracing::debug!(
             lifecycle = "shutdown",
             error_category = "None",
@@ -40,7 +40,7 @@ where
                 .compare_exchange(RUNNING, SHUTTING_DOWN, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                return;
+                return Ok(());
             }
 
             let mut completions = Vec::with_capacity(actors.len());
@@ -60,10 +60,10 @@ where
                 }
             }
         };
-        if tokio::time::timeout(self.shutdown_timeout, wait)
+        let timed_out = tokio::time::timeout(self.shutdown_timeout, wait)
             .await
-            .is_err()
-        {
+            .is_err();
+        if timed_out {
             tracing::warn!(
                 lifecycle = "shutdown",
                 error_category = "ShutdownTimedOut",
@@ -86,6 +86,11 @@ where
             error_category = "None",
             "CoActor runtime shutdown completed"
         );
+        if timed_out {
+            Err(ServerError::ShutdownTimedOut)
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn fence(self: &Arc<Self>) {

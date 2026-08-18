@@ -14,7 +14,7 @@ use crate::runtime::ServerBuilderCore;
 use crate::transport::inmem::{InmemRegistry, InmemTransport};
 use crate::transport::{Endpoint, ServerTransport};
 use crate::{
-    __macro, IntoActorConfig, NodeDirectory, NodeRecord, NodeSessionId, Server, ServerStartError,
+    __macro, IntoActorConfig, NodeDirectory, NodeRecord, NodeSessionId, Server, ServerError,
 };
 
 struct SingleNodeDirectory(NodeRecord);
@@ -95,7 +95,7 @@ where
         self
     }
 
-    async fn start_with_state(mut self, state: S) -> Result<TestServer<S>, ServerStartError> {
+    async fn start_with_state(mut self, state: S) -> Result<TestServer<S>, ServerError> {
         self.core = self.core.with_state(state);
         self.core.validate()?;
         let registry = InmemRegistry::new();
@@ -157,7 +157,7 @@ where
 }
 
 impl TestServerBuilder<(), crate::runtime::MissingState> {
-    pub async fn start(self) -> Result<TestServer<()>, ServerStartError> {
+    pub async fn start(self) -> Result<TestServer<()>, ServerError> {
         self.start_with_state(()).await
     }
 }
@@ -166,7 +166,7 @@ impl<S> TestServerBuilder<S, crate::runtime::ReadyState>
 where
     S: Send + Sync + 'static,
 {
-    pub async fn start(mut self) -> Result<TestServer<S>, ServerStartError> {
+    pub async fn start(mut self) -> Result<TestServer<S>, ServerError> {
         let state = self
             .core
             .state
@@ -184,7 +184,7 @@ impl<S: Send + Sync + 'static> TestServer<S> {
     /// Stops the test Server and its in-memory Client.
     pub async fn shutdown(self) {
         self.accept_task.abort();
-        self.server.shutdown().await;
+        let _ = self.server.shutdown().await;
         self.client.shutdown().await;
     }
 }
@@ -198,7 +198,10 @@ mod cluster_fakes {
     use async_trait::async_trait;
     use std::{
         collections::HashMap,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
 
@@ -207,11 +210,12 @@ mod cluster_fakes {
         revision: Revision,
         expires_at_unix_ms: u64,
     }
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     pub(crate) struct TestCoordinationStore {
-        leases: Mutex<HashMap<String, TestNodeLease>>,
-        owners: Mutex<HashMap<ActorAddress, VersionedActorOwnerRecord>>,
-        next_revision: Mutex<u64>,
+        leases: Arc<Mutex<HashMap<String, TestNodeLease>>>,
+        owners: Arc<Mutex<HashMap<ActorAddress, VersionedActorOwnerRecord>>>,
+        next_revision: Arc<Mutex<u64>>,
+        panic_on_renewal: Arc<AtomicBool>,
     }
     impl TestCoordinationStore {
         fn next(&self) -> Revision {
@@ -228,6 +232,10 @@ mod cluster_fakes {
 
         pub(crate) fn remove_node(&self, node_id: &str) {
             self.leases.lock().unwrap().remove(node_id);
+        }
+
+        pub(crate) fn panic_on_renewal(&self) {
+            self.panic_on_renewal.store(true, Ordering::Release);
         }
     }
     #[async_trait]
@@ -298,6 +306,10 @@ mod cluster_fakes {
             ttl: Duration,
             revision: &Revision,
         ) -> Result<MutationOutcome<Revision>, CoordinationError> {
+            assert!(
+                !self.panic_on_renewal.load(Ordering::Acquire),
+                "injected renewal task failure"
+            );
             let mut leases = self.leases.lock().unwrap();
             if !leases
                 .get(&node.node_id)

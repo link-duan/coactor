@@ -1,11 +1,9 @@
 use std::time::Duration;
 
-use crate::transport::inmem::InmemRegistry;
 use crate::{
     Actor, ActorAddress, ActorRuntime, MessageContext, MutationOutcome, NodeDirectory,
-    NodeLeaseStore, NodeRecord, NodeSessionId, Revision, Server, ServerBuilderCore, ServerFailure,
-    ServerStartError, actor,
-    test_support::{TestCoordinationStore, start_cluster_inmem},
+    NodeLeaseStore, NodeRecord, NodeSessionId, Revision, Server, ServerError, actor,
+    test_support::TestCoordinationStore,
 };
 
 #[actor]
@@ -15,6 +13,18 @@ impl Actor<()> for Probe {
         Self
     }
     async fn on_message(&mut self, _: &MessageContext, _: &[u8]) {}
+}
+
+#[actor]
+struct HangingProbe;
+impl Actor<()> for HangingProbe {
+    fn new(_: ActorRuntime<()>) -> Self {
+        Self
+    }
+    async fn on_message(&mut self, _: &MessageContext, _: &[u8]) {}
+    async fn on_deactivate(&mut self, _: crate::DeactivationReason) {
+        std::future::pending().await
+    }
 }
 
 #[derive(Clone)]
@@ -29,64 +39,157 @@ impl Actor<SharedState> for StatefulProbe {
     async fn on_message(&mut self, _: &MessageContext, _: &[u8]) {}
 }
 
-#[test]
-fn production_builder_infers_state_in_both_orders() {
-    let _ = Server::builder(TestCoordinationStore::default())
+#[tokio::test]
+async fn production_builder_serves_with_state_in_both_orders() {
+    Server::builder(TestCoordinationStore::default())
         .with_state(SharedState)
-        .actor::<StatefulProbe>("stateful");
-    let _ = Server::builder(TestCoordinationStore::default())
         .actor::<StatefulProbe>("stateful")
-        .with_state(SharedState);
+        .advertised_endpoint("127.0.0.1:7000")
+        .shutdown_signal(async {})
+        .serve(":0")
+        .await
+        .unwrap();
+    Server::builder(TestCoordinationStore::default())
+        .actor::<StatefulProbe>("stateful")
+        .with_state(SharedState)
+        .advertised_endpoint("127.0.0.1:7000")
+        .shutdown_signal(async {})
+        .serve(":0")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
-async fn server_builder_validates_named_network_configuration_at_start() {
-    let error = match Server::builder(TestCoordinationStore::default())
+async fn server_serve_accepts_wildcard_port_and_gracefully_stops() {
+    Server::builder(TestCoordinationStore::default())
+        .advertised_endpoint("127.0.0.1:7000")
         .actor::<Probe>("probe")
-        .start()
+        .shutdown_signal(async {})
+        .serve(":0")
         .await
-    {
-        Ok(_) => panic!("missing bind address should fail"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, ServerStartError::MissingBindAddress));
+        .unwrap();
+}
 
-    let bind = "127.0.0.1:0".parse().unwrap();
-    let error = match Server::builder(TestCoordinationStore::default())
-        .bind(bind)
+#[tokio::test]
+async fn server_serve_accepts_bracketed_ipv6_address_when_available() {
+    if std::net::TcpListener::bind("[::1]:0").is_err() {
+        return;
+    }
+    Server::builder(TestCoordinationStore::default())
+        .advertised_endpoint("[::1]:7000")
         .actor::<Probe>("probe")
-        .start()
+        .shutdown_signal(async {})
+        .serve("[::1]:0")
         .await
-    {
-        Ok(_) => panic!("missing endpoint should fail"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, ServerStartError::MissingAdvertisedEndpoint));
+        .unwrap();
+}
 
-    let error = match Server::builder(TestCoordinationStore::default())
-        .bind(bind)
+#[tokio::test]
+async fn server_serve_releases_node_lease_after_shutdown_signal() {
+    let store = TestCoordinationStore::default();
+    let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(
+        Server::builder(store.clone())
+            .advertised_endpoint("127.0.0.1:7000")
+            .node_id("node-a")
+            .actor::<Probe>("probe")
+            .shutdown_signal(async {
+                let _ = shutdown_signal.await;
+            })
+            .serve("127.0.0.1:0"),
+    );
+
+    while store.read_node("node-a").await.unwrap().is_none() {
+        tokio::task::yield_now().await;
+    }
+    shutdown.send(()).unwrap();
+
+    serving.await.unwrap().unwrap();
+    assert!(store.read_node("node-a").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn server_serve_reports_graceful_shutdown_timeout() {
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen_address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+
+    let store = TestCoordinationStore::default();
+    let serving_store = store.clone();
+    let advertised_endpoint = listen_address.clone();
+    let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async move {
+        Server::builder(serving_store)
+            .advertised_endpoint(&advertised_endpoint)
+            .node_id("node-a")
+            .actor::<HangingProbe>("hanging-probe")
+            .shutdown_timeout(Duration::from_millis(10))
+            .shutdown_signal(async {
+                let _ = shutdown_signal.await;
+            })
+            .serve(&listen_address)
+            .await
+    });
+
+    while store.read_node("node-a").await.unwrap().is_none() {
+        tokio::task::yield_now().await;
+    }
+    let client = crate::Client::builder(store).build().unwrap();
+    let address = ActorAddress::new("hanging-probe", "probe-1").unwrap();
+    let _session = client.open(&address).await.unwrap();
+
+    shutdown.send(()).unwrap();
+
+    assert!(matches!(
+        serving.await.unwrap(),
+        Err(ServerError::ShutdownTimedOut)
+    ));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn server_builder_validates_named_network_configuration_when_serving() {
+    let error = Server::builder(TestCoordinationStore::default())
+        .actor::<Probe>("probe")
+        .serve("127.0.0.1:0")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ServerError::MissingAdvertisedEndpoint));
+
+    let error = Server::builder(TestCoordinationStore::default())
         .advertised_endpoint("http://example.com:7000")
         .actor::<Probe>("probe")
-        .start()
+        .serve("127.0.0.1:0")
         .await
-    {
-        Ok(_) => panic!("scheme should fail endpoint validation"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, ServerStartError::InvalidAdvertisedEndpoint));
+        .unwrap_err();
+    assert!(matches!(error, ServerError::InvalidAdvertisedEndpoint));
 
-    let error = match Server::builder(TestCoordinationStore::default())
-        .bind(bind)
+    let error = Server::builder(TestCoordinationStore::default())
         .advertised_endpoint("example.com:7000")
         .node_id("Bad_Node")
         .actor::<Probe>("probe")
-        .start()
+        .serve("127.0.0.1:0")
         .await
-    {
-        Ok(_) => panic!("invalid Node ID should fail"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, ServerStartError::InvalidNodeId));
+        .unwrap_err();
+    assert!(matches!(error, ServerError::InvalidNodeId));
+
+    let error = Server::builder(TestCoordinationStore::default())
+        .advertised_endpoint("example.com:7000")
+        .actor::<Probe>("probe")
+        .serve("localhost:7000")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ServerError::InvalidListenAddress));
+
+    for address in ["127.0.0.1", "[::1", ":", ":70000"] {
+        let error = Server::builder(TestCoordinationStore::default())
+            .advertised_endpoint("example.com:7000")
+            .actor::<Probe>("probe")
+            .serve(address)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ServerError::InvalidListenAddress));
+    }
 
     assert_eq!(
         crate::cluster::canonical_endpoint("EXAMPLE.com:7000"),
@@ -117,18 +220,49 @@ fn node(node_id: &str) -> NodeRecord {
 }
 
 #[tokio::test(start_paused = true)]
-async fn server_wait_reports_self_fencing() {
-    let store = std::sync::Arc::new(TestCoordinationStore::default());
-    let registry = InmemRegistry::new();
-    let mut core = ServerBuilderCore::base(Some(()));
-    core.add_actor::<Probe>(crate::ActorConfig::new("probe"));
-    let server = start_cluster_inmem(core, store.clone(), "node-a", registry).await;
-    tokio::task::yield_now().await;
+async fn server_serve_reports_self_fencing() {
+    let store = TestCoordinationStore::default();
+    let serving = tokio::spawn(
+        Server::builder(store.clone())
+            .advertised_endpoint("127.0.0.1:7000")
+            .node_id("node-a")
+            .actor::<Probe>("probe")
+            .serve("127.0.0.1:0"),
+    );
+
+    while store.read_node("node-a").await.unwrap().is_none() {
+        tokio::task::yield_now().await;
+    }
     store.remove_node("node-a");
-    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::advance(Duration::from_secs(11)).await;
     tokio::task::yield_now().await;
-    assert_eq!(server.wait().await, Err(ServerFailure::Fenced));
-    server.shutdown().await;
+
+    assert!(matches!(serving.await.unwrap(), Err(ServerError::Fenced)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn server_serve_reports_unexpected_renewal_service_stop() {
+    let store = TestCoordinationStore::default();
+    let serving = tokio::spawn(
+        Server::builder(store.clone())
+            .advertised_endpoint("127.0.0.1:7000")
+            .node_id("node-a")
+            .node_lease_ttl(Duration::from_secs(3))
+            .actor::<Probe>("probe")
+            .serve("127.0.0.1:0"),
+    );
+
+    while store.read_node("node-a").await.unwrap().is_none() {
+        tokio::task::yield_now().await;
+    }
+    store.panic_on_renewal();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+
+    assert!(matches!(
+        serving.await.unwrap(),
+        Err(ServerError::ServiceStopped)
+    ));
 }
 
 #[tokio::test]

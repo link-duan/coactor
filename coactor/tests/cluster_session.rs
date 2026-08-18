@@ -63,7 +63,7 @@ async fn clients_open_directly_through_the_node_directory() {
     assert_eq!(second.recv().await.unwrap().unwrap(), b"a:again");
 
     client.shutdown().await;
-    server.shutdown().await;
+    let _ = server.shutdown().await;
 }
 
 struct StaticDirectory(Vec<NodeRecord>);
@@ -99,7 +99,7 @@ async fn client_open_evicts_an_unreachable_gateway_and_retries_another() {
     session.send(b"ok".to_vec()).await.unwrap();
     assert_eq!(session.recv().await.unwrap().unwrap(), b"live:ok");
     client.shutdown().await;
-    server.shutdown().await;
+    let _ = server.shutdown().await;
 }
 
 struct CountingDirectory(Arc<AtomicUsize>);

@@ -52,26 +52,12 @@ let store = S3CoordinationStore::new(
     "coactor/dev",
 )?;
 
-let server = Server::builder(store)
-    .bind("127.0.0.1:7000".parse()?)
+Server::builder(store)
     .advertised_endpoint("127.0.0.1:7000")
     .node_id("dev-node")
     .actor::<Counter>("counter")
-    .start()
+    .serve(":7000")
     .await?;
-
-let failure = tokio::select! {
-    result = server.wait() => result.err(),
-    result = tokio::signal::ctrl_c() => {
-        result?;
-        None
-    }
-};
-
-server.shutdown().await;
-if let Some(error) = failure {
-    return Err(error.into());
-}
 ```
 
 ## Connect a Client

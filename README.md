@@ -17,11 +17,10 @@ CoActor is an embedded distributed Actor runtime for Rust applications. It addre
 ### Server
 
 ```rust
-let server = Server::builder(coordination_store)
-    .bind("0.0.0.0:7000".parse()?)
+Server::builder(coordination_store)
     .advertised_endpoint("actor-0.internal:7000")
     .actor::<CounterActor>("counter")
-    .start()
+    .serve(":7000")
     .await?;
 ```
 

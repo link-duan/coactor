@@ -92,12 +92,12 @@ async fn same_node_rejection_falls_back_to_another_live_node() {
     assert_eq!(owner.record.owner.unwrap().node_id, "node-b");
 
     client.shutdown().await;
-    fallback.shutdown().await;
-    gateway.shutdown().await;
+    let _ = fallback.shutdown().await;
+    let _ = gateway.shutdown().await;
     replacement_client.shutdown().await;
-    replacement.shutdown().await;
+    let _ = replacement.shutdown().await;
     old_client.shutdown().await;
-    old.shutdown().await;
+    let _ = old.shutdown().await;
 }
 
 #[tokio::test]
@@ -149,7 +149,7 @@ async fn replacement_session_lazily_takes_over_same_node_with_higher_epoch() {
     assert!(next_owner.record.ownership_epoch > first_owner.record.ownership_epoch);
 
     replacement_client.shutdown().await;
-    replacement.shutdown().await;
+    let _ = replacement.shutdown().await;
     first_client.shutdown().await;
-    first_server.shutdown().await;
+    let _ = first_server.shutdown().await;
 }

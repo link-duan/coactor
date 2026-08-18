@@ -17,7 +17,7 @@ use super::{
 use crate::runtime::ServerBuilderCore;
 use crate::transport::grpc::GrpcTransport;
 use crate::transport::{ClientTransport, Endpoint, ServerTransport};
-use crate::{ActorAddress, Server, ServerStartError};
+use crate::{ActorAddress, Server, ServerError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -320,13 +320,13 @@ pub(crate) struct ServerStarter<S> {
 }
 
 impl<S: Send + Sync + 'static> ServerStarter<S> {
-    pub async fn start(self) -> Result<Server<S>, ServerStartError> {
+    pub(crate) async fn start(self) -> Result<Server<S>, ServerError> {
         self.builder.validate()?;
         let listener = match self.config.bind_address {
             Some(address) => Some(
                 tokio::net::TcpListener::bind(address)
                     .await
-                    .map_err(ServerStartError::BindFailed)?,
+                    .map_err(ServerError::BindFailed)?,
             ),
             None => None,
         };
@@ -353,11 +353,11 @@ impl<S: Send + Sync + 'static> ServerStarter<S> {
                 .acquire_node(node.clone(), self.config.node_lease_ttl),
         )
         .await
-        .map_err(|_| ServerStartError::LeaseUnconfirmed)?
-        .map_err(ServerStartError::Coordination)?;
+        .map_err(|_| ServerError::LeaseUnconfirmed)?
+        .map_err(ServerError::Coordination)?;
         let revision = match acquired {
             MutationOutcome::Applied(revision) => revision,
-            MutationOutcome::Conflict => return Err(ServerStartError::LeaseConflict),
+            MutationOutcome::Conflict => return Err(ServerError::LeaseConflict),
             MutationOutcome::Indeterminate(_) => confirm_node_lease(
                 self.stores.node_leases.as_ref(),
                 &node,
@@ -365,7 +365,7 @@ impl<S: Send + Sync + 'static> ServerStarter<S> {
                 self.config.coordination_timeout,
             )
             .await
-            .ok_or(ServerStartError::LeaseUnconfirmed)?,
+            .ok_or(ServerError::LeaseUnconfirmed)?,
         };
         let (termination_sender, termination_receiver) = watch::channel(false);
         let authority = Arc::new(NodeAuthority::new(
@@ -374,7 +374,7 @@ impl<S: Send + Sync + 'static> ServerStarter<S> {
             termination_sender,
         ));
         if !authority.is_valid() {
-            return Err(ServerStartError::LeaseUnconfirmed);
+            return Err(ServerError::LeaseUnconfirmed);
         }
         let cluster = ClusterRouter::new(
             self.stores.directory.clone(),

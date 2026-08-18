@@ -152,12 +152,11 @@ pub fn app_state(&self) -> &Arc<S>
 不需要业务 State：
 
 ```rust
-let server = Server::builder(coordination_store)
+Server::builder(coordination_store)
     .node_id("node-a")
-    .listen(bind_address)
-    .advertise(advertised_address)
+    .advertised_endpoint(advertised_address)
     .actor::<CounterActor>("counter")
-    .start()
+    .serve(":7000")
     .await?;
 ```
 
@@ -166,13 +165,12 @@ let server = Server::builder(coordination_store)
 需要业务 State 时显式注入：
 
 ```rust
-let server = Server::builder(coordination_store)
+Server::builder(coordination_store)
     .with_state(AppState)
     .node_id("node-a")
-    .listen(bind_address)
-    .advertise(advertised_address)
+    .advertised_endpoint(advertised_address)
     .actor::<CounterActor>("counter")
-    .start()
+    .serve(":7000")
     .await?;
 ```
 
@@ -195,7 +193,7 @@ Server::builder(AppState, coordination_store)
 ```rust
 Server::builder(store)
     .actor::<UnitActor>("counter")
-    .start();
+    .serve(":7000");
 ```
 
 需要业务 State 时，`.with_state(...)` 提供 `S` 的实际值。它既可以出现在 Actor registration 前，也可以出现在后面：
@@ -204,14 +202,14 @@ Server::builder(store)
 Server::builder(store)
     .with_state(AppState)
     .actor::<StatefulActor>("counter")
-    .start();
+    .serve(":7000");
 ```
 
 ```rust
 Server::builder(store)
     .actor::<StatefulActor>("counter")
     .with_state(AppState)
-    .start();
+    .serve(":7000");
 ```
 
 第二种形状中，`StatefulActor: ActorType<AppState>` 与 `.with_state(AppState)` 共同把 builder 的 `S` 推导为 `AppState`；registration 已经是 `Registration<AppState>`，因此不需要把 `Registration<()>` 转换成其他类型。
@@ -232,7 +230,7 @@ impl<C, S> ServerBuilder<C, S> {
 }
 
 impl<C> ServerBuilder<C, ()> {
-    pub async fn start(self) -> Result<Server<()>, ServerStartError>;
+    pub async fn serve(self, address: &str) -> Result<(), ServerError>;
 }
 
 impl<C, S> ReadyServerBuilder<C, S> {
@@ -240,11 +238,11 @@ impl<C, S> ReadyServerBuilder<C, S> {
     where
         A: ActorType<S>;
 
-    pub async fn start(self) -> Result<Server<S>, ServerStartError>;
+    pub async fn serve(self, address: &str) -> Result<(), ServerError>;
 }
 ```
 
-`ServerBuilder<C, ()>::start()` 隐式提供 unit State；其他 State 类型需要通过 `.with_state(...)` 进入 ready 阶段。公开类型名称不一定需要暴露 `ReadyServerBuilder`，也可以使用私有 typestate 参数表达。
+`ServerBuilder<C, ()>::serve()` 隐式提供 unit State；其他 State 类型需要通过 `.with_state(...)` 进入 ready 阶段。公开类型名称不一定需要暴露 `ReadyServerBuilder`，也可以使用私有 typestate 参数表达。
 
 ### Builder 顺序
 
@@ -253,19 +251,17 @@ impl<C, S> ReadyServerBuilder<C, S> {
 ```rust
 Server::builder(store)
     .with_state(state)
-    .bind(...)
     .advertised_endpoint(...)
     .actor::<A>(...)
-    .start()
+    .serve(":7000")
 ```
 
 ```rust
 Server::builder(store)
     .actor::<A>(...)
     .with_state(state)
-    .bind(...)
     .advertised_endpoint(...)
-    .start()
+    .serve(":7000")
 ```
 
 CoActor 只允许一个顶层 App State 类型，不复制 Axum 连续注入不同 State、继续组合新 routes 的多 State 行为。
