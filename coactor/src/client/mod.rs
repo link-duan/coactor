@@ -135,7 +135,7 @@ impl Client {
         Self::from_parts(transport, directory, DEFAULT_OPEN_TIMEOUT)
     }
 
-    /// Opens a persistent bidirectional Session to the supplied Actor Address.
+    /// Opens a bidirectional Session to the supplied Actor Address.
     pub async fn open(&self, address: &ActorAddress) -> Result<Session, OpenError> {
         let client = self.inner.clone();
         if client.status.load(Ordering::Acquire) != RUNNING {

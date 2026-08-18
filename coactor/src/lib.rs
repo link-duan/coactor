@@ -1,12 +1,11 @@
 //! Embedded distributed Actor runtime for Rust applications.
 //!
 //! CoActor addresses logical Actors with a validated [`ActorAddress`], hosts them
-//! in a [`Server`], and lets callers communicate through persistent bidirectional
+//! in a [`Server`], and lets callers communicate through bidirectional
 //! [`Session`]s opened by a [`Client`]. Actions and Events are byte messages with
 //! in-memory, at-most-once delivery semantics.
 //!
-//! The current runtime provides availability failover, not Actor state recovery.
-//! Events are not durable acknowledgements.
+//! Availability failover starts a replacement Active Actor with empty CoActor-managed state.
 //!
 //! Start with the repository's [Getting Started guide][getting-started].
 //!

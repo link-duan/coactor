@@ -33,5 +33,5 @@ status: accepted
 - 关闭 ADR-0008 的“Server 放置”开放决策；Client 池均衡与正式非 K8s 发现方案仍为开放决策。
 - 跨网关的 herd 残余风险（p2c 偏置最空节点）被接受，由"转发失败剔除候选 + client 重试"自愈；单网关内的 herd 由 in-flight 记账压掉。
 - 缓存引入 ≤ ~3.3s 的额外指标滞后，p2c 容忍；缓存误判（漏掉刚排空的节点）由转发失败剔除兜底。
-- 无持续 rebalance：放置失衡只能等 passivation + failover 缓慢纠正，主动 Migration 仍是后续独立决策（CONTEXT.md 已预留）。
+- 无持续 rebalance：放置失衡只能等 passivation + failover 缓慢纠正。
 - 新增 `rand` direct dependency（已在 lockfile 中作为传递依赖）；dead code 的 `placement_candidates` 被新实现取代。

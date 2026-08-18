@@ -10,4 +10,4 @@ CoActor 在嵌入式 runtime 之上扩展分布式生产能力，但不引入强
 
 设计有意假设普通时钟同步，并使用本地 monotonic time 执行 self-fencing；不宣称可以容忍任意 clock skew。含糊的 storage mutation 必须执行有界 read-back reconciliation。Capacity information 只是 Placement hint，不是 reservation。
 
-本阶段提供 Availability Failover，而不是 Recovery：确认旧 Owner 失效后，新 Owner 从空 CoActor-managed state 启动，caller 必须重新建立 Session（见 ADR-0005）。开发与 CI 通过 deterministic fake、本地 HTTP contract test 和 S3-compatible emulator 验证 adapter；真实 AWS qualification 是发布门禁，而不是日常测试前提。详细 wire、lease 与 takeover 规则由 distributed runtime semantics 文档维护。
+本阶段提供 Availability Failover：确认旧 Owner 失效后，新 Owner 从空 CoActor-managed state 启动，不恢复旧 Owner 的内存状态；caller 必须重新建立 Session（见 ADR-0005）。开发与 CI 通过 deterministic fake、本地 HTTP contract test 和 S3-compatible emulator 验证 adapter；真实 AWS qualification 是发布门禁，而不是日常测试前提。详细 wire、lease 与 takeover 规则由 distributed runtime semantics 文档维护。

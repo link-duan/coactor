@@ -48,7 +48,7 @@ impl CallerRegistry {
     }
 }
 
-/// A persistent caller-side Session for sending Actions and receiving Events.
+/// A caller-side Session for sending Actions and receiving Events.
 pub struct Session {
     pub(crate) client: Weak<ClientInner>,
     pub(crate) address: ActorAddress,
@@ -62,7 +62,7 @@ pub struct Session {
 impl Session {
     /// Sends a fire-and-forget Action.
     ///
-    /// Success confirms transport admission, not Actor processing or durable storage.
+    /// Success confirms transport admission, not Actor processing.
     /// A Server-side rejection may arrive asynchronously through [`Session::recv`].
     pub async fn send(&self, msg: Vec<u8>) -> Result<(), SendError> {
         let client = self.client.upgrade().ok_or(SendError::RuntimeStopped)?;

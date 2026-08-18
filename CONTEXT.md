@@ -1,6 +1,6 @@
 # CoActor Runtime
 
-CoActor 为业务 key 提供按需运行的 Actor 执行边界。本词汇表同时定义已交付的执行与 ownership 语言，以及为后续持久化保留的术语；术语存在不表示对应能力已经交付。
+CoActor 为业务 key 提供按需运行的 Actor 执行边界。本词汇表定义已交付的执行与 ownership 语言。
 
 ## Language
 
@@ -33,11 +33,11 @@ caller 通过 Session 向 Actor 发送的入站消息，字节负载，无 reply
 _Avoid_: Command, request, method call
 
 **Event**:
-Actor 通过 Session Handle 推送给 caller 的出站消息，字节负载；Actor 可随时推送，不要求对应一次 Action。它不证明对应 mutation 已持久化，crash 后可能丢失。
-_Avoid_: Reply, response, Durable ACK
+Actor 通过 Session Handle 推送给 caller 的出站消息，字节负载；Actor 可随时推送，不要求对应一次 Action。
+_Avoid_: Reply, response
 
 **Session**:
-caller 与 Actor 之间的一次持久双向通道；所有 Action 都经 Session 入站，Event 经 Session 出站。Client 以 Actor Address 打开 Session；owner 或网关失效都会显式打断它，由 caller 重新打开。
+caller 与 Actor 之间的一次双向通道；所有 Action 都经 Session 入站，Event 经 Session 出站。Client 以 Actor Address 打开 Session；owner 或网关失效都会显式打断它，由 caller 重新打开。
 _Avoid_: Connection handle, command channel
 
 **Session Handle**:
@@ -61,7 +61,7 @@ Active Actor 已开始执行 deactivation lifecycle、不可再恢复服务的�
 _Avoid_: Idle, passivation candidate
 
 **Ownership Epoch**:
-ownership CAS 产生的单调 Owner 世代；它区分同一 Actor Address 的先后授权，consumer 不感知该值。未来持久化可将其作为 fencing 与恢复边界。
+ownership CAS 产生的单调 Owner 世代；它区分同一 Actor Address 的先后授权，consumer 不感知该值。
 _Avoid_: Process generation, activation number
 
 **Owner**:
@@ -69,33 +69,15 @@ _Avoid_: Process generation, activation number
 _Avoid_: Active Actor location, registry entry
 
 **Fencing**:
-阻止 stale Owner 继续服务，或阻止其数据成为当前逻辑提交状态的安全机制组合。
+阻止 stale Owner 继续服务的安全机制组合。
 _Avoid_: Heartbeat alone, process shutdown alone
 
 **Self-Fence**:
 节点无法在时限内证明自己仍有权威时，主动停止 mutation 和成功响应的状态转换。
 _Avoid_: Graceful shutdown, lease renewal
 
-**Durable ACK Gate**:
-在持久化证明覆盖本次 mutation 之前扣留 durable success response 的边界。CoActor 当前不提供 durable ACK，因此普通 Event 不经过该边界。
-_Avoid_: Event, enqueue ACK
-
-
-
-**Restore Cut**:
-新 Owner 获得 Ownership Epoch 后，从小于新 epoch 的最大现存 state epoch 第一次成功读取时固定的确定版本，由 source epoch、Actor Store revision 与 object ETag 标识。
-_Avoid_: Re-reading until newer, best-effort snapshot
-
-**Recovery**:
-Owner 意外失效后，在有效 Owner 上重建 Actor 可继续服务状态的过程。
-_Avoid_: In-memory restart, migration
-
-**Migration**:
-在原 Owner 可参与时，有计划地转移 Actor ownership 与服务位置的过程。
-_Avoid_: Recovery, restart
-
 **Actor Lifecycle Method**:
-由 runtime 在确定生命周期阶段调用并等待、由 consumer 异步实现的 Actor 方法；consumer 可在其中执行 restore 或持久化。
+由 runtime 在确定生命周期阶段调用并等待、由 consumer 异步实现的 Actor 方法。
 _Avoid_: Action handler, arbitrary callback
 
 **Message Context**:
@@ -106,37 +88,13 @@ _Avoid_: Actor Context, Actor state, global variable
 一个 CoActor runtime 内由所有 Actor Type 共享的 consumer 强类型依赖容器，例如数据库 client、HTTP client 和配置。
 _Avoid_: TypeId service locator, Actor state
 
-**Persistence API**:
-CoActor 向 Actor 提供的持久存储访问边界；它不规定 consumer 保存的数据模型，后台 checkpoint 时机由 runtime policy 决定。
-_Avoid_: Automatic persistence, durable ACK
-
-**Actor-scoped KV**:
-以当前 Actor Address 隔离命名空间的 KV 能力；Active Actor 通过本地嵌入式 KV 引擎操作单文件 Actor Store，consumer 不感知物理文件或对象地址。
-_Avoid_: Global KV, raw object-store client
-
-**Actor Store**:
-承载一个 Actor-scoped KV 的本地单文件存储；Active Actor 操作本地文件，runtime 将其连同 `format_version`、`revision` 和 `checksum` 作为单个 durable state object 持久化到对象存储。
-_Avoid_: In-memory state, one S3 object per KV key
-
-**Actor Store Revision**:
-Actor Store 每次成功提交本地 KV 写事务后由 runtime/KV 层递增的状态版本；它不对应 Action 或单个 key。
-_Avoid_: Action sequence, ownership epoch
-
-**Persistence Fault**:
-Actor Store 在有界重试后仍无法持久化的单 Actor 停止服务状态；Active Actor 保留本地文件并拒绝所有新 Action，等待恢复或运维处置。
-_Avoid_: Ownership loss, node-wide fence
-
-**Restore Fault**:
-选定的历史 state object 存在但无法通过完整性、格式或 KV 文件校验时的 activation 失败状态；runtime 不自动回退到更早状态。
-_Avoid_: Empty state, first activation
-
 **Ownership Authority**:
 由 runtime 掌控、负责竞争、续持和释放 ownership，并产生单调 Ownership Epoch 的共享权威。它是集群正确性边界，通过 Coordination Store 实现，但不等同于 Node Directory。
 _Avoid_: Ownership Provider, Actor registry, Node Directory
 
 **Coordination Store**:
 承载 Node Lease 与 Actor Owner Record 的共享存储边界；它提供节点租约、live Node Directory 与 ownership 条件写语义，具体后端可采用 S3 或 etcd 的原生机制。
-_Avoid_: Ownership Authority, Service Discovery, Actor Store
+_Avoid_: Ownership Authority, Service Discovery
 
 **Node**:
 嵌入 CoActor runtime 并通过网络接收或转发 Action 的 consumer 进程运行位置；一个 Node 的长期运维身份与单次运行会话必须区分。
@@ -163,12 +121,12 @@ _Avoid_: active actor count alone, remaining capacity
 _Avoid_: Node Lease, local route, Node Directory entry
 
 **Availability Failover**:
-旧 Owner 失效后，由新 Owner 以更高 Ownership Epoch 从空 CoActor 状态重新提供服务；consumer 可自行重建外部状态，但 CoActor 不保证状态恢复。
-_Avoid_: Recovery, Migration, restart
+旧 Owner 失效后，由新 Owner 以更高 Ownership Epoch 从空 CoActor 状态重新提供服务。
+_Avoid_: restart
 
 **Ownership Fault**:
-runtime 无法取得、确认或继续持有服务权时产生的分布式 lifecycle failure；它不得被当作普通业务错误或持久化故障。
-_Avoid_: Actor Stopped, Persistence Fault, mailbox overload
+runtime 无法取得、确认或继续持有服务权时产生的分布式 lifecycle failure；它不得被当作普通业务错误或 mailbox overload。
+_Avoid_: Actor Stopped, mailbox overload
 
 **Consumer**:
 通过 CoActor Rust library 注册 Actor Type、发送 Action、接收 Event 并提供 Actor 业务逻辑的宿主应用。

@@ -4,7 +4,7 @@
 
 An Actor is a logical execution boundary identified by an `ActorAddress`: an Actor Type plus an Actor ID. Both components use Kubernetes DNS-label syntax. Creating or cloning an address does not activate the Actor.
 
-A Server registers Actor Types explicitly. A Client opens a persistent bidirectional Session to an address:
+A Server registers Actor Types explicitly. A Client opens a bidirectional Session to an address:
 
 ```rust
 let address = ActorAddress::new("room", "room-7")?;
@@ -18,7 +18,6 @@ Actions are byte messages sent by the caller. Events are byte messages pushed by
 For one Active Actor, CoActor processes Actions serially and non-reentrantly. Delivery is in-memory and at-most-once:
 
 - `Session::send` success confirms transport admission only;
-- an Event does not prove durable storage;
 - CoActor does not retransmit or deduplicate messages.
 
 Consumers own message serialization, schema compatibility, and business-level errors.
@@ -43,14 +42,12 @@ Clients reach Actors through Gateway nodes. Gateway or Owner failure interrupts 
 
 An unowned or stale Actor is placed on a live Server using current capacity information. The ownership claim fixes that placement; CoActor does not continuously rebalance active Actors.
 
-Owner or Gateway failure interrupts the Session. The caller must open a new Session. A replacement Owner currently starts with empty CoActor-managed state: this is availability failover, not state recovery.
+Owner or Gateway failure interrupts the Session. The caller must open a new Session. A replacement Owner starts with empty CoActor-managed state.
 
-## Current limits
+## Limits
 
-CoActor does not currently provide:
+CoActor does not provide:
 
-- Actor state persistence or Recovery;
-- durable acknowledgements;
 - Session migration across failures;
 - continuous placement rebalancing;
 - a built-in Coordination backend other than S3.

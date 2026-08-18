@@ -116,4 +116,4 @@ Then run the Client in another terminal:
 cargo run -p coactor --example counter_client
 ```
 
-A successful `send` confirms transport admission, not Actor processing or persistence. Read [Runtime model and guarantees](runtime.md) before relying on failure behavior.
+A successful `send` confirms transport admission, not Actor processing. Read [Runtime model and guarantees](runtime.md) before relying on failure behavior.

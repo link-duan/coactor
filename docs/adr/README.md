@@ -6,7 +6,6 @@ ADR status 表示决策是否仍然有效，不表示实现已经交付。被后
 
 - [ADR-0001：嵌入式 Actor runtime](0001-embedded-actor-runtime.md) — 单进程核心、consumer 边界与调用模型
 - [ADR-0002：提供无状态 Availability Failover 的分布式 runtime](0002-distributed-availability-failover.md) — peer transport、ownership、fencing 与无状态接管
-- [ADR-0003：将 Actor Store 与 Recovery 延后到持久化阶段](0003-actor-store-recovery.md) — 后续持久化与恢复边界
 - [ADR-0004：内置 S3 Ownership Authority](0004-built-in-s3-ownership-authority.md) — S3 conditional-write correctness；公开配置先后由 ADR-0010/0011 取代
 - [ADR-0005：Session 双向消息模型](0005-session-message-model.md) — Action/Event 字节消息、Passivation 条件、Failover 打断
 - [ADR-0006：Node 间 bidi gRPC stream](0006-bidi-peer-stream.md) — 多路复用流替代 unary Invoke

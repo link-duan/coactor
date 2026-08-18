@@ -114,7 +114,7 @@ pub trait Actor<S>: Send + 'static {
 
     /// Performs asynchronous initialization before the Active Actor begins serving Sessions.
     ///
-    /// Use this method for network, database, filesystem, and restore work. Offload
+    /// Use this method for network, database, filesystem, and other asynchronous work. Offload
     /// unavoidable blocking operations with [`tokio::task::spawn_blocking`].
     async fn on_activate(&mut self) -> Result<(), String> {
         Ok(())
