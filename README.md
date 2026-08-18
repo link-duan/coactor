@@ -40,6 +40,7 @@ Actions and Events are in-memory, at-most-once byte messages. A successful send 
 ## Documentation
 
 - [Getting started](docs/getting-started.md)
+- [Command-line chat example](docs/examples/command-line-chat.md)
 - [Runtime model and guarantees](docs/runtime.md)
 - [S3 deployment](docs/s3.md)
 - [Testing Actors](docs/testing.md)

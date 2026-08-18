@@ -55,11 +55,29 @@ jobs:
       - name: Build documentation
         run: cargo doc --locked --workspace --no-deps --all-features
 
-      - name: Check counter examples
-        run: >-
-          cargo check --locked -p coactor
-          --example counter_server
-          --example counter_client
+      - name: Check examples
+        run: cargo check --locked -p coactor --examples
+
+  chat-example:
+    name: Chat example integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Use stable Rust toolchain
+        run: rustup default stable
+
+      - name: Run chat example integration test
+        run: python3 scripts/test-chat-example.py
 
   s3-contract:
     name: S3 HTTP contract

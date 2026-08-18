@@ -179,6 +179,11 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Returns the identifier of the Session represented by this handle.
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
     pub async fn send(&self, msg: Vec<u8>) -> Result<(), SendError> {
         self.registry
             .deliver_event(&self.address, self.session_id, msg)

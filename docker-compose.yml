@@ -1,0 +1,43 @@
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    command: /data
+    environment:
+      RUSTFS_ACCESS_KEY: coactor-dev
+      RUSTFS_SECRET_KEY: coactor-dev-secret
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_REGION: us-east-1
+      RUSTFS_OBS_LOGGER_LEVEL: error
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - rustfs-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9000/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  rustfs-init:
+    image: minio/mc:latest
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint: >-
+      /bin/sh -c '
+      mc alias set local http://rustfs:9000 coactor-dev coactor-dev-secret &&
+      mc mb --ignore-existing local/coactor &&
+      touch /tmp/ready &&
+      tail -f /dev/null
+      '
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 10
+
+volumes:
+  rustfs-data:

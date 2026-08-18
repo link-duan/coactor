@@ -52,6 +52,14 @@ path = "examples/counter_server.rs"
 name = "counter_client"
 path = "examples/counter_client.rs"
 
+[[example]]
+name = "chat_server"
+path = "examples/chat_server.rs"
+
+[[example]]
+name = "chat_client"
+path = "examples/chat_client.rs"
+
 [[test]]
 name = "macro_ui"
 path = "tests/macro_ui.rs"

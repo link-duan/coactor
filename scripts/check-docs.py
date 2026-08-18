@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PUBLIC_DOCS = [
     ROOT / "README.md",
     ROOT / "docs" / "getting-started.md",
+    ROOT / "docs" / "examples" / "command-line-chat.md",
     ROOT / "docs" / "runtime.md",
     ROOT / "docs" / "s3.md",
     ROOT / "docs" / "testing.md",
