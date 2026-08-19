@@ -1,20 +1,28 @@
 # CoActor
 
-CoActor is an embedded distributed Actor runtime for Rust applications. It addresses Actors by stable business keys, activates them on demand, and coordinates ownership across Server nodes.
+> An embedded distributed Actor framework for Rust applications.
 
-> CoActor `0.1.0` provides in-memory Actor execution and availability failover.
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+
+CoActor brings location-transparent Actors to applications that already run on Tokio. It embeds Actor execution directly into your Server process, addresses Actors by stable business keys, activates them on demand, and coordinates ownership across Server nodes.
+
+> **Current status:** CoActor is in the early stages of development.
 
 ## Why CoActor?
 
-- **Fits existing Rust services.** CoActor runs inside the application's Tokio process; there is no separate Actor service or mandatory control plane to operate.
-- **Uses stable business identities.** Callers address an Actor by Actor Type and Actor ID without knowing which Server currently hosts it.
-- **Activates Actors on demand.** The runtime creates Active Actors when Sessions open and passivates idle Actors while preserving their logical addresses.
-- **Supports server push.** Bidirectional Sessions carry fire-and-forget Actions and independently emitted Events, including broadcasts to connected callers.
-- **Makes distributed failure explicit.** Leases, ownership fencing, and Session interruption prevent a stale Owner from being treated as current instead of hiding failover behind ambiguous success.
+CoActor is designed for applications that need Actor semantics without introducing a separate Actor service or mandatory control plane.
 
-## Example
+- **Embedded by design** — run the framework inside an existing Rust/Tokio service.
+- **Stable addressing** — address an Actor by its Actor Type and Actor ID, independent of its current Server.
+- **On-demand lifecycle** — activate Actors when Sessions open and passivate idle Actors while retaining their logical addresses.
+- **Bidirectional Sessions** — send fire-and-forget Actions and receive independently emitted Events, including broadcasts to connected callers.
+- **Explicit failure semantics** — leases, ownership fencing, and Session interruption make failover behavior observable instead of turning stale ownership into ambiguous success.
+- **Direct owner connections** — Clients resolve ownership and connect directly to the current Owner; Servers do not act as message-forwarding gateways.
 
-### Server
+## Quick start
+
+### Host an Actor on a Server
 
 ```rust
 Server::builder(coordination_store)
@@ -24,7 +32,7 @@ Server::builder(coordination_store)
     .await?;
 ```
 
-### Client
+### Open a Session from a Client
 
 ```rust
 let client = Client::builder(coordination_store).build()?;
@@ -35,16 +43,51 @@ session.send(b"increment".to_vec()).await?;
 let event = session.recv().await;
 ```
 
-Actions and Events are in-memory, at-most-once byte messages. A successful send confirms transport admission only. Owner or Transport Connection failure ends the Session; callers reopen it, and the new Owner starts with empty CoActor-managed state.
+For a complete setup—including S3 coordination, credentials, and runnable examples—see [Getting started](docs/getting-started.md).
+
+## Programming model
+
+An Actor is a stateful Rust type registered under a stable Actor Type name. Callers construct an [`ActorAddress`](https://docs.rs/coactor/latest/coactor/struct.ActorAddress.html) from that type name and an Actor ID, then exchange byte messages through a bidirectional Session.
+
+The framework manages:
+
+1. Actor registration and activation;
+2. bounded message admission and serialized Actor execution;
+3. Session lifecycle and server push;
+4. ownership placement, leases, and fencing across Server nodes; and
+5. graceful shutdown and failure propagation.
+
+## Delivery and failure semantics
+
+Actions and Events are in-memory, at-most-once byte messages. A successful `send` confirms transport admission only; it does not confirm that the Actor has processed the message.
+
+When an Owner or transport connection fails, the Session ends and the caller must reopen it. After failover, the new Owner starts with empty CoActor-managed state. These guarantees are intentional—read [Runtime model and guarantees](docs/runtime.md) before building application-level reliability or recovery on top of CoActor.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md)
-- [Command-line chat example](docs/examples/command-line-chat.md)
-- [Runtime model and guarantees](docs/runtime.md)
-- [S3 deployment](docs/s3.md)
-- [Testing Actors](docs/testing.md)
+- [Getting started](docs/getting-started.md) — install, define an Actor, and run a Server and Client
+- [Runtime model and guarantees](docs/runtime.md) — lifecycle, delivery, ownership, and failure behavior
+- [Command-line chat example](docs/examples/command-line-chat.md) — bidirectional Sessions and broadcast Events
+- [S3 deployment](docs/s3.md) — configure the shared Coordination Store
+- [Testing Actors](docs/testing.md) — test Actor behavior and lifecycle
+- [Architecture Decision Records](docs/adr/README.md) — design decisions behind the framework
+
+## Examples
+
+The repository includes runnable examples for a counter and a multi-client chat room:
+
+```bash
+cargo run -p coactor --example counter_server
+cargo run -p coactor --example counter_client
+```
+
+See the [command-line chat guide](docs/examples/command-line-chat.md) for the full multi-process example.
+
+## Requirements
+
+- Rust 1.85 or later
+- An S3-compatible bucket for distributed coordination
 
 ## License
 
-Licensed under either Apache-2.0 or MIT, at your option.
+Licensed under the [MIT License](LICENSE).

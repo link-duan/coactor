@@ -1,10 +1,10 @@
 [package]
 name = "coactor"
 version = "0.1.0"
-description = "An embedded distributed Actor runtime for Rust applications"
+description = "An embedded distributed Actor framework for Rust applications"
 readme = "../README.md"
 documentation = "https://docs.rs/coactor"
-keywords = ["actor", "distributed", "runtime", "tokio"]
+keywords = ["actor", "distributed", "framework", "tokio"]
 categories = ["asynchronous", "concurrency"]
 autotests = false
 edition.workspace = true

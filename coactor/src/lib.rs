@@ -1,4 +1,4 @@
-//! Embedded distributed Actor runtime for Rust applications.
+//! Embedded distributed Actor framework for Rust applications.
 //!
 //! CoActor addresses logical Actors with a validated [`ActorAddress`], hosts them
 //! in a [`Server`], and lets callers communicate through bidirectional
