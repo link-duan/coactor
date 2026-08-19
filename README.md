@@ -3,6 +3,7 @@
 > An embedded distributed Actor framework for Rust applications.
 
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+[![Unit test coverage](https://codecov.io/gh/link-duan/coactor/graph/badge.svg?flag=unit)](https://codecov.io/gh/link-duan/coactor?flags=unit)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
 CoActor brings location-transparent Actors to applications that already run on Tokio. It embeds Actor execution directly into your Server process, addresses Actors by stable business keys, activates them on demand, and coordinates ownership across Server nodes.

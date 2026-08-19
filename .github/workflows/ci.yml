@@ -58,6 +58,45 @@ jobs:
       - name: Check examples
         run: cargo check --locked -p coactor --examples
 
+  coverage:
+    name: Unit test coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+
+      - name: Use stable Rust toolchain
+        run: rustup default stable
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Measure unit test coverage
+        run: >-
+          cargo llvm-cov --locked --workspace --lib --all-features
+          --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          disable_search: true
+          flags: unit
+          name: unit-tests
+          fail_ci_if_error: true
+          use_oidc: true
+
   chat-example:
     name: Chat example integration
     runs-on: ubuntu-latest
