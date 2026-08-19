@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  verify:
+    name: Verify release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.85.0 --profile minimal
+
+      - name: Use stable Rust toolchain
+        run: rustup default stable
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          main_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "coactor") | .version')"
+          macros_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "coactor-macros") | .version')"
+
+          test "$tag_version" = "$main_version" || {
+            echo "Tag version $tag_version does not match coactor version $main_version"
+            exit 1
+          }
+          test "$main_version" = "$macros_version" || {
+            echo "coactor ($main_version) and coactor-macros ($macros_version) must have the same version"
+            exit 1
+          }
+
+      - name: Verify formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features
+
+      - name: Run tests
+        run: cargo test --locked --workspace --all-targets --all-features
+
+      - name: Check documentation structure
+        run: python3 scripts/check-docs.py
+
+      - name: Build documentation
+        run: cargo doc --locked --workspace --no-deps --all-features
+
+      - name: Package macro crate
+        run: cargo package --locked -p coactor-macros
+
+      - name: Verify MSRV
+        run: cargo +1.85.0 check --locked --workspace --all-features
+
+  publish:
+    name: Publish crates
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+
+      - name: Install stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Use stable Rust toolchain
+        run: rustup default stable
+
+      - name: Authenticate with crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish coactor-macros
+        run: cargo publish --locked -p coactor-macros --token "${{ steps.auth.outputs.token }}"
+
+      - name: Wait for coactor-macros index propagation
+        shell: bash
+        run: |
+          for attempt in {1..12}; do
+            if cargo info coactor-macros --registry crates-io >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "coactor-macros is not available in the crates.io index"
+          exit 1
+
+      - name: Package main crate
+        run: cargo package --locked -p coactor
+
+      - name: Publish coactor
+        run: cargo publish --locked -p coactor --token "${{ steps.auth.outputs.token }}"

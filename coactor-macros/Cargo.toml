@@ -1,6 +1,11 @@
 [package]
 name="coactor-macros"
 version="0.1.0"
+description="Procedural macros for the CoActor framework"
+readme="../README.md"
+documentation="https://docs.rs/coactor-macros"
+keywords=["actor", "coactor", "proc-macro"]
+categories=["development-tools::procedural-macro-helpers"]
 edition.workspace=true
 license.workspace=true
 repository.workspace=true

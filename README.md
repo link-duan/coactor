@@ -44,7 +44,7 @@ session.send(b"increment".to_vec()).await?;
 let event = session.recv().await;
 ```
 
-For a complete setup—including S3 coordination, credentials, and runnable examples—see [Getting started](docs/getting-started.md).
+For a complete setup—including S3 coordination, credentials, and runnable examples—see [Getting started](https://github.com/link-duan/coactor/blob/main/docs/getting-started.md).
 
 ## Programming model
 
@@ -66,12 +66,13 @@ When an Owner or transport connection fails, the Session ends and the caller mus
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — install, define an Actor, and run a Server and Client
-- [Runtime model and guarantees](docs/runtime.md) — lifecycle, delivery, ownership, and failure behavior
-- [Command-line chat example](docs/examples/command-line-chat.md) — bidirectional Sessions and broadcast Events
-- [S3 deployment](docs/s3.md) — configure the shared Coordination Store
-- [Testing Actors](docs/testing.md) — test Actor behavior and lifecycle
-- [Architecture Decision Records](docs/adr/README.md) — design decisions behind the framework
+- [Getting started](https://github.com/link-duan/coactor/blob/main/docs/getting-started.md) — install, define an Actor, and run a Server and Client
+- [Runtime model and guarantees](https://github.com/link-duan/coactor/blob/main/docs/runtime.md) — lifecycle, delivery, ownership, and failure behavior
+- [Command-line chat example](https://github.com/link-duan/coactor/blob/main/docs/examples/command-line-chat.md) — bidirectional Sessions and broadcast Events
+- [S3 deployment](https://github.com/link-duan/coactor/blob/main/docs/s3.md) — configure the shared Coordination Store
+- [Testing Actors](https://github.com/link-duan/coactor/blob/main/docs/testing.md) — test Actor behavior and lifecycle
+- [Architecture Decision Records](https://github.com/link-duan/coactor/blob/main/docs/adr/README.md) — design decisions behind the framework
+- [Release guide](https://github.com/link-duan/coactor/blob/main/docs/releasing.md) — publish both crates through GitHub Actions
 
 ## Examples
 
@@ -82,7 +83,7 @@ cargo run -p coactor --example counter_server
 cargo run -p coactor --example counter_client
 ```
 
-See the [command-line chat guide](docs/examples/command-line-chat.md) for the full multi-process example.
+See the [command-line chat guide](https://github.com/link-duan/coactor/blob/main/docs/examples/command-line-chat.md) for the full multi-process example.
 
 ## Requirements
 
