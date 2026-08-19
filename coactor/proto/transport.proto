@@ -1,9 +1,9 @@
 syntax = "proto3";
 
-package coactor.peer.v1;
+package coactor.transport.v1;
 
-service Peer {
-  // Node 之间多路复用的双向消息通道：一个节点对建立一条流，按 session_id 路由。
+service Transport {
+  // Client 与 Server 之间多路复用的双向消息通道，按 session_id 路由。
   rpc Exchange(stream Envelope) returns (stream Envelope);
 }
 
@@ -12,7 +12,7 @@ message Envelope {
   string actor_type = 2;
   bytes actor_id = 3;
   bytes session_id = 4;
-  string from_node = 5;
+  reserved 5;
   oneof kind {
     ActionMessage action = 6;
     SessionOpen session_open = 7;
@@ -32,8 +32,7 @@ message EventMessage {
 }
 
 message SessionOpen {
-  // caller 节点的可连接端点，作为 Event 回传路径。
-  string caller_endpoint = 1;
+  reserved 1;
 }
 
 message SessionClose {

@@ -37,7 +37,7 @@ Actor 通过 Session Handle 推送给 caller 的出站消息，字节负载；Ac
 _Avoid_: Reply, response
 
 **Session**:
-caller 与 Actor 之间的一次双向通道；所有 Action 都经 Session 入站，Event 经 Session 出站。Client 以 Actor Address 打开 Session；owner 或网关失效都会显式打断它，由 caller 重新打开。
+caller 与 Actor 之间的一次双向通道；所有 Action 都经 Session 入站，Event 经 Session 出站。Client 以 Actor Address 打开 Session；Owner 或绑定的 Transport Connection 失效都会显式打断它，由 caller 重新打开。
 _Avoid_: Connection handle, command channel
 
 **Session Handle**:
@@ -97,7 +97,7 @@ _Avoid_: Ownership Provider, Actor registry, Node Directory
 _Avoid_: Ownership Authority, Service Discovery
 
 **Node**:
-嵌入 CoActor runtime 并通过网络接收或转发 Action 的 consumer 进程运行位置；一个 Node 的长期运维身份与单次运行会话必须区分。
+嵌入 CoActor Server 并通过网络直接服务 Session 的 consumer 进程运行位置；一个 Node 的长期运维身份与单次运行会话必须区分。
 _Avoid_: Actor Owner, Runtime handle, Pod
 
 **Node ID**:
@@ -133,19 +133,27 @@ _Avoid_: Actor Stopped, mailbox overload
 _Avoid_: Actor, runtime node
 
 **Server**:
-embed CoActor runtime 并宿主 Actor 的一侧；它注册 Actor Type、维护 ownership 与生命周期、accept 入站传输并负责网关转发与放置，是唯一访问 ownership authority 写入的一方。Server 不提供 caller 能力。
+embed CoActor runtime 并宿主 Actor 的一侧；它注册 Actor Type、维护 ownership 与生命周期、accept Client 直连 Session，并且是唯一可以变更 Node Lease 或 Actor Owner Record 的一方。Server 不提供 caller 能力，也不转发其他 Server 的 Session 消息。
 _Avoid_: Runtime, Node, Host
 
 **Client**:
-embed CoActor runtime 但只发起 Session 的调用方；它从 Coordination Store 的只读 Node Directory 建立 Gateway Pool，经网关节点中继 Action/Event。Client 不宿主 Actor，也不能变更 Node Lease 或 Actor Owner Record。
+embed CoActor runtime 但只发起 Session 的调用方；它通过 Coordination Store 的只读 Node Directory 与 Actor Owner 查询直接连接 Owner，并在 Actor unowned/stale 时执行 Placement。Client 不宿主 Actor，也不能变更 Node Lease 或 Actor Owner Record。
 _Avoid_: Runtime, caller handle
 
+**Transport Connection**:
+Client 与一个 Server endpoint 之间承载 Envelope 的双向连接；一条连接可复用多个 Session，但一个 Session 从打开到关闭固定使用同一条连接。
+_Avoid_: Session, Node peer, Actor connection
+
+**Transport Connection Pool**:
+Client 为一个 Server endpoint 维护的有界 Transport Connection 集合，用于分散 Session 并隔离单连接故障。
+_Avoid_: Gateway Pool, Session pool
+
 **Node Directory**:
-由当前 live Node Session 构成的只读节点目录，是 Client Gateway Pool、Server Placement 和 Owner endpoint 解析的共同节点来源；它不决定 Actor ownership，也不保证 endpoint 此刻一定可连接。
+由当前 live Node Session 构成的只读节点目录，是 Client 解析 Owner endpoint 与构造 Placement 候选的共同节点来源；它不决定 Actor ownership，也不保证 endpoint 此刻一定可连接。
 _Avoid_: Service Discovery, Actor registry, Actor Owner Record
 
 **Placement**:
-网关对未拥有或 stale 的 Actor 决定 Owner 节点的决策过程；基于候选节点的 Load Ratio 快照与随机化（p2c），一次性决策经 ownership claim 固定，直到 failover。它不持续再平衡。
+Client 在 Actor unowned/stale 时根据 Node Directory 负载快照选择候选 Server 的一次性决策；目标 Server 的 capacity reservation 与 ownership claim 才是最终 admission。Placement 不持续再平衡。
 _Avoid_: Load balancing, routing
 
 **Placement Burst**:
@@ -153,5 +161,5 @@ _Avoid_: Load balancing, routing
 _Avoid_: Traffic spike, hot start
 
 **In-flight Placement**:
-网关已决定放置到某节点、但该节点 Lease 尚未反映的本地记账计数；它参与预测 Load Ratio 计算，防止同一网关内并发放置的 herd。
+Client 已选择候选 Server、但该 Server 的 Lease 尚未反映新 Active Actor 的本地记账计数；它参与预测 Load Ratio，防止同一 Client 内并发放置的 herd。
 _Avoid_: Pending claim, reservation

@@ -15,3 +15,4 @@ ADR status 表示决策是否仍然有效，不表示实现已经交付。被后
 - [ADR-0010：Node Directory 与可替换 Coordination Store](0010-node-directory-coordination-store.md) — capability 拆分与 backend 原生 lease；公开配置和稳定 Node identity 由 ADR-0011/0012 扩展
 - [ADR-0011：链式构造 runtime 并直接打开 Session](0011-chainable-runtime-api.md) — capability 注入、可选 State、直接按 Actor Address 打开 Session
 - [ADR-0012：稳定 Node identity 与可读 Coordination Store key](0012-stable-node-identity-and-keys.md) — 稳定 Node ID、进程 incarnation 与可读持久 key
+- [ADR-0013：Client 直连 Owner 并负责 Placement](0013-client-direct-owner-placement.md) — 移除 Gateway/Relay、Client-side placement 与 endpoint 多连接池

@@ -82,13 +82,11 @@ pub enum ServerError {
     InvalidNodeLeaseTtl,
     #[error("Coordination operation timeout must be greater than zero")]
     InvalidCoordinationTimeout,
-    #[error("peer connection timeout must be greater than zero")]
-    InvalidPeerConnectTimeout,
     #[error("deactivation timeout must be greater than zero")]
     InvalidDeactivationTimeout,
     #[error("shutdown timeout must be greater than zero")]
     InvalidShutdownTimeout,
-    #[error("the peer listener could not bind")]
+    #[error("the transport listener could not bind")]
     BindFailed(#[source] std::io::Error),
     #[error("Node Lease is already owned")]
     LeaseConflict,
@@ -108,8 +106,12 @@ pub enum ServerError {
 pub enum ClientBuildError {
     #[error("open timeout must be greater than zero")]
     InvalidOpenTimeout,
-    #[error("peer connection timeout must be greater than zero")]
-    InvalidPeerConnectTimeout,
+    #[error("transport connection timeout must be greater than zero")]
+    InvalidTransportConnectTimeout,
+    #[error("max_open_attempts must be greater than zero")]
+    InvalidMaxOpenAttempts,
+    #[error("max_connections_per_endpoint must be greater than zero")]
+    InvalidMaxConnectionsPerEndpoint,
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -118,8 +120,8 @@ pub enum OpenError {
     RuntimeStopped,
     #[error("the Node Directory is unavailable")]
     DirectoryUnavailable,
-    #[error("the Node Directory has no available Gateway")]
-    NoAvailableGateway,
+    #[error("the Client exhausted its SessionOpen messages sent to Servers")]
+    AttemptsExhausted,
     #[error("the remote runtime is unavailable")]
     RemoteUnavailable,
     #[error("the Actor Type is not registered")]
@@ -137,7 +139,6 @@ impl From<SendError> for OpenError {
         match error {
             SendError::RuntimeStopped | SendError::RuntimeShuttingDown => Self::RuntimeStopped,
             SendError::DirectoryUnavailable => Self::DirectoryUnavailable,
-            SendError::NoAvailableGateway => Self::NoAvailableGateway,
             SendError::ActorTypeNotRegistered(_) => Self::ActorTypeNotRegistered,
             SendError::RuntimeAtCapacity => Self::RuntimeAtCapacity,
             SendError::OwnershipUnavailable => Self::OwnershipUnavailable,
@@ -225,8 +226,6 @@ pub enum SendError {
     RemoteUnavailable,
     #[error("the Node Directory is unavailable")]
     DirectoryUnavailable,
-    #[error("the Node Directory has no available Gateway")]
-    NoAvailableGateway,
     #[error("distributed ownership is unavailable")]
     OwnershipUnavailable,
     #[error("the remote runtime rejected the protocol: {0}")]
@@ -245,7 +244,7 @@ pub enum RemoteProtocolError {
 
 impl SendError {
     pub(crate) fn to_wire(&self) -> i32 {
-        use crate::peer_protocol::RuntimeFailure;
+        use crate::transport_protocol::RuntimeFailure;
         (match self {
             Self::ActorTypeNotRegistered(_) => RuntimeFailure::ActorTypeNotRegistered,
             Self::NotOwner => RuntimeFailure::NotOwner,
@@ -258,16 +257,14 @@ impl SendError {
             Self::RuntimeStopped => RuntimeFailure::RuntimeStopped,
             Self::NodeFenced => RuntimeFailure::NodeFenced,
             Self::RemoteUnavailable => RuntimeFailure::RemoteUnavailable,
-            Self::DirectoryUnavailable | Self::NoAvailableGateway => {
-                RuntimeFailure::RemoteUnavailable
-            }
+            Self::DirectoryUnavailable => RuntimeFailure::RemoteUnavailable,
             Self::OwnershipUnavailable => RuntimeFailure::OwnershipUnavailable,
             Self::RemoteProtocol(_) => RuntimeFailure::ProtocolMismatch,
         }) as i32
     }
 
     pub(crate) fn from_wire(value: i32) -> Self {
-        use crate::peer_protocol::RuntimeFailure;
+        use crate::transport_protocol::RuntimeFailure;
         match RuntimeFailure::try_from(value).unwrap_or(RuntimeFailure::Unspecified) {
             RuntimeFailure::ActorTypeNotRegistered => Self::ActorTypeNotRegistered(String::new()),
             RuntimeFailure::NotOwner => Self::NotOwner,

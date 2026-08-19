@@ -1,8 +1,8 @@
-//! 放置策略（crate 私有）：网关对未拥有 Actor 决定"放哪"。
+//! Client 对未拥有 Actor 执行 Placement。
 //!
-//! runtime 收集候选（Node Lease 快照 + 硬过滤 + 惰性缓存），策略是纯决策。
-//! 默认 p2c（power of two choices）：随机抽 2 个候选，选 Load Ratio 低的；
-//! 配合本地 In-flight Placement 记账防止同一网关内并发放置的 herd（ADR-0009）。
+//! Client 从 Node Directory 收集并硬过滤候选，策略只负责排序。默认 p2c
+//!（power of two choices）随机抽两个候选并选择较低 Load Ratio，同时使用
+//! Client 本地 In-flight Placement 记账缓解并发 herd。
 
 use std::{
     collections::HashMap,
@@ -10,11 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use parking_lot::Mutex;
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 
-use crate::{ActorAddress, transport::Endpoint};
+use crate::ActorAddress;
 
 /// In-flight 记账的过期窗口：一个 lease 刷新周期（≈ 默认 renewal_interval）。
 /// 窗口内"已决定但未反映到 lease"的放置计入预测负载；窗口过后 lease 已反映，
@@ -22,34 +21,39 @@ use crate::{ActorAddress, transport::Endpoint};
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(3);
 
 /// 放置决策上下文：runtime 已硬过滤后的候选节点（Load Ratio 输入）。
-pub(crate) struct PlacementCtx {
-    pub candidates: Vec<Candidate>,
+pub struct PlacementContext {
+    pub candidates: Vec<PlacementCandidate>,
 }
 
 /// 候选节点：端点 + 负载快照（Load Ratio = active/max 的输入）。
 #[derive(Clone)]
-pub(crate) struct Candidate {
-    pub endpoint: Endpoint,
+pub struct PlacementCandidate {
+    pub endpoint: String,
     pub active_actor_count: usize,
     pub max_actor_count: usize,
 }
 
-/// 返回有序候选（不含本节点）；空列表 = 就地认领（与无算法时行为一致）。
-#[async_trait]
-pub(crate) trait PlacementStrategy: Send + Sync {
-    async fn candidates(&self, address: &ActorAddress, ctx: &PlacementCtx) -> Vec<Endpoint>;
-    /// 网关转发失败后回调：扣减 in-flight 记账。默认无操作。
-    fn on_placement_failed(&self, _endpoint: &Endpoint) {}
+/// 返回有序候选；空列表表示当前没有可尝试的 Server。
+pub trait PlacementStrategy: Send + Sync {
+    fn candidates(&self, address: &ActorAddress, ctx: &PlacementContext) -> Vec<String>;
+    /// Placement 失败后回调：扣减 in-flight 记账。默认无操作。
+    fn on_placement_failed(&self, _endpoint: &str) {}
 }
 
 /// 默认：p2c 均衡放置 + in-flight 记账。
-pub(crate) struct P2cPlacement {
+pub struct P2cPlacement {
     rng: Mutex<Box<dyn RngCore + Send>>,
     in_flight: Mutex<HashMap<String, (usize, Instant)>>,
 }
 
+impl Default for P2cPlacement {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl P2cPlacement {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             rng: Mutex::new(Box::new(StdRng::from_os_rng())),
             in_flight: Mutex::new(HashMap::new()),
@@ -68,7 +72,7 @@ impl P2cPlacement {
 
 impl P2cPlacement {
     fn predicted_ratio(
-        candidate: &Candidate,
+        candidate: &PlacementCandidate,
         in_flight: &HashMap<String, (usize, Instant)>,
     ) -> f64 {
         let extra = in_flight
@@ -78,7 +82,7 @@ impl P2cPlacement {
             / candidate.max_actor_count.max(1) as f64
     }
 
-    fn pick(&self, ctx: &PlacementCtx) -> Vec<Endpoint> {
+    fn pick(&self, ctx: &PlacementContext) -> Vec<String> {
         let n = ctx.candidates.len();
         if n == 0 {
             return Vec::new();
@@ -117,16 +121,15 @@ impl P2cPlacement {
     }
 }
 
-#[async_trait]
 impl PlacementStrategy for P2cPlacement {
-    async fn candidates(&self, _address: &ActorAddress, ctx: &PlacementCtx) -> Vec<Endpoint> {
+    fn candidates(&self, _address: &ActorAddress, ctx: &PlacementContext) -> Vec<String> {
         self.pick(ctx)
     }
 
-    fn on_placement_failed(&self, endpoint: &Endpoint) {
+    fn on_placement_failed(&self, endpoint: &str) {
         self.in_flight
             .lock()
-            .entry(endpoint.as_str().to_owned())
+            .entry(endpoint.to_owned())
             .and_modify(|(count, _)| *count = count.saturating_sub(1));
     }
 }
@@ -142,16 +145,16 @@ mod tests {
 
     use crate::ActorAddress;
 
-    fn candidate(endpoint: &str, active: usize, max: usize) -> Candidate {
-        Candidate {
-            endpoint: Endpoint::new(endpoint.to_owned()),
+    fn candidate(endpoint: &str, active: usize, max: usize) -> PlacementCandidate {
+        PlacementCandidate {
+            endpoint: endpoint.to_owned(),
             active_actor_count: active,
             max_actor_count: max,
         }
     }
 
-    fn ctx(candidates: Vec<Candidate>) -> PlacementCtx {
-        PlacementCtx { candidates }
+    fn ctx(candidates: Vec<PlacementCandidate>) -> PlacementContext {
+        PlacementContext { candidates }
     }
 
     fn address() -> ActorAddress {
@@ -166,9 +169,9 @@ mod tests {
             candidate("node-a", 90, 100),
             candidate("node-b", 10, 100),
         ]);
-        let picked = placement.candidates(&address(), &c).await;
+        let picked = placement.candidates(&address(), &c);
         assert_eq!(picked.len(), 2);
-        assert_eq!(picked[0], Endpoint::new("node-b"), "低负载优先");
+        assert_eq!(picked[0], "node-b", "低负载优先");
     }
 
     /// 异构容量：数量多但容量大（低 ratio）优先于数量少但接近满载。
@@ -179,22 +182,22 @@ mod tests {
             candidate("node-big", 90, 1000),
             candidate("node-small", 9, 10),
         ]);
-        let picked = placement.candidates(&address(), &c).await;
-        assert_eq!(picked[0], Endpoint::new("node-big"), "90/1000 < 9/10");
+        let picked = placement.candidates(&address(), &c);
+        assert_eq!(picked[0], "node-big", "90/1000 < 9/10");
     }
 
     #[tokio::test]
     async fn single_candidate_is_picked() {
         let placement = P2cPlacement::with_rng(Box::new(StdRng::seed_from_u64(3)));
         let c = ctx(vec![candidate("node-a", 10, 100)]);
-        let picked = placement.candidates(&address(), &c).await;
-        assert_eq!(picked, vec![Endpoint::new("node-a")]);
+        let picked = placement.candidates(&address(), &c);
+        assert_eq!(picked, vec!["node-a"]);
     }
 
     #[tokio::test]
     async fn no_candidates_returns_empty() {
         let placement = P2cPlacement::with_rng(Box::new(StdRng::seed_from_u64(4)));
-        let picked = placement.candidates(&address(), &ctx(Vec::new())).await;
+        let picked = placement.candidates(&address(), &ctx(Vec::new()));
         assert!(picked.is_empty(), "空候选 = 就地认领");
     }
 
@@ -206,8 +209,8 @@ mod tests {
             candidate("node-a", 10, 100),
             candidate("node-b", 10, 100),
         ]);
-        let first = placement.candidates(&address(), &c).await;
-        let second = placement.candidates(&address(), &c).await;
+        let first = placement.candidates(&address(), &c);
+        let second = placement.candidates(&address(), &c);
         assert_ne!(first[0], second[0], "已选节点被记账抬高后不再重复选中");
     }
 
@@ -219,7 +222,7 @@ mod tests {
             candidate("node-a", 10, 100),
             candidate("node-b", 10, 100),
         ]);
-        let picked = placement.candidates(&address(), &c).await;
+        let picked = placement.candidates(&address(), &c);
         placement.on_placement_failed(&picked[0]);
         let in_flight = placement.in_flight.lock();
         assert_eq!(

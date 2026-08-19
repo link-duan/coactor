@@ -16,7 +16,7 @@ use super::{
 };
 use crate::runtime::ServerBuilderCore;
 use crate::transport::grpc::GrpcTransport;
-use crate::transport::{ClientTransport, Endpoint, ServerTransport};
+use crate::transport::{Endpoint, ServerTransport};
 use crate::{ActorAddress, Server, ServerError};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -46,7 +46,6 @@ pub(crate) struct ServerRuntimeConfig {
     pub node_lease_ttl: Duration,
     pub coordination_timeout: Duration,
     pub server_transport: Arc<dyn ServerTransport>,
-    pub client_transport: Arc<dyn ClientTransport>,
 }
 
 impl fmt::Debug for ServerRuntimeConfig {
@@ -67,7 +66,6 @@ impl ServerRuntimeConfig {
         advertised_endpoint: String,
         node_lease_ttl: Duration,
         coordination_timeout: Duration,
-        peer_connect_timeout: Duration,
     ) -> Self {
         Self {
             node_id,
@@ -75,8 +73,7 @@ impl ServerRuntimeConfig {
             advertised_endpoint,
             node_lease_ttl,
             coordination_timeout,
-            server_transport: Arc::new(GrpcTransport::new(peer_connect_timeout)),
-            client_transport: Arc::new(GrpcTransport::new(peer_connect_timeout)),
+            server_transport: Arc::new(GrpcTransport::server()),
         }
     }
 
@@ -93,8 +90,7 @@ impl ServerRuntimeConfig {
             advertised_endpoint: endpoint.into(),
             node_lease_ttl: Duration::from_secs(10),
             coordination_timeout: Duration::from_secs(15),
-            server_transport: Arc::new(transport.clone()),
-            client_transport: Arc::new(transport),
+            server_transport: Arc::new(transport),
         }
     }
 
@@ -270,11 +266,15 @@ pub trait NodeLeaseStore: Send + Sync + 'static {
 }
 
 #[async_trait]
-pub trait ActorOwnerStore: Send + Sync + 'static {
+pub trait ActorOwnerReader: Send + Sync + 'static {
     async fn read_actor_owner(
         &self,
         address: &ActorAddress,
     ) -> Result<Option<VersionedActorOwnerRecord>, CoordinationError>;
+}
+
+#[async_trait]
+pub trait ActorOwnerStore: ActorOwnerReader {
     async fn compare_exchange_actor_owner(
         &self,
         address: &ActorAddress,
@@ -335,7 +335,7 @@ impl<S: Send + Sync + 'static> ServerStarter<S> {
             node_id: self.config.node_id.clone(),
             session_id: session_id.clone(),
             advertised_endpoint: self.config.advertised_endpoint.clone(),
-            protocol_version: crate::PEER_PROTOCOL_VERSION,
+            protocol_version: crate::TRANSPORT_PROTOCOL_VERSION,
             lease_generation: 0,
             sampled_at_unix_ms: wall_time_millis(),
             active_actor_count: 0,
@@ -382,13 +382,11 @@ impl<S: Send + Sync + 'static> ServerStarter<S> {
             self.config.node_id.clone(),
             session_id,
             self.config.coordination_timeout,
-            self.config.renewal_interval(),
         );
-        let builder = self
+        let runtime = self
             .builder
-            .with_client_transport(self.config.client_transport.clone());
-        let runtime = builder.build_with_authority(Some(authority.clone()), Some(cluster))?;
-        let peer = runtime.spawn_peer(
+            .build_with_authority(Some(authority.clone()), Some(cluster))?;
+        let transport = runtime.spawn_transport(
             self.config.server_transport.clone(),
             &Endpoint::new(self.config.advertised_endpoint.clone()),
             listener,
@@ -405,7 +403,7 @@ impl<S: Send + Sync + 'static> ServerStarter<S> {
                 interval: self.config.renewal_interval(),
             },
         );
-        Ok(runtime.with_cluster_tasks(peer, renewal, termination_receiver))
+        Ok(runtime.with_cluster_tasks(transport, renewal, termination_receiver))
     }
 }
 

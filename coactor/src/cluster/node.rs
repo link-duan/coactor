@@ -57,7 +57,7 @@ impl NodeAuthority {
     }
 }
 
-pub struct PeerTask {
+pub struct TransportTask {
     pub shutdown: watch::Sender<bool>,
     pub force: oneshot::Sender<()>,
     pub task: tokio::task::JoinHandle<()>,
@@ -77,14 +77,14 @@ struct RenewalExit {
 }
 
 pub struct ClusterTasks {
-    pub peer: PeerTask,
+    pub transport: TransportTask,
     pub renewal: RenewalTask,
     pub fenced: watch::Receiver<bool>,
 }
 impl ClusterTasks {
     pub async fn shutdown(self) {
         let _ = self.renewal.shutdown.send(());
-        let _ = self.peer.shutdown.send(true);
+        let _ = self.transport.shutdown.send(true);
         if let Ok(exit) = self.renewal.task.await {
             if exit.release {
                 let _ = exit
@@ -93,17 +93,17 @@ impl ClusterTasks {
                     .await;
             }
         }
-        let _ = self.peer.force.send(());
-        let _ = self.peer.task.await;
+        let _ = self.transport.force.send(());
+        let _ = self.transport.task.await;
     }
 }
 
-pub fn spawn_peer<S>(
+pub fn spawn_transport<S>(
     runtime: Arc<ServerInner<S>>,
     transport: Arc<dyn ServerTransport>,
     advertised: &Endpoint,
     listener: Option<tokio::net::TcpListener>,
-) -> PeerTask
+) -> TransportTask
 where
     S: Send + Sync + 'static,
 {
@@ -112,7 +112,7 @@ where
     let (stopped_sender, stopped) = watch::channel(false);
     let mut listener = transport
         .listen(advertised, listener)
-        .expect("peer listener bind");
+        .expect("transport listener bind");
     let task = tokio::spawn(async move {
         let mut shutdown_receiver = shutdown_receiver;
         let mut force_receiver = force_receiver;
@@ -127,7 +127,8 @@ where
                         let mut stream = stream;
                         let sender = stream.sender();
                         while let Some(envelope) = stream.recv().await { task_runtime.dispatch_inbound(envelope, Some(sender.clone())).await; }
-                        task_runtime.close_relays_for_sender(&sender).await;
+                        task_runtime.close_sessions_for_sender(&sender).await;
+                        task_runtime.retain_inbound_tasks();
                     });
                     runtime.register_inbound_task(handle.abort_handle());
                 }
@@ -135,7 +136,7 @@ where
         }
         let _ = stopped_sender.send(true);
     });
-    PeerTask {
+    TransportTask {
         shutdown,
         force,
         task,

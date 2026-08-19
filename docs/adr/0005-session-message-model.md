@@ -4,6 +4,8 @@ status: accepted
 
 # Session 双向消息模型
 
+> [ADR-0013](0013-client-direct-owner-placement.md) 移除了 Gateway 故障边界；Session 现在固定在 Client 与 Owner Server 的一条 Transport Connection 上。Owner 或连接失效仍会显式打断 Session，caller 必须重新 `open()`。
+
 CoActor 的消息模型从 request-response command 改为 Session 上的双向消息：caller 通过 `open()` 建立与 Actor 的一次会话，入站 **Action** 与出站 **Event** 均为字节负载、fire-and-forget，业务错误由 Event 表达。每个 Action 都必须携带 Session ID，所有入站都经过 Session，不提供无 Session 的单向 tell。
 
 Session 是逻辑概念（`SessionId` + caller 本地接收流），不是物理连接。`open()` 主动激活 Actor（`on_activate` → 注册 Session → `on_session_opened`，可"连接即推送"）；Actor 侧通过构造注入的 `ActorRuntime` 获得 `broadcast`（全部存活 Session）与身份/AppState 能力，定向推送使用 `MessageContext::send` 或可 clone 的 `SessionHandle`。消息的投递状态由 `send` 同步返回（进入 mailbox 后不确认，at-most-once）；出站与入站 mailbox 均 bounded，满载返回 `MailboxFull`。

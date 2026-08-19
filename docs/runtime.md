@@ -36,13 +36,21 @@ Each Server maintains a renewable lease. If it can no longer prove its authority
 
 CoActor allows only the current Owner to serve an Actor. A takeover fences the previous Owner before the replacement begins serving it.
 
-Clients reach Actors through Gateway nodes. Gateway or Owner failure interrupts the Session.
+When opening a Session, the Client reads the Actor Owner from its read-only Coordination capabilities. A live Owner is contacted directly. If the Actor is unowned or its prior Owner lease is stale, the Client performs Placement and sends `SessionOpen` to the selected Server; only that Server may reserve capacity and claim ownership.
+
+Servers never forward Session traffic to other Servers. A target either serves locally, claims an unowned Actor, or rejects the request with `NotOwner` or `RuntimeAtCapacity`.
 
 ## Placement and failover
 
-An unowned or stale Actor is placed on a live Server using current capacity information. The ownership claim fixes that placement; CoActor does not continuously rebalance active Actors.
+Client Placement uses the Node Directory load snapshot, the configured Placement Strategy, and Client-local In-flight Placement accounting. The default strategy is p2c. Draining, pressured, full, protocol-incompatible, and invalid endpoint records are excluded before attempts; target Server capacity and ownership CAS remain the final admission checks.
 
-Owner or Gateway failure interrupts the Session. The caller must open a new Session. A replacement Owner starts with empty CoActor-managed state.
+Placement retries exclude failed candidates and remain bounded by both the configured maximum number of `SessionOpen` messages sent to Servers and the single `open_timeout` deadline. `NotOwner` causes a fresh ownership read. Failure to connect to an unchanged live Owner does not permit Placement on another Server.
+
+The ownership claim fixes placement; CoActor does not continuously rebalance Active Actors. Owner or Transport Connection failure interrupts the Session. The caller must open a new Session, and a replacement Owner starts with empty CoActor-managed state.
+
+## Transport connections
+
+The Client maintains a bounded connection pool for each Server endpoint. Connections are created lazily, and each Session is bound to one connection from open through close. Multiple Sessions may share a connection; losing one connection terminates only the Sessions bound to it.
 
 ## Limits
 

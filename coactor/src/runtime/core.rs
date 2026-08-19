@@ -15,8 +15,8 @@ use super::lifecycle::spawn_actor;
 use super::message::{MailboxMessage, Registration};
 use super::route::{Route, RouteState, try_send};
 use super::session::{EventSink, SessionId, SessionRegistry};
-use crate::cluster::{ClusterRouter, NodeAuthority, OwnerStatus, PlacementCtx, ResolvedOwner};
-use crate::transport::{ClientTransport, Endpoint, PeerSender};
+use crate::cluster::{ClusterRouter, NodeAuthority, ResolvedOwner};
+use crate::transport::TransportSender;
 use crate::{ActorAddress, SendError};
 
 pub(crate) const RUNNING: u8 = 0;
@@ -35,29 +35,11 @@ pub(crate) struct ServerInner<S> {
     pub next_generation: AtomicU64,
     pub status: AtomicU8,
     pub shutdown_timeout: Duration,
-    pub peer_protocol_version: u32,
+    pub transport_protocol_version: u32,
     pub authority: Option<Arc<NodeAuthority>>,
     pub cluster: Option<Arc<ClusterRouter>>,
-    /// 到各远端 Node 的 bidi stream 发送端（node-pair 复用）。
-    pub channels: Mutex<HashMap<String, Arc<dyn PeerSender>>>,
-    /// 入站连接的接收 task（shutdown 时中止，确保连接关闭）。
+    /// Inbound Transport Connection receive tasks, aborted during shutdown.
     pub inbound_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
-    /// 远程 SessionOpen 的 ack 等待表。
-    pub pending_opens:
-        Mutex<HashMap<SessionId, tokio::sync::oneshot::Sender<Result<(), SendError>>>>,
-    /// 出站连接用的 client transport（网关转发）；None = 本地单节点。
-    pub client_transport: Option<Arc<dyn ClientTransport>>,
-    /// 放置策略（未拥有 Actor 的候选选择）。
-    pub placement: Arc<dyn crate::cluster::PlacementStrategy>,
-    /// 网关转发的中继表：session_id → (owner 端点, caller 回传 sender)。
-    pub relays: Mutex<HashMap<SessionId, Relay>>,
-}
-
-/// 网关中继条目：owner 侧转发目标 + caller 侧回传路径。
-#[derive(Clone)]
-pub(crate) struct Relay {
-    pub owner: String,
-    pub client: Arc<dyn PeerSender>,
 }
 
 impl<S> ServerInner<S>
@@ -159,7 +141,7 @@ where
         result
     }
 
-    /// 仅投递到已激活的 Actor；未激活时静默丢弃（用于 SessionClosed 等控制消息）。
+    /// Delivers only to an existing Active Actor; inactive addresses are ignored.
     pub(crate) fn dispatch_message_if_active(
         &self,
         address: &ActorAddress,
@@ -216,10 +198,7 @@ where
                 address.actor_type().to_owned(),
             )));
         }
-        if !self
-            .sessions
-            .register_actor(address, session_id, sink.clone())
-        {
+        if !self.sessions.register_actor(address, session_id, sink) {
             return Ok(Err(SendError::ActorStopped));
         }
         let (complete, receive) = oneshot::channel();
@@ -227,12 +206,23 @@ where
             session_id,
             complete,
         };
-        self.dispatch_message(address, message, reservation, guard)?;
-        let outcome = receive.await.map_err(|_| SendError::ActorStopped)?;
+        if let Err(error) = self.dispatch_message(address, message, reservation, guard) {
+            self.sessions.unregister_actor(address, &session_id);
+            return Err(error);
+        }
+        let outcome = match receive.await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                self.sessions.unregister_actor(address, &session_id);
+                return Err(SendError::ActorStopped);
+            }
+        };
+        if outcome.is_err() {
+            self.sessions.unregister_actor(address, &session_id);
+        }
         Ok(outcome)
     }
 
-    /// owner 侧处理远程 Action / SessionClose。
     pub(crate) async fn dispatch_remote_message(
         self: &Arc<Self>,
         address: &ActorAddress,
@@ -262,35 +252,14 @@ where
         }
     }
 
-    pub(crate) async fn notify_channel_closed(&self, endpoint: &str) {
-        self.channels.lock().remove(endpoint);
-        // 网关：指向该端点的 relay 会话失效，通知 caller 重开。
-        let stale: Vec<(SessionId, Relay)> = self
-            .relays
-            .lock()
-            .iter()
-            .filter(|(_, relay)| relay.owner == endpoint)
-            .map(|(id, relay)| (*id, relay.clone()))
-            .collect();
-        for (session_id, relay) in stale {
-            self.relays.lock().remove(&session_id);
-            let _ = relay.client.try_send(crate::peer_protocol::Envelope {
-                protocol_version: 0,
-                actor_type: String::new(),
-                actor_id: Vec::new(),
-                session_id: session_id.as_bytes(),
-                from_node: String::new(),
-                kind: Some(crate::peer_protocol::envelope::Kind::SessionError(
-                    crate::peer_protocol::SessionError {
-                        failure: SendError::RemoteUnavailable.to_wire(),
-                    },
-                )),
-            });
-        }
+    pub(crate) fn register_inbound_task(&self, handle: tokio::task::AbortHandle) {
+        let mut tasks = self.inbound_tasks.lock();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(handle);
     }
 
-    pub(crate) fn register_inbound_task(&self, handle: tokio::task::AbortHandle) {
-        self.inbound_tasks.lock().push(handle);
+    pub(crate) fn retain_inbound_tasks(&self) {
+        self.inbound_tasks.lock().retain(|task| !task.is_finished());
     }
 
     pub(crate) fn abort_inbound_tasks(&self) {
@@ -299,49 +268,24 @@ where
         }
     }
 
-    pub(crate) async fn ensure_channel(
+    /// A direct Client Transport Connection closed; close only Sessions bound to it.
+    pub(crate) async fn close_sessions_for_sender(
         self: &Arc<Self>,
-        endpoint: &str,
-    ) -> Result<Arc<dyn PeerSender>, SendError> {
-        if let Some(sender) = self.channels.lock().get(endpoint) {
-            return Ok(sender.clone());
+        sender: &Arc<dyn TransportSender>,
+    ) {
+        for (address, session_id) in self.sessions.by_sender_snapshot(sender) {
+            self.close_local_session(&address, &session_id, &self.sessions)
+                .await;
         }
-        let Some(transport) = &self.client_transport else {
-            return Err(SendError::RemoteUnavailable);
-        };
-        let stream = transport
-            .connect(&Endpoint::new(endpoint))
-            .await
-            .map_err(|_| SendError::RemoteUnavailable)?;
-        let sender = stream.sender();
-        let runtime = self.clone();
-        let closed_endpoint = endpoint.to_owned();
-        let loop_sender = sender.clone();
-        tokio::spawn(async move {
-            let mut stream = stream;
-            while let Some(envelope) = stream.recv().await {
-                runtime
-                    .handle_owner_envelope(envelope, Some(loop_sender.clone()))
-                    .await;
-            }
-            runtime.notify_channel_closed(&closed_endpoint).await;
-        });
-        self.channels
-            .lock()
-            .insert(endpoint.to_owned(), sender.clone());
-        Ok(sender)
     }
 
-    /// outbound channel 收包：owner 侧完整处理器。
-    /// 处理转发来的 SessionOpen/Action/SessionClose（宿主）与 owner 回复
-    /// （ack/Event/SessionError，中继或投递本地 receiver）。
-    /// 不含转发路径（不调用 ensure_channel），避免与网关 accept 侧形成循环依赖。
-    async fn handle_owner_envelope(
+    /// Handles one direct Client Envelope. Servers never forward to another Server.
+    pub(crate) async fn dispatch_inbound(
         self: &Arc<Self>,
-        envelope: crate::peer_protocol::Envelope,
-        reply: Option<Arc<dyn PeerSender>>,
+        envelope: crate::transport_protocol::Envelope,
+        reply: Option<Arc<dyn TransportSender>>,
     ) {
-        use crate::peer_protocol::envelope::Kind;
+        use crate::transport_protocol::envelope::Kind;
         let Some(kind) = envelope.kind else { return };
         let Some(session_id) = SessionId::from_bytes(&envelope.session_id) else {
             return;
@@ -350,581 +294,95 @@ where
         else {
             return;
         };
-        let version_ok = envelope.protocol_version == self.peer_protocol_version;
+        let version_ok = envelope.protocol_version == self.transport_protocol_version;
         match kind {
             Kind::Action(action) => {
                 if !version_ok {
+                    return;
+                }
+                if !reply
+                    .as_ref()
+                    .is_some_and(|sender| self.sessions.is_bound_to(&address, &session_id, sender))
+                {
+                    send_session_error(reply, envelope.session_id, SendError::ActorStopped);
                     return;
                 }
                 if let Err(error) = self
                     .dispatch_remote_message(&address, session_id, Some(action.payload))
                     .await
                 {
-                    if let Some(sender) = reply {
-                        let _ = sender.try_send(crate::peer_protocol::Envelope {
-                            protocol_version: 0,
-                            actor_type: String::new(),
-                            actor_id: Vec::new(),
-                            session_id: envelope.session_id,
-                            from_node: String::new(),
-                            kind: Some(Kind::SessionError(crate::peer_protocol::SessionError {
-                                failure: error.to_wire(),
-                            })),
-                        });
-                    }
+                    send_session_error(reply, envelope.session_id, error);
                 }
             }
             Kind::SessionOpen(_) => {
-                let result = if version_ok {
-                    match reply.clone() {
-                        Some(sender) => {
-                            // 转发来的会话：确认自己是 owner 后宿主；属他人则拒绝（不二次转发，防环）。
-                            if let Some(cluster) = &self.cluster {
-                                match cluster.resolve(&address, &self.capacity).await {
-                                    Ok(ResolvedOwner::Local { reservation, guard }) => {
-                                        self.open_local_session(
-                                            &address,
-                                            session_id,
-                                            EventSink::Remote { sender },
-                                            reservation,
-                                            Some(guard),
-                                        )
-                                        .await
-                                    }
-                                    _ => Ok(Err(SendError::NotOwner)),
-                                }
-                            } else {
+                let result = if !version_ok {
+                    Ok(Err(SendError::RemoteProtocol(
+                        crate::RemoteProtocolError::VersionMismatch,
+                    )))
+                } else if let Some(sender) = reply.clone() {
+                    if let Some(cluster) = &self.cluster {
+                        match cluster.resolve(&address, &self.capacity).await {
+                            Ok(ResolvedOwner::Local { reservation, guard }) => {
                                 self.open_local_session(
                                     &address,
                                     session_id,
                                     EventSink::Remote { sender },
-                                    None,
-                                    None,
+                                    reservation,
+                                    Some(guard),
                                 )
                                 .await
                             }
+                            Ok(ResolvedOwner::Remote) => Ok(Err(SendError::NotOwner)),
+                            Err(error) => Ok(Err(error)),
                         }
-                        None => Ok(Err(SendError::RemoteUnavailable)),
-                    }
-                } else {
-                    Ok(Err(SendError::RemoteProtocol(
-                        crate::RemoteProtocolError::VersionMismatch,
-                    )))
-                };
-                if let Some(sender) = reply {
-                    let outcome = match result {
-                        Ok(Ok(())) => Some(crate::peer_protocol::session_opened_ack::Outcome::Ok(
-                            Vec::new(),
-                        )),
-                        Ok(Err(error)) | Err(error) => {
-                            Some(crate::peer_protocol::session_opened_ack::Outcome::Failure(
-                                error.to_wire(),
-                            ))
-                        }
-                    };
-                    let _ = sender.try_send(crate::peer_protocol::Envelope {
-                        protocol_version: 0,
-                        actor_type: String::new(),
-                        actor_id: Vec::new(),
-                        session_id: envelope.session_id,
-                        from_node: String::new(),
-                        kind: Some(Kind::SessionOpenedAck(
-                            crate::peer_protocol::SessionOpenedAck { outcome },
-                        )),
-                    });
-                }
-            }
-            Kind::SessionClose(_) => {
-                self.close_local_session(&address, &session_id, &self.sessions)
-                    .await;
-            }
-            Kind::SessionOpenedAck(ack) => {
-                let result = match ack.outcome {
-                    Some(crate::peer_protocol::session_opened_ack::Outcome::Ok(_)) => Ok(()),
-                    Some(crate::peer_protocol::session_opened_ack::Outcome::Failure(failure)) => {
-                        Err(SendError::from_wire(failure))
-                    }
-                    None => Err(SendError::RemoteProtocol(
-                        crate::RemoteProtocolError::MalformedMessage,
-                    )),
-                };
-                if let Some(sender) = self.pending_opens.lock().remove(&session_id) {
-                    let _ = sender.send(result);
-                }
-            }
-            Kind::Event(event) => {
-                let relay = self.relays.lock().get(&session_id).cloned();
-                if let Some(relay) = relay {
-                    let _ = relay.client.try_send(crate::peer_protocol::Envelope {
-                        protocol_version: 0,
-                        actor_type: String::new(),
-                        actor_id: Vec::new(),
-                        session_id: envelope.session_id,
-                        from_node: String::new(),
-                        kind: Some(Kind::Event(event)),
-                    });
-                }
-            }
-            Kind::SessionError(error) => {
-                let relay = self.relays.lock().get(&session_id).cloned();
-                if let Some(relay) = relay {
-                    let _ = relay.client.try_send(crate::peer_protocol::Envelope {
-                        protocol_version: 0,
-                        actor_type: String::new(),
-                        actor_id: Vec::new(),
-                        session_id: envelope.session_id,
-                        from_node: String::new(),
-                        kind: Some(Kind::SessionError(error)),
-                    });
-                }
-            }
-        }
-    }
-
-    /// 网关放置：未拥有/stale 的 Actor 按策略候选逐个尝试转发；候选耗尽报
-    /// `RuntimeAtCapacity`（不做自兜底）。策略接收 runtime 硬过滤后的候选快照。
-    pub(crate) async fn place_session(
-        self: &Arc<Self>,
-        address: &ActorAddress,
-        session_id: SessionId,
-        client: Arc<dyn PeerSender>,
-    ) -> Result<Result<(), SendError>, SendError> {
-        let Some(cluster) = &self.cluster else {
-            return Ok(Err(SendError::RuntimeAtCapacity));
-        };
-        let ctx = PlacementCtx {
-            candidates: cluster
-                .placement_candidates(self.peer_protocol_version)
-                .await?,
-        };
-        let candidates = self.placement.candidates(address, &ctx).await;
-        if candidates.is_empty() {
-            // 无其他可用节点：就地认领（resolve 含 claim）；竞态下被他者认领则转发给真 owner。
-            return match cluster.resolve(address, &self.capacity).await {
-                Ok(ResolvedOwner::Local { reservation, guard }) => {
-                    self.open_local_session(
-                        address,
-                        session_id,
-                        EventSink::Remote { sender: client },
-                        reservation,
-                        Some(guard),
-                    )
-                    .await
-                }
-                Ok(ResolvedOwner::Remote { endpoint, .. }) => {
-                    self.forward_to_owner_or_actual(
-                        address,
-                        session_id,
-                        &Endpoint::new(endpoint),
-                        client,
-                    )
-                    .await
-                }
-                Err(error) => Ok(Err(error)),
-            };
-        }
-        for candidate in candidates {
-            match self
-                .forward_to_owner_or_actual(address, session_id, &candidate, client.clone())
-                .await
-            {
-                Ok(Ok(())) => return Ok(Ok(())),
-                Ok(Err(SendError::ActorTypeNotRegistered(_))) => {
-                    return Ok(Err(SendError::ActorTypeNotRegistered(String::new())));
-                }
-                // 满/其他 ack 失败或传输不可达：扣回 in-flight 记账，剔除该候选，试下一个。
-                Ok(Err(_)) | Err(_) => {
-                    self.placement.on_placement_failed(&candidate);
-                    continue;
-                }
-            }
-        }
-        Ok(Err(SendError::RuntimeAtCapacity))
-    }
-
-    async fn place_session_after_owner_rejection(
-        self: &Arc<Self>,
-        address: &ActorAddress,
-        session_id: SessionId,
-        rejected: &Endpoint,
-        client: Arc<dyn PeerSender>,
-    ) -> Result<Result<(), SendError>, SendError> {
-        let Some(cluster) = &self.cluster else {
-            return Ok(Err(SendError::RuntimeAtCapacity));
-        };
-        let ctx = PlacementCtx {
-            candidates: cluster
-                .placement_candidates(self.peer_protocol_version)
-                .await?,
-        };
-        for candidate in self.placement.candidates(address, &ctx).await {
-            if candidate == *rejected {
-                continue;
-            }
-            match self
-                .forward_session_open(address, session_id, &candidate, client.clone())
-                .await
-            {
-                Ok(Ok(())) => return Ok(Ok(())),
-                Ok(Err(SendError::ActorTypeNotRegistered(_))) => {
-                    return Ok(Err(SendError::ActorTypeNotRegistered(String::new())));
-                }
-                Ok(Err(_)) | Err(_) => {
-                    self.placement.on_placement_failed(&candidate);
-                }
-            }
-        }
-        match cluster.resolve(address, &self.capacity).await {
-            Ok(ResolvedOwner::Local { reservation, guard }) => {
-                self.open_local_session(
-                    address,
-                    session_id,
-                    EventSink::Remote { sender: client },
-                    reservation,
-                    Some(guard),
-                )
-                .await
-            }
-            Ok(ResolvedOwner::Remote { endpoint, .. }) => {
-                self.forward_session_open(address, session_id, &Endpoint::new(endpoint), client)
-                    .await
-            }
-            Err(error) => Ok(Err(error)),
-        }
-    }
-
-    /// 转发 SessionOpen 给 owner；收到 NotOwner（所有权在读取与转发之间翻转）→
-    /// 重解析真 owner 再转发一次（有界），仍失败则返回错误。
-    async fn forward_to_owner_or_actual(
-        self: &Arc<Self>,
-        address: &ActorAddress,
-        session_id: SessionId,
-        endpoint: &Endpoint,
-        client: Arc<dyn PeerSender>,
-    ) -> Result<Result<(), SendError>, SendError> {
-        let result = self
-            .forward_session_open(address, session_id, endpoint, client.clone())
-            .await;
-        if !matches!(result, Ok(Err(SendError::NotOwner))) {
-            return result;
-        }
-        let Some(cluster) = &self.cluster else {
-            return Ok(Err(SendError::RuntimeAtCapacity));
-        };
-        if cluster
-            .clear_owner_for_fallback(address, endpoint.as_str())
-            .await?
-        {
-            return self
-                .place_session_after_owner_rejection(address, session_id, endpoint, client)
-                .await;
-        }
-        match cluster.owner_only(address).await {
-            Ok(OwnerStatus::Remote { endpoint }) => {
-                self.forward_session_open(address, session_id, &Endpoint::new(endpoint), client)
-                    .await
-            }
-            Ok(OwnerStatus::Local) => {
-                self.open_local_session(
-                    address,
-                    session_id,
-                    EventSink::Remote { sender: client },
-                    None,
-                    None,
-                )
-                .await
-            }
-            Ok(OwnerStatus::Unowned) => Ok(Err(SendError::RuntimeAtCapacity)),
-            Err(error) => Ok(Err(error)),
-        }
-    }
-
-    /// 网关：把 SessionOpen 转发给 owner，等 ack 后回传 caller；失败则清理中继。
-    pub(crate) async fn forward_session_open(
-        self: &Arc<Self>,
-        address: &ActorAddress,
-        session_id: SessionId,
-        owner: &Endpoint,
-        client: Arc<dyn PeerSender>,
-    ) -> Result<Result<(), SendError>, SendError> {
-        let channel = self.ensure_channel(owner.as_str()).await?;
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.pending_opens.lock().insert(session_id, ack_tx);
-        self.relays.lock().insert(
-            session_id,
-            Relay {
-                owner: owner.as_str().to_owned(),
-                client,
-            },
-        );
-        let envelope = envelope_session_open(
-            address,
-            session_id,
-            String::new(),
-            self.cluster
-                .as_ref()
-                .map_or(String::new(), |cluster| cluster.node_id().to_owned()),
-            self.peer_protocol_version,
-        );
-        if channel.try_send(envelope).is_err() {
-            self.pending_opens.lock().remove(&session_id);
-            self.relays.lock().remove(&session_id);
-            return Ok(Err(SendError::RemoteUnavailable));
-        }
-        let result = match tokio::time::timeout(Duration::from_secs(3), ack_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) | Err(_) => {
-                self.pending_opens.lock().remove(&session_id);
-                self.relays.lock().remove(&session_id);
-                Err(SendError::RemoteUnavailable)
-            }
-        };
-        if result.is_err() {
-            self.relays.lock().remove(&session_id);
-        }
-        Ok(result)
-    }
-
-    /// 经网关 channel 发送 Envelope 到 owner。
-    pub(crate) async fn relay_send(
-        self: &Arc<Self>,
-        endpoint: &str,
-        envelope: crate::peer_protocol::Envelope,
-    ) -> Result<(), SendError> {
-        let channel = self.ensure_channel(endpoint).await;
-        let channel = channel?;
-        channel
-            .try_send(envelope)
-            .map_err(|_| SendError::RemoteUnavailable)
-    }
-
-    /// caller 侧入站流断开：终结经由该流中转的 relay（向 owner 发 SessionClose）。
-    pub(crate) async fn close_relays_for_sender(self: &Arc<Self>, sender: &Arc<dyn PeerSender>) {
-        let stale: Vec<(SessionId, Relay)> = self
-            .relays
-            .lock()
-            .iter()
-            .filter(|(_, relay)| Arc::ptr_eq(&relay.client, sender))
-            .map(|(id, relay)| (*id, relay.clone()))
-            .collect();
-        for (session_id, relay) in stale {
-            self.relays.lock().remove(&session_id);
-            let _ = self
-                .relay_send(relay.owner.as_str(), envelope_session_close(session_id))
-                .await;
-        }
-    }
-
-    /// 处理节点对间收到的 Envelope；`reply` 为入站流的 outbound（owner 侧回发 ack/Event 用）。
-    pub(crate) async fn dispatch_inbound(
-        self: &Arc<Self>,
-        envelope: crate::peer_protocol::Envelope,
-        reply: Option<Arc<dyn PeerSender>>,
-    ) {
-        use crate::peer_protocol::envelope::Kind;
-        let Some(kind) = envelope.kind else {
-            return;
-        };
-        let Some(session_id) = SessionId::from_bytes(&envelope.session_id) else {
-            return;
-        };
-        let Some(address) = actor_address_from_envelope(envelope.actor_type, envelope.actor_id)
-        else {
-            return;
-        };
-        let version_ok = envelope.protocol_version == self.peer_protocol_version;
-        match kind {
-            Kind::Action(action) => {
-                if !version_ok {
-                    return;
-                }
-                let relay = self.relays.lock().get(&session_id).cloned();
-                if let Some(relay) = relay {
-                    // 网关：Action 转发给 owner
-                    let _ = self
-                        .relay_send(
-                            relay.owner.as_str(),
-                            crate::client::envelope_action(&address, session_id, action.payload),
+                    } else {
+                        self.open_local_session(
+                            &address,
+                            session_id,
+                            EventSink::Remote { sender },
+                            None,
+                            None,
                         )
-                        .await;
-                    return;
-                }
-                if let Err(error) = self
-                    .dispatch_remote_message(&address, session_id, Some(action.payload))
-                    .await
-                {
-                    // 网关模型：send() 只反映传输投递；server 侧拒绝（MailboxFull 等）
-                    // 经 SessionError 异步通知 caller，不终止 Session。
-                    if let Some(reply) = reply {
-                        let _ = reply.try_send(crate::peer_protocol::Envelope {
-                            protocol_version: 0,
-                            actor_type: String::new(),
-                            actor_id: Vec::new(),
-                            session_id: envelope.session_id,
-                            from_node: String::new(),
-                            kind: Some(crate::peer_protocol::envelope::Kind::SessionError(
-                                crate::peer_protocol::SessionError {
-                                    failure: error.to_wire(),
-                                },
-                            )),
-                        });
-                    }
-                }
-            }
-            Kind::SessionOpen(_open) => {
-                let result = if version_ok {
-                    match reply.clone() {
-                        Some(sender) => {
-                            // 网关语义：入站会话先只读判断所有权——已归自己则宿主，
-                            // 归他人则转发给 owner，未拥有/stale 则走放置决策。
-                            // 无 router 的单节点（TestServer）直接宿主。
-                            if let Some(cluster) = &self.cluster {
-                                match cluster.owner_only(&address).await {
-                                    Ok(OwnerStatus::Local) => {
-                                        self.open_local_session(
-                                            &address,
-                                            session_id,
-                                            EventSink::Remote { sender },
-                                            None,
-                                            None,
-                                        )
-                                        .await
-                                    }
-                                    Ok(OwnerStatus::Remote { endpoint }) => {
-                                        self.forward_to_owner_or_actual(
-                                            &address,
-                                            session_id,
-                                            &Endpoint::new(endpoint),
-                                            sender,
-                                        )
-                                        .await
-                                    }
-                                    Ok(OwnerStatus::Unowned) => {
-                                        if envelope.from_node.is_empty() {
-                                            // 来自 client：网关做放置决策。
-                                            self.place_session(&address, session_id, sender).await
-                                        } else {
-                                            // 转发来的会话：目标节点就地认领
-                                            // （resolve 含 claim），不二次转发（防环）。
-                                            match cluster.resolve(&address, &self.capacity).await {
-                                                Ok(ResolvedOwner::Local { reservation, guard }) => {
-                                                    self.open_local_session(
-                                                        &address,
-                                                        session_id,
-                                                        EventSink::Remote { sender },
-                                                        reservation,
-                                                        Some(guard),
-                                                    )
-                                                    .await
-                                                }
-                                                _ => Ok(Err(SendError::NotOwner)),
-                                            }
-                                        }
-                                    }
-                                    Err(error) => Ok(Err(error)),
-                                }
-                            } else {
-                                self.open_local_session(
-                                    &address,
-                                    session_id,
-                                    EventSink::Remote { sender },
-                                    None,
-                                    None,
-                                )
-                                .await
-                            }
-                        }
-                        None => Ok(Err(SendError::RemoteUnavailable)),
+                        .await
                     }
                 } else {
-                    Ok(Err(SendError::RemoteProtocol(
-                        crate::RemoteProtocolError::VersionMismatch,
-                    )))
+                    Ok(Err(SendError::RemoteUnavailable))
                 };
                 if let Some(sender) = reply {
                     let outcome = match result {
-                        Ok(Ok(())) => Some(crate::peer_protocol::session_opened_ack::Outcome::Ok(
-                            Vec::new(),
-                        )),
-                        Ok(Err(error)) | Err(error) => {
-                            Some(crate::peer_protocol::session_opened_ack::Outcome::Failure(
+                        Ok(Ok(())) => Some(
+                            crate::transport_protocol::session_opened_ack::Outcome::Ok(Vec::new()),
+                        ),
+                        Ok(Err(error)) | Err(error) => Some(
+                            crate::transport_protocol::session_opened_ack::Outcome::Failure(
                                 error.to_wire(),
-                            ))
-                        }
+                            ),
+                        ),
                     };
-                    let _ = sender.try_send(crate::peer_protocol::Envelope {
+                    let _ = sender.try_send(crate::transport_protocol::Envelope {
                         protocol_version: 0,
                         actor_type: String::new(),
                         actor_id: Vec::new(),
                         session_id: envelope.session_id,
-                        from_node: String::new(),
                         kind: Some(Kind::SessionOpenedAck(
-                            crate::peer_protocol::SessionOpenedAck { outcome },
+                            crate::transport_protocol::SessionOpenedAck { outcome },
                         )),
                     });
                 }
             }
             Kind::SessionClose(_) => {
-                let relay = self.relays.lock().remove(&session_id);
-                if let Some(relay) = relay {
-                    let _ = self
-                        .relay_send(relay.owner.as_str(), envelope_session_close(session_id))
-                        .await;
-                } else {
-                    let _ = self
-                        .dispatch_remote_message(&address, session_id, None)
+                if reply
+                    .as_ref()
+                    .is_some_and(|sender| self.sessions.is_bound_to(&address, &session_id, sender))
+                {
+                    self.close_local_session(&address, &session_id, &self.sessions)
                         .await;
                 }
             }
-            Kind::Event(event) => {
-                let relay = self.relays.lock().get(&session_id).cloned();
-                if let Some(relay) = relay {
-                    // owner → 网关 → caller
-                    let _ = relay.client.try_send(crate::peer_protocol::Envelope {
-                        protocol_version: 0,
-                        actor_type: String::new(),
-                        actor_id: Vec::new(),
-                        session_id: envelope.session_id,
-                        from_node: String::new(),
-                        kind: Some(crate::peer_protocol::envelope::Kind::Event(event)),
-                    });
-                }
-            }
-            Kind::SessionError(error) => {
-                let relay = self.relays.lock().get(&session_id).cloned();
-                if let Some(relay) = relay {
-                    let _ = relay.client.try_send(crate::peer_protocol::Envelope {
-                        protocol_version: 0,
-                        actor_type: String::new(),
-                        actor_id: Vec::new(),
-                        session_id: envelope.session_id,
-                        from_node: String::new(),
-                        kind: Some(crate::peer_protocol::envelope::Kind::SessionError(error)),
-                    });
-                }
-            }
-            Kind::SessionOpenedAck(ack) => {
-                let result = match ack.outcome {
-                    Some(crate::peer_protocol::session_opened_ack::Outcome::Ok(_)) => Ok(()),
-                    Some(crate::peer_protocol::session_opened_ack::Outcome::Failure(failure)) => {
-                        Err(SendError::from_wire(failure))
-                    }
-                    None => Err(SendError::RemoteProtocol(
-                        crate::RemoteProtocolError::MalformedMessage,
-                    )),
-                };
-                if let Some(sender) = self.pending_opens.lock().remove(&session_id) {
-                    let _ = sender.send(result);
-                }
-            }
+            Kind::Event(_) | Kind::SessionError(_) | Kind::SessionOpenedAck(_) => {}
         }
     }
-}
 
-impl<S> ServerInner<S>
-where
-    S: Send + Sync + 'static,
-{
     pub(crate) fn make_message_context(
         &self,
         address: &ActorAddress,
@@ -949,44 +407,27 @@ where
     }
 }
 
-fn actor_address_from_envelope(actor_type: String, actor_id: Vec<u8>) -> Option<ActorAddress> {
-    if actor_type.is_empty() && actor_id.is_empty() {
-        return ActorAddress::new("protocol", "message").ok();
+fn send_session_error(
+    reply: Option<Arc<dyn TransportSender>>,
+    session_id: Vec<u8>,
+    error: SendError,
+) {
+    if let Some(reply) = reply {
+        let _ = reply.try_send(crate::transport_protocol::Envelope {
+            protocol_version: 0,
+            actor_type: String::new(),
+            actor_id: Vec::new(),
+            session_id,
+            kind: Some(crate::transport_protocol::envelope::Kind::SessionError(
+                crate::transport_protocol::SessionError {
+                    failure: error.to_wire(),
+                },
+            )),
+        });
     }
+}
+
+fn actor_address_from_envelope(actor_type: String, actor_id: Vec<u8>) -> Option<ActorAddress> {
     let actor_id = String::from_utf8(actor_id).ok()?;
     ActorAddress::new(actor_type, actor_id).ok()
-}
-
-fn envelope_session_open(
-    address: &ActorAddress,
-    session_id: SessionId,
-    caller_endpoint: String,
-    from_node: String,
-    protocol_version: u32,
-) -> crate::peer_protocol::Envelope {
-    crate::peer_protocol::Envelope {
-        protocol_version,
-        actor_type: address.actor_type().to_owned(),
-        actor_id: address.actor_id().as_bytes().to_vec(),
-        session_id: session_id.as_bytes(),
-        from_node,
-        kind: Some(crate::peer_protocol::envelope::Kind::SessionOpen(
-            crate::peer_protocol::SessionOpen { caller_endpoint },
-        )),
-    }
-}
-
-fn envelope_session_close(session_id: SessionId) -> crate::peer_protocol::Envelope {
-    crate::peer_protocol::Envelope {
-        protocol_version: 0,
-        actor_type: String::new(),
-        actor_id: Vec::new(),
-        session_id: session_id.as_bytes(),
-        from_node: String::new(),
-        kind: Some(crate::peer_protocol::envelope::Kind::SessionClose(
-            crate::peer_protocol::SessionClose {
-                reason: crate::peer_protocol::CloseReason::CallerDropped as i32,
-            },
-        )),
-    }
 }

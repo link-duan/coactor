@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use crate::transport::PeerSender;
+use crate::transport::TransportSender;
 use crate::{ActorAddress, SendError};
 
 /// 本节点 Session 接收流的容量（出站 Event 背压上界）。
@@ -29,7 +29,7 @@ impl SessionId {
 /// Session 的 Event 回传路径（owner 节点视角）：经该节点对间的 bidi stream 发送端回传。
 #[derive(Clone)]
 pub(crate) enum EventSink {
-    Remote { sender: Arc<dyn PeerSender> },
+    Remote { sender: Arc<dyn TransportSender> },
 }
 
 /// Server 侧 Session 注册表：actor → 存活 Session 的回传路径。
@@ -52,12 +52,18 @@ impl SessionRegistry {
         session_id: SessionId,
         sink: EventSink,
     ) -> bool {
-        self.by_actor
-            .lock()
+        let mut by_actor = self.by_actor.lock();
+        match by_actor
             .entry(address.clone())
             .or_default()
-            .insert(session_id, sink)
-            .is_none()
+            .entry(session_id)
+        {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(sink);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
     }
 
     pub(crate) fn unregister_actor(&self, address: &ActorAddress, session_id: &SessionId) -> bool {
@@ -91,6 +97,24 @@ impl SessionRegistry {
             .unwrap_or_default()
     }
 
+    pub(crate) fn by_sender_snapshot(
+        &self,
+        sender: &Arc<dyn TransportSender>,
+    ) -> Vec<(ActorAddress, SessionId)> {
+        self.by_actor
+            .lock()
+            .iter()
+            .flat_map(|(address, sessions)| {
+                sessions.iter().filter_map(|(session_id, sink)| match sink {
+                    EventSink::Remote { sender: candidate } if Arc::ptr_eq(candidate, sender) => {
+                        Some((address.clone(), *session_id))
+                    }
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn by_actor_addresses(&self) -> Vec<ActorAddress> {
         self.by_actor.lock().keys().cloned().collect()
     }
@@ -102,6 +126,21 @@ impl SessionRegistry {
             .and_then(|sessions| sessions.get(session_id).cloned())
     }
 
+    pub(crate) fn is_bound_to(
+        &self,
+        address: &ActorAddress,
+        session_id: &SessionId,
+        sender: &Arc<dyn TransportSender>,
+    ) -> bool {
+        matches!(
+            self.by_actor
+                .lock()
+                .get(address)
+                .and_then(|sessions| sessions.get(session_id)),
+            Some(EventSink::Remote { sender: bound }) if Arc::ptr_eq(bound, sender)
+        )
+    }
+
     /// 向一个 Session 投递 Event；尽力而为。
     pub(crate) async fn deliver_event(
         &self,
@@ -111,14 +150,13 @@ impl SessionRegistry {
     ) -> Result<(), SendError> {
         match self.sink(address, &session_id) {
             Some(EventSink::Remote { sender }) => sender
-                .try_send(crate::peer_protocol::Envelope {
+                .try_send(crate::transport_protocol::Envelope {
                     protocol_version: 0,
                     actor_type: String::new(),
                     actor_id: Vec::new(),
                     session_id: session_id.as_bytes(),
-                    from_node: String::new(),
-                    kind: Some(crate::peer_protocol::envelope::Kind::Event(
-                        crate::peer_protocol::EventMessage { payload },
+                    kind: Some(crate::transport_protocol::envelope::Kind::Event(
+                        crate::transport_protocol::EventMessage { payload },
                     )),
                 })
                 .map_err(|_| SendError::RemoteUnavailable),
@@ -137,14 +175,13 @@ impl SessionRegistry {
         self.unregister_actor(address, session_id);
         match sink {
             Some(EventSink::Remote { sender }) => {
-                let _ = sender.try_send(crate::peer_protocol::Envelope {
+                let _ = sender.try_send(crate::transport_protocol::Envelope {
                     protocol_version: 0,
                     actor_type: String::new(),
                     actor_id: Vec::new(),
                     session_id: session_id.as_bytes(),
-                    from_node: String::new(),
-                    kind: Some(crate::peer_protocol::envelope::Kind::SessionError(
-                        crate::peer_protocol::SessionError {
+                    kind: Some(crate::transport_protocol::envelope::Kind::SessionError(
+                        crate::transport_protocol::SessionError {
                             failure: error.to_wire(),
                         },
                     )),
@@ -188,5 +225,47 @@ impl SessionHandle {
         self.registry
             .deliver_event(&self.address, self.session_id, msg)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::TransportError;
+
+    struct TestTransportSender;
+
+    impl TransportSender for TestTransportSender {
+        fn try_send(&self, _: crate::transport_protocol::Envelope) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn close(&self) {}
+    }
+
+    #[test]
+    fn duplicate_session_registration_preserves_the_original_transport_connection() {
+        let registry = SessionRegistry::new();
+        let address = ActorAddress::new("test", "duplicate-session").unwrap();
+        let session_id = SessionId::new();
+        let original: Arc<dyn TransportSender> = Arc::new(TestTransportSender);
+        let duplicate: Arc<dyn TransportSender> = Arc::new(TestTransportSender);
+
+        assert!(registry.register_actor(
+            &address,
+            session_id,
+            EventSink::Remote {
+                sender: original.clone(),
+            },
+        ));
+        assert!(!registry.register_actor(
+            &address,
+            session_id,
+            EventSink::Remote {
+                sender: duplicate.clone(),
+            },
+        ));
+        assert!(registry.is_bound_to(&address, &session_id, &original));
+        assert!(!registry.is_bound_to(&address, &session_id, &duplicate));
     }
 }

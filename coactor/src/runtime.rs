@@ -7,14 +7,11 @@ use parking_lot::Mutex;
 use tokio::sync::{Semaphore, watch};
 
 use crate::cluster::{
-    ClusterRouter, ClusterTasks, CoordinationStore, CoordinationStores, NodeAuthority, PeerTask,
-    RenewalTask, ServerRuntimeConfig, ServerStarter, canonical_endpoint, spawn_peer,
+    ClusterRouter, ClusterTasks, CoordinationStore, CoordinationStores, NodeAuthority, RenewalTask,
+    ServerRuntimeConfig, ServerStarter, TransportTask, canonical_endpoint, spawn_transport,
 };
 use crate::runtime::session::SessionRegistry;
-use crate::{
-    __macro, IntoActorConfig, PEER_PROTOCOL_VERSION, PlacementStrategy, ServerError,
-    transport::ClientTransport,
-};
+use crate::{__macro, IntoActorConfig, ServerError, TRANSPORT_PROTOCOL_VERSION};
 
 #[doc(hidden)]
 pub struct MissingState;
@@ -30,7 +27,6 @@ pub struct ServerBuilder<C, S = (), P = MissingState> {
     node_id: Option<String>,
     node_lease_ttl: Duration,
     coordination_timeout: Duration,
-    peer_connect_timeout: Duration,
     shutdown_signal: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
     phase: PhantomData<P>,
 }
@@ -49,7 +45,6 @@ impl<S: Send + Sync + 'static> Server<S> {
             node_id: None,
             node_lease_ttl: Duration::from_secs(10),
             coordination_timeout: Duration::from_secs(15),
-            peer_connect_timeout: Duration::from_secs(3),
             shutdown_signal: None,
             phase: PhantomData,
         }
@@ -70,7 +65,7 @@ where
         self
     }
 
-    /// Sets the canonical `host:port` endpoint advertised to peers and Clients.
+    /// Sets the canonical `host:port` endpoint advertised to Clients.
     pub fn advertised_endpoint(mut self, endpoint: &str) -> Self {
         self.advertised_endpoint = Some(endpoint.to_owned());
         self
@@ -106,10 +101,6 @@ where
     }
     pub fn coordination_timeout(mut self, timeout: Duration) -> Self {
         self.coordination_timeout = timeout;
-        self
-    }
-    pub fn peer_connect_timeout(mut self, timeout: Duration) -> Self {
-        self.peer_connect_timeout = timeout;
         self
     }
     /// Sets the application-owned future that requests graceful Server shutdown.
@@ -152,7 +143,6 @@ where
             node_id: self.node_id,
             node_lease_ttl: self.node_lease_ttl,
             coordination_timeout: self.coordination_timeout,
-            peer_connect_timeout: self.peer_connect_timeout,
             shutdown_signal: self.shutdown_signal,
             phase: PhantomData,
         }
@@ -179,16 +169,12 @@ where
         if self.coordination_timeout.is_zero() {
             return Err(ServerError::InvalidCoordinationTimeout);
         }
-        if self.peer_connect_timeout.is_zero() {
-            return Err(ServerError::InvalidPeerConnectTimeout);
-        }
         let config = ServerRuntimeConfig::production(
             node_id,
             bind_address,
             advertised_endpoint,
             self.node_lease_ttl,
             self.coordination_timeout,
-            self.peer_connect_timeout,
         );
         let store = Arc::new(self.store);
         Ok(ServerStarter {
@@ -256,14 +242,12 @@ fn parse_listen_address(address: &str) -> Result<SocketAddr, ServerError> {
 pub(crate) struct ServerBuilderCore<S> {
     pub(crate) state: Option<S>,
     registrations: Vec<__macro::Registration<S>>,
-    client_transport: Option<Arc<dyn ClientTransport>>,
-    placement: Arc<dyn PlacementStrategy>,
     pub(crate) mailbox_capacity: usize,
     pub(crate) max_active_actors: usize,
     pub(crate) idle_timeout: Duration,
     pub(crate) deactivation_timeout: Duration,
     pub(crate) shutdown_timeout: Duration,
-    peer_protocol_version: u32,
+    transport_protocol_version: u32,
 }
 
 impl<S: Send + Sync + 'static> ServerBuilderCore<S> {
@@ -271,14 +255,12 @@ impl<S: Send + Sync + 'static> ServerBuilderCore<S> {
         Self {
             state,
             registrations: Vec::new(),
-            client_transport: None,
-            placement: crate::cluster::default_placement(),
             mailbox_capacity: 32,
             max_active_actors: 10_000,
             idle_timeout: Duration::from_secs(60),
             deactivation_timeout: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(30),
-            peer_protocol_version: PEER_PROTOCOL_VERSION,
+            transport_protocol_version: TRANSPORT_PROTOCOL_VERSION,
         }
     }
     pub(crate) fn with_state(mut self, state: S) -> Self {
@@ -293,10 +275,6 @@ impl<S: Send + Sync + 'static> ServerBuilderCore<S> {
         registration.mailbox_capacity = config.mailbox_capacity;
         registration.idle_timeout = config.idle_timeout;
         self.registrations.push(registration);
-    }
-    pub(crate) fn with_client_transport(mut self, transport: Arc<dyn ClientTransport>) -> Self {
-        self.client_transport = Some(transport);
-        self
     }
     pub(crate) fn validate(&self) -> Result<(), ServerError> {
         if self.mailbox_capacity == 0 {
@@ -358,15 +336,10 @@ impl<S: Send + Sync + 'static> ServerBuilderCore<S> {
                 next_generation: std::sync::atomic::AtomicU64::new(1),
                 status: std::sync::atomic::AtomicU8::new(__macro::RUNNING),
                 shutdown_timeout: self.shutdown_timeout,
-                peer_protocol_version: self.peer_protocol_version,
+                transport_protocol_version: self.transport_protocol_version,
                 authority,
                 cluster,
-                channels: Mutex::new(HashMap::new()),
                 inbound_tasks: Mutex::new(Vec::new()),
-                pending_opens: Mutex::new(HashMap::new()),
-                client_transport: self.client_transport,
-                placement: self.placement,
-                relays: Mutex::new(HashMap::new()),
             }),
             cluster: None,
         })
@@ -379,22 +352,22 @@ pub struct Server<S = ()> {
     cluster: Option<ClusterTasks>,
 }
 impl<S: Send + Sync + 'static> Server<S> {
-    pub(crate) fn spawn_peer(
+    pub(crate) fn spawn_transport(
         &self,
         transport: Arc<dyn crate::transport::ServerTransport>,
         advertised: &crate::transport::Endpoint,
         listener: Option<tokio::net::TcpListener>,
-    ) -> PeerTask {
-        spawn_peer(self.inner.clone(), transport, advertised, listener)
+    ) -> TransportTask {
+        spawn_transport(self.inner.clone(), transport, advertised, listener)
     }
     pub(crate) fn with_cluster_tasks(
         mut self,
-        peer: PeerTask,
+        transport: TransportTask,
         renewal: RenewalTask,
         fenced: watch::Receiver<bool>,
     ) -> Self {
         self.cluster = Some(ClusterTasks {
-            peer,
+            transport,
             renewal,
             fenced,
         });
@@ -406,13 +379,13 @@ impl<S: Send + Sync + 'static> Server<S> {
             return Ok(());
         };
         let mut fenced = tasks.fenced.clone();
-        let mut peer_stopped = tasks.peer.stopped.clone();
+        let mut transport_stopped = tasks.transport.stopped.clone();
         let mut renewal_stopped = tasks.renewal.stopped.clone();
         loop {
             if *fenced.borrow() {
                 return Err(ServerError::Fenced);
             }
-            if *peer_stopped.borrow() {
+            if *transport_stopped.borrow() {
                 return Err(ServerError::ServiceStopped);
             }
             tokio::select! {
@@ -422,8 +395,8 @@ impl<S: Send + Sync + 'static> Server<S> {
                         return Err(ServerError::ServiceStopped);
                     }
                 }
-                changed = peer_stopped.changed() => {
-                    if changed.is_err() || *peer_stopped.borrow() {
+                changed = transport_stopped.changed() => {
+                    if changed.is_err() || *transport_stopped.borrow() {
                         return Err(ServerError::ServiceStopped);
                     }
                 }
@@ -433,7 +406,7 @@ impl<S: Send + Sync + 'static> Server<S> {
             }
         }
     }
-    /// Gracefully stops Actors, peer transport, and Node Lease renewal.
+    /// Gracefully stops Actors, transport, and Node Lease renewal.
     pub(crate) async fn shutdown(mut self) -> Result<(), ServerError> {
         let result = self.inner.shutdown().await;
         if let Some(tasks) = self.cluster.take() {

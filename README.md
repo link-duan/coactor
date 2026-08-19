@@ -27,7 +27,7 @@ Server::builder(coordination_store)
 ### Client
 
 ```rust
-let client = Client::builder(node_directory).build()?;
+let client = Client::builder(coordination_store).build()?;
 let address = ActorAddress::new("counter", "counter-7")?;
 let mut session = client.open(&address).await?;
 
@@ -35,7 +35,7 @@ session.send(b"increment".to_vec()).await?;
 let event = session.recv().await;
 ```
 
-Actions and Events are in-memory, at-most-once byte messages. A successful send confirms transport admission only. Owner or Gateway failure ends the Session; callers reopen it, and the new Owner starts with empty CoActor-managed state.
+Actions and Events are in-memory, at-most-once byte messages. A successful send confirms transport admission only. Owner or Transport Connection failure ends the Session; callers reopen it, and the new Owner starts with empty CoActor-managed state.
 
 ## Documentation
 

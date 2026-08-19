@@ -56,7 +56,7 @@ fn node() -> NodeRecord {
         node_id: "node-a".to_owned(),
         session_id: NodeSessionId::generate(),
         advertised_endpoint: "127.0.0.1:7000".to_owned(),
-        protocol_version: crate::PEER_PROTOCOL_VERSION,
+        protocol_version: crate::TRANSPORT_PROTOCOL_VERSION,
         lease_generation: 0,
         sampled_at_unix_ms: crate::cluster::wall_time_millis(),
         active_actor_count: 3,

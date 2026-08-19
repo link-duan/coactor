@@ -37,7 +37,7 @@ Usernames must be unique within a room and contain 1–32 printable characters. 
 
 ## Runtime behavior
 
-Room membership exists only in the Active Actor's memory. Owner or Gateway failure ends existing Sessions, and availability failover starts a new empty room state. Actions and Events retain CoActor's in-memory, at-most-once delivery semantics.
+Room membership exists only in the Active Actor's memory. Owner or Transport Connection failure ends existing Sessions, and availability failover starts a new empty room state. Actions and Events retain CoActor's in-memory, at-most-once delivery semantics.
 
 `ActorRuntime::broadcast` targets every live Session of the Actor. A Session waiting for its `Join` result can therefore briefly receive another room Event; the provided Client handles Events until its own `Joined` or `Error` arrives.
 

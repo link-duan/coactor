@@ -4,6 +4,8 @@ status: accepted
 
 # 放置均衡：p2c + Load Ratio + In-flight 记账
 
+> [ADR-0013](0013-client-direct-owner-placement.md) 将 Placement 与 In-flight Placement 的执行位置从 Gateway/Server 移到 Client，并增加失败节点排除与有界重试。p2c、Load Ratio、TTL 候选缓存和本地 In-flight Placement 算法仍然有效。
+
 `PlacementStrategy` 接缝早已存在但默认就地认领，`ClusterRouter::placement_candidates`（按 active 数排序取 top-2）是 dead code。本 ADR 确定真正的放置均衡算法，约束来自两个已观察到的不均衡来源：
 
 1. **Placement Burst（瞬时流量）**：直播开播瞬间上千新 room 同时 open，所有网关读同一份 lease 快照，确定性算法会把流量全部导向同一个"看起来最空"的节点（如刚重启 count=0 的节点），雪崩倾斜。

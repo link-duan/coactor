@@ -1,7 +1,7 @@
 //! crate 私有 transport seam：Server/Client 两侧消息传输的对称抽象。
 //!
 //! 方向不对称（ADR-0008）：Client 只 connect，Server 只 accept；两侧共用
-//! 双向 `PeerStream`（`peer_protocol::Envelope` 为消息单元）。`grpc` 是当前
+//! 双向 `TransportStream`（`transport_protocol::Envelope` 为消息单元）。`grpc` 是当前
 //! 唯一实现，`inmem`（进程内逻辑转发）供 `test_support` 使用。
 //!
 //! trait 方法使用原生 `async fn`：依赖 `Send` supertrait 让 future 自动 `Send`
@@ -14,7 +14,7 @@ pub(crate) mod inmem;
 
 use std::sync::Arc;
 
-use crate::peer_protocol::Envelope;
+use crate::transport_protocol::Envelope;
 
 /// 对端节点地址：gRPC 为 `http://host:port`，inmem 为进程内 registry key。
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -52,22 +52,24 @@ impl std::fmt::Display for TransportError {
 impl std::error::Error for TransportError {}
 
 /// 双向流的可克隆出站半部；owner 侧用它把 Event/ack 回传到 caller。
-pub(crate) trait PeerSender: Send + Sync {
+pub(crate) trait TransportSender: Send + Sync {
     fn try_send(&self, envelope: Envelope) -> Result<(), TransportError>;
+
+    fn close(&self);
 }
 
 /// 双向 Envelope 流：caller 建立或 owner accept 后，两侧都经它收发。
 #[async_trait::async_trait]
-pub(crate) trait PeerStream: Send {
-    fn sender(&self) -> Arc<dyn PeerSender>;
+pub(crate) trait TransportStream: Send {
+    fn sender(&self) -> Arc<dyn TransportSender>;
 
     async fn recv(&mut self) -> Option<Envelope>;
 }
 
 /// Server 半部：绑定监听并逐个 accept 入站流；`shutdown` 停止接受新连接。
 #[async_trait::async_trait]
-pub(crate) trait PeerListener: Send {
-    async fn accept(&mut self) -> Option<Box<dyn PeerStream>>;
+pub(crate) trait TransportListener: Send {
+    async fn accept(&mut self) -> Option<Box<dyn TransportStream>>;
 
     fn shutdown(&self);
 }
@@ -79,10 +81,13 @@ pub(crate) trait ServerTransport: Send + Sync {
         &self,
         advertised: &Endpoint,
         listener: Option<tokio::net::TcpListener>,
-    ) -> Result<Box<dyn PeerListener>, TransportError>;
+    ) -> Result<Box<dyn TransportListener>, TransportError>;
 }
 
 #[async_trait::async_trait]
 pub(crate) trait ClientTransport: Send + Sync {
-    async fn connect(&self, endpoint: &Endpoint) -> Result<Box<dyn PeerStream>, TransportError>;
+    async fn connect(
+        &self,
+        endpoint: &Endpoint,
+    ) -> Result<Box<dyn TransportStream>, TransportError>;
 }

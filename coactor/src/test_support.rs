@@ -14,7 +14,8 @@ use crate::runtime::ServerBuilderCore;
 use crate::transport::inmem::{InmemRegistry, InmemTransport};
 use crate::transport::{Endpoint, ServerTransport};
 use crate::{
-    __macro, IntoActorConfig, NodeDirectory, NodeRecord, NodeSessionId, Server, ServerError,
+    __macro, ActorOwnerReader, IntoActorConfig, NodeDirectory, NodeRecord, NodeSessionId, Server,
+    ServerError,
 };
 
 struct SingleNodeDirectory(NodeRecord);
@@ -29,6 +30,16 @@ impl NodeDirectory for SingleNodeDirectory {
     }
     async fn list_nodes(&self) -> Result<Vec<NodeRecord>, crate::CoordinationError> {
         Ok(vec![self.0.clone()])
+    }
+}
+
+#[async_trait]
+impl ActorOwnerReader for SingleNodeDirectory {
+    async fn read_actor_owner(
+        &self,
+        _address: &crate::ActorAddress,
+    ) -> Result<Option<crate::VersionedActorOwnerRecord>, crate::CoordinationError> {
+        Ok(None)
     }
 }
 
@@ -126,7 +137,7 @@ where
             node_id: "test".to_owned(),
             session_id: NodeSessionId::generate(),
             advertised_endpoint: key,
-            protocol_version: crate::PEER_PROTOCOL_VERSION,
+            protocol_version: crate::TRANSPORT_PROTOCOL_VERSION,
             lease_generation: 0,
             sampled_at_unix_ms: crate::cluster::wall_time_millis(),
             active_actor_count: 0,
@@ -192,8 +203,9 @@ impl<S: Send + Sync + 'static> TestServer<S> {
 #[cfg(test)]
 mod cluster_fakes {
     use crate::{
-        ActorAddress, ActorOwnerRecord, ActorOwnerStore, CoordinationError, MutationOutcome,
-        NodeDirectory, NodeLeaseStore, NodeRecord, Revision, VersionedActorOwnerRecord,
+        ActorAddress, ActorOwnerReader, ActorOwnerRecord, ActorOwnerStore, CoordinationError,
+        MutationOutcome, NodeDirectory, NodeLeaseStore, NodeRecord, Revision,
+        VersionedActorOwnerRecord,
     };
     use async_trait::async_trait;
     use std::{
@@ -342,13 +354,16 @@ mod cluster_fakes {
         }
     }
     #[async_trait]
-    impl ActorOwnerStore for TestCoordinationStore {
+    impl ActorOwnerReader for TestCoordinationStore {
         async fn read_actor_owner(
             &self,
             address: &ActorAddress,
         ) -> Result<Option<VersionedActorOwnerRecord>, CoordinationError> {
             Ok(self.owners.lock().unwrap().get(address).cloned())
         }
+    }
+    #[async_trait]
+    impl ActorOwnerStore for TestCoordinationStore {
         async fn compare_exchange_actor_owner(
             &self,
             address: &ActorAddress,

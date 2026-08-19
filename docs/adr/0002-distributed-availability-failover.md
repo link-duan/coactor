@@ -4,7 +4,7 @@ status: accepted
 
 # 提供无状态 Availability Failover 的分布式 runtime
 
-CoActor 在嵌入式 runtime 之上扩展分布式生产能力，但不引入强制的 control-plane service。生产运行必须显式配置 peer 与 ownership，不能静默退化为 local-only。Session 消息保持 location-transparent；Node 间 bidi gRPC stream（见 ADR-0006）提供 peer transport，Ownership Authority 协调 Placement 与 Fencing。CoActor 负责 Actor 层规则，只在其实际保证的底层能力上复用成熟基础设施。
+CoActor 在嵌入式 runtime 之上扩展分布式生产能力，但不引入强制的 control-plane service。生产运行必须显式配置 transport 与 ownership，不能静默退化为 local-only。Session 消息保持 location-transparent；当前 Client 直连 Owner 的 bidi transport topology 由 [ADR-0013](0013-client-direct-owner-placement.md) 定义，Ownership Authority 协调 Placement 与 Fencing。CoActor 负责 Actor 层规则，只在其实际保证的底层能力上复用成熟基础设施。
 
 当前公开 cluster API 使用 AWS S3 conditional operation 实现共享 Coordination Store。可续持的 Node Lease 证明一个 runtime session 是否可以服务请求；per-Actor ownership record 决定路由并通过单调 epoch 对 takeover 进行 fencing。Node Lease 丢失会阻止受影响的 runtime session 继续服务 Actor，并通过宿主 supervision boundary 报告终止；library 不终止宿主进程。两层模型避免续租工作随 Active Actor 数量线性增长。
 

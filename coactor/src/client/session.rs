@@ -8,9 +8,8 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use super::{ClientInner, envelope_action};
-use crate::peer_protocol::Envelope;
-use crate::{ActorAddress, SendError, SessionId, transport::Endpoint};
+use super::{ClientInner, TransportConnection, envelope_action, envelope_session_close};
+use crate::{ActorAddress, SendError, SessionId};
 
 type EventSender = mpsc::Sender<Result<Vec<u8>, SendError>>;
 
@@ -38,6 +37,12 @@ impl CallerRegistry {
         self.receivers.lock().get(session_id).cloned()
     }
 
+    pub(crate) fn terminate(&self, session_id: &SessionId, error: SendError) {
+        if let Some(sender) = self.receivers.lock().remove(session_id) {
+            let _ = sender.try_send(Err(error));
+        }
+    }
+
     /// 以终止错误结束全部 Session（shutdown 用）。
     pub(crate) fn terminate_all(&self, error: SendError) {
         let senders: Vec<EventSender> = self.receivers.lock().values().cloned().collect();
@@ -55,8 +60,7 @@ pub struct Session {
     pub(crate) session_id: SessionId,
     pub(crate) receiver: mpsc::Receiver<Result<Vec<u8>, SendError>>,
     pub(crate) registry: Arc<CallerRegistry>,
-    /// 建立时的 owner 端点（Direct 模式恒为配置端点）。
-    pub(crate) owner_endpoint: Option<Endpoint>,
+    pub(crate) connection: Arc<TransportConnection>,
 }
 
 impl Session {
@@ -69,14 +73,8 @@ impl Session {
         if client.status.load(Ordering::Acquire) != super::RUNNING {
             return Err(SendError::RuntimeStopped);
         }
-        let endpoint = self
-            .owner_endpoint
-            .clone()
-            .ok_or(SendError::RemoteUnavailable)?;
-        let channel = client.ensure_channel(&endpoint).await?;
-        channel
+        self.connection
             .try_send(envelope_action(&self.address, self.session_id, msg))
-            .map_err(|_| SendError::RemoteUnavailable)
     }
 
     /// Receives the next Event or terminal Session error.
@@ -97,31 +95,9 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.registry.unregister_local(&self.session_id);
-        let Some(endpoint) = self.owner_endpoint.clone() else {
-            return;
-        };
-        let client = self.client.clone();
-        let address = self.address.clone();
-        let session_id = self.session_id;
-        tokio::spawn(async move {
-            let Some(client) = client.upgrade() else {
-                return;
-            };
-            let Ok(channel) = client.ensure_channel(&endpoint).await else {
-                return;
-            };
-            let _ = channel.try_send(Envelope {
-                protocol_version: 0,
-                actor_type: address.actor_type().to_owned(),
-                actor_id: address.actor_id().as_bytes().to_vec(),
-                session_id: session_id.as_bytes(),
-                from_node: String::new(),
-                kind: Some(crate::peer_protocol::envelope::Kind::SessionClose(
-                    crate::peer_protocol::SessionClose {
-                        reason: crate::peer_protocol::CloseReason::CallerDropped as i32,
-                    },
-                )),
-            });
-        });
+        self.connection.unbind(&self.session_id);
+        let _ = self
+            .connection
+            .try_send(envelope_session_close(&self.address, self.session_id));
     }
 }

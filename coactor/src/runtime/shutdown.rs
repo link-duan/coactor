@@ -77,9 +77,7 @@ where
         }
         self.terminate_all_sessions(SendError::RuntimeShuttingDown)
             .await;
-        self.channels.lock().clear();
         self.abort_inbound_tasks();
-        self.pending_opens.lock().clear();
         self.status.store(STOPPED, Ordering::Release);
         tracing::debug!(
             lifecycle = "shutdown",
@@ -117,9 +115,7 @@ where
         }
         self.actors.lock().clear();
         self.terminate_all_sessions(SendError::NodeFenced).await;
-        self.channels.lock().clear();
         self.abort_inbound_tasks();
-        self.pending_opens.lock().clear();
     }
 
     async fn terminate_all_sessions(&self, error: SendError) {

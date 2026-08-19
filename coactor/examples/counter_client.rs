@@ -5,8 +5,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bucket = std::env::var("COACTOR_S3_BUCKET")?;
     let prefix = std::env::var("COACTOR_S3_PREFIX").unwrap_or_default();
     let sdk = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let directory = S3CoordinationStore::new(aws_sdk_s3::Client::new(&sdk), bucket, prefix)?;
-    let client = Client::builder(directory).build()?;
+    let coordination_store =
+        S3CoordinationStore::new(aws_sdk_s3::Client::new(&sdk), bucket, prefix)?;
+    let client = Client::builder(coordination_store).build()?;
 
     let address = ActorAddress::new("counter", "counter-7")?;
     let mut session = client.open(&address).await?;

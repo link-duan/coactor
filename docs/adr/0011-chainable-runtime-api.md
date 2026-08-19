@@ -4,7 +4,7 @@ status: accepted
 
 # 链式构造 runtime 并直接打开 Session
 
-CoActor 使用 capability injection 取代 mode-specific constructor 与 backend config enum：生产侧使用 `Server::builder(coordination_store)`，caller 使用 `Client::builder(node_directory).build()`，测试使用 `TestServer::builder()`。App State 默认为 `()`，`.with_state(state)` 可以出现在 Actor registration 前后；registration 使用 `.actor::<A>("name")` 或 `ActorConfig`，Server 配置通过 `.advertised_endpoint(...)`、`.shutdown_signal(...)`、`.default_mailbox_capacity(...)` 等具名链式方法表达，监听地址在最终 `.serve(...)` 调用中提供。
+CoActor 使用 capability injection 取代 mode-specific constructor 与 backend config enum：生产侧使用 `Server::builder(coordination_store)`，caller 使用 `Client::builder(coordination_store).build()`，测试使用 `TestServer::builder()`。Client 构造参数需同时提供只读 Node Directory 与 Actor Owner 查询能力；该调整由 [ADR-0013](0013-client-direct-owner-placement.md) 扩展。App State 默认为 `()`，`.with_state(state)` 可以出现在 Actor registration 前后；registration 使用 `.actor::<A>("name")` 或 `ActorConfig`，Server 配置通过 `.advertised_endpoint(...)`、`.shutdown_signal(...)`、`.default_mailbox_capacity(...)` 等具名链式方法表达，监听地址在最终 `.serve(...)` 调用中提供。
 
 `ActorAddress` 成为唯一公开地址值：它校验 Actor Type 与 Actor ID，二者都使用 Kubernetes DNS-label 语法。`Client::open(&ActorAddress)` 直接建立 Session；删除 `ActorRef` 以及独立 Rust newtype `ActorType`、`ActorId`，因为它们增加 staging，却没有增加 runtime 行为。`ActorRuntime::state()` 暴露 `&S`，runtime 内部继续持有共享 ownership。
 

@@ -17,9 +17,9 @@ mod cluster;
 
 pub mod coordination {
     pub use crate::cluster::{
-        ActorOwner, ActorOwnerRecord, ActorOwnerStore, CoordinationError, CoordinationErrorKind,
-        CoordinationStore, MutationOutcome, NodeDirectory, NodeLeaseStore, NodeRecord,
-        NodeSessionId, Revision, VersionedActorOwnerRecord,
+        ActorOwner, ActorOwnerReader, ActorOwnerRecord, ActorOwnerStore, CoordinationError,
+        CoordinationErrorKind, CoordinationStore, MutationOutcome, NodeDirectory, NodeLeaseStore,
+        NodeRecord, NodeSessionId, Revision, VersionedActorOwnerRecord,
     };
 
     pub mod backend {
@@ -32,21 +32,22 @@ pub mod coordination {
 #[cfg(test)]
 pub(crate) use cluster::s3::S3CoordinationStore;
 pub(crate) use cluster::{
-    ActorOwner, ActorOwnerRecord, ActorOwnerStore, CoordinationError, MutationOutcome,
-    NodeDirectory, NodeLeaseStore, NodeRecord, NodeSessionId, PlacementStrategy, Revision,
+    ActorOwner, ActorOwnerReader, ActorOwnerRecord, ActorOwnerStore, CoordinationError,
+    MutationOutcome, NodeDirectory, NodeLeaseStore, NodeRecord, NodeSessionId, Revision,
     VersionedActorOwnerRecord,
 };
 #[cfg(test)]
 pub(crate) use cluster::{CoordinationStores, ServerRuntimeConfig, ServerStarter};
+pub use cluster::{P2cPlacement, PlacementCandidate, PlacementContext, PlacementStrategy};
 #[cfg(test)]
 pub(crate) use runtime::ServerBuilderCore;
 
 pub use coactor_macros::actor;
 
-const PEER_PROTOCOL_VERSION: u32 = 2;
+const TRANSPORT_PROTOCOL_VERSION: u32 = 2;
 
-mod peer_protocol {
-    tonic::include_proto!("coactor.peer.v1");
+mod transport_protocol {
+    tonic::include_proto!("coactor.transport.v1");
 }
 
 #[doc(hidden)]

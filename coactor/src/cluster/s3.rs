@@ -8,8 +8,9 @@ use thiserror::Error;
 use super::wall_time_millis;
 use crate::coordination::CoordinationErrorKind;
 use crate::{
-    ActorAddress, ActorOwnerRecord, ActorOwnerStore, CoordinationError, MutationOutcome,
-    NodeDirectory, NodeLeaseStore, NodeRecord, Revision, VersionedActorOwnerRecord,
+    ActorAddress, ActorOwnerReader, ActorOwnerRecord, ActorOwnerStore, CoordinationError,
+    MutationOutcome, NodeDirectory, NodeLeaseStore, NodeRecord, Revision,
+    VersionedActorOwnerRecord,
 };
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -340,13 +341,17 @@ impl NodeLeaseStore for S3CoordinationStore {
 }
 
 #[async_trait]
-impl ActorOwnerStore for S3CoordinationStore {
+impl ActorOwnerReader for S3CoordinationStore {
     async fn read_actor_owner(
         &self,
         address: &ActorAddress,
     ) -> Result<Option<VersionedActorOwnerRecord>, CoordinationError> {
         self.read_actor_key(address).await
     }
+}
+
+#[async_trait]
+impl ActorOwnerStore for S3CoordinationStore {
     async fn compare_exchange_actor_owner(
         &self,
         address: &ActorAddress,

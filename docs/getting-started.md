@@ -5,7 +5,7 @@
 - Rust 1.85 or later
 - an existing S3 bucket
 - AWS credentials with read, list, write, and delete access under a dedicated prefix
-- a Server endpoint reachable by its Client and peers
+- a Server endpoint reachable by its Clients
 
 ## Install
 
@@ -62,19 +62,19 @@ Server::builder(store)
 
 ## Connect a Client
 
-The Client process does not register or host Actors. It reads the Node Directory and opens Sessions through the available Servers.
+The Client process does not register or host Actors. It reads Actor ownership and the Node Directory from the Coordination Store, then connects directly to the Owner or performs Placement for an unowned Actor.
 
 ```rust
 let sdk = aws_config::load_defaults(
     aws_config::BehaviorVersion::latest(),
 ).await;
 
-let directory = S3CoordinationStore::new(
+let coordination_store = S3CoordinationStore::new(
     aws_sdk_s3::Client::new(&sdk),
     "my-bucket",
     "coactor/dev",
 )?;
-let client = Client::builder(directory).build()?;
+let client = Client::builder(coordination_store).build()?;
 
 let address = ActorAddress::new("counter", "counter-7")?;
 let mut session = client.open(&address).await?;
